@@ -85,6 +85,7 @@ pub fn cli(args: &[String]) -> i32 {
             }
         }
     }
+    crate::views::sync_columns(&mut app);
     if let Some(f) = arg(args, "--focus-row").and_then(|v| v.parse::<usize>().ok()) {
         app.tab_mut().sel.focus = Some(f);
     }

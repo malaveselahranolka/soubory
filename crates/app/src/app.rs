@@ -64,6 +64,12 @@ pub struct Tab {
     pub asc: bool,
     pub error: Option<String>,
     pub loaded_at: Option<Instant>,
+    /// Column view: folders to the left of the active column (each selects the next one).
+    pub cols_left: Vec<crate::views::Pane>,
+    /// Column view: contents of the folder selected in the active column.
+    pub col_right: Option<crate::views::Pane>,
+    /// Column view: horizontal scroll.
+    pub col_scroll: f32,
 }
 
 impl Tab {
@@ -80,6 +86,9 @@ impl Tab {
             asc: true,
             error: None,
             loaded_at: None,
+            cols_left: Vec::new(),
+            col_right: None,
+            col_scroll: 0.0,
         }
     }
     pub fn dir(&self) -> PathBuf {
@@ -132,6 +141,10 @@ pub enum Hit {
     Empty,
     Crumb(usize),
     IconSlider,
+    /// Column view: (column index, row) outside the active column.
+    ColRow(usize, usize),
+    /// Column view: empty space in a column.
+    ColEmpty(usize),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -351,6 +364,10 @@ impl App {
         }
         t.loaded_at = Some(Instant::now());
         self.relayout();
+        if self.tab().view == View::Columns {
+            self.tab_mut().col_right = None;
+            crate::views::sync_columns(self);
+        }
         if select.is_some() {
             self.reveal_focus();
         }
@@ -371,6 +388,7 @@ impl App {
         t.hist.push(from);
         t.loc = loc;
         t.scroll = 0.0;
+        crate::views::reset_columns(self);
         self.reload(select.as_deref());
         self.focus = Focus::Content;
         self.invalidate();
@@ -382,6 +400,7 @@ impl App {
         if let Some((loc, sel)) = t.hist.back(cur) {
             t.loc = loc;
             t.scroll = 0.0;
+            crate::views::reset_columns(self);
             self.reload(sel.as_deref());
             self.invalidate();
         }
@@ -393,6 +412,7 @@ impl App {
         if let Some((loc, sel)) = t.hist.forward(cur) {
             t.loc = loc;
             t.scroll = 0.0;
+            crate::views::reset_columns(self);
             self.reload(sel.as_deref());
             self.invalidate();
         }
@@ -487,7 +507,10 @@ impl App {
 
     pub fn set_view(&mut self, v: View) {
         self.tab_mut().view = v;
+        self.tab_mut().scroll = 0.0;
+        crate::views::reset_columns(self);
         self.relayout();
+        crate::views::sync_columns(self);
         self.reveal_focus();
         self.invalidate();
     }
@@ -526,14 +549,15 @@ impl App {
 
     // ---- geometry of the content area ---------------------------------------------------------
 
+    /// Row rectangle in list view, or in the active column of column view.
     pub fn row_rect(&self, i: usize) -> Rect {
         let b = self.lay.body;
-        Rect::new(
-            b.x,
-            b.y + i as f32 * layout::ROW_H - self.tab().scroll,
-            b.w,
-            layout::ROW_H,
-        )
+        let y = b.y + 4.0 + i as f32 * layout::ROW_H - self.tab().scroll;
+        if self.tab().view == View::Columns {
+            let x = crate::views::col_x(self, self.tab().cols_left.len());
+            return Rect::new(x, y, layout::COL_W, layout::ROW_H);
+        }
+        Rect::new(b.x, y, b.w, layout::ROW_H)
     }
 
     pub fn grid(&self) -> layout::Grid {
@@ -543,12 +567,7 @@ impl App {
     pub fn tile_rect(&self, i: usize) -> Rect {
         let g = self.grid();
         let (r, c) = (i / g.cols, i % g.cols);
-        Rect::new(
-            g.x0 + c as f32 * g.tile_w,
-            self.lay.body.y + 8.0 + r as f32 * g.tile_h - self.tab().scroll,
-            g.tile_w,
-            g.tile_h,
-        )
+        Rect::new(g.x0 + c as f32 * g.tile_w, self.lay.body.y + 8.0 + r as f32 * g.tile_h - self.tab().scroll, g.tile_w, g.tile_h)
     }
 
     pub fn content_height(&self) -> f32 {
@@ -558,12 +577,21 @@ impl App {
                 let g = self.grid();
                 16.0 + n.div_ceil(g.cols) as f32 * g.tile_h
             }
+            View::Gallery => crate::views::strip_width(self),
             _ => n as f32 * layout::ROW_H + 8.0,
         }
     }
 
+    /// Visible extent along the scroll axis (gallery scrolls its strip horizontally).
+    fn viewport(&self) -> f32 {
+        match self.tab().view {
+            View::Gallery => crate::views::gallery_parts(self).1.w,
+            _ => self.lay.body.h,
+        }
+    }
+
     pub fn clamp_scroll(&mut self) {
-        let max = (self.content_height() - self.lay.body.h).max(0.0);
+        let max = (self.content_height() - self.viewport()).max(0.0);
         let t = self.tab_mut();
         t.scroll = t.scroll.clamp(0.0, max);
     }
@@ -571,24 +599,36 @@ impl App {
     pub fn item_rect(&self, i: usize) -> Rect {
         match self.tab().view {
             View::Icons => self.tile_rect(i),
+            View::Gallery => crate::views::strip_tile(self, i),
             _ => self.row_rect(i),
         }
     }
 
     /// Scrolls so the focused item is visible.
     pub fn reveal_focus(&mut self) {
-        let Some(f) = self.tab().sel.focus else {
-            return;
-        };
+        let Some(f) = self.tab().sel.focus else { return };
         let r = self.item_rect(f);
-        let b = self.lay.body;
-        let t = self.tab_mut();
-        if r.y < b.y {
-            t.scroll -= b.y - r.y;
-        } else if r.b() > b.b() {
-            t.scroll += r.b() - b.b();
+        if self.tab().view == View::Gallery {
+            let s = crate::views::gallery_parts(self).1;
+            let t = self.tab_mut();
+            if r.x < s.x + 8.0 {
+                t.scroll -= s.x + 8.0 - r.x;
+            } else if r.r() > s.r() - 8.0 {
+                t.scroll += r.r() - (s.r() - 8.0);
+            }
+        } else {
+            let b = self.lay.body;
+            let t = self.tab_mut();
+            if r.y < b.y {
+                t.scroll -= b.y - r.y;
+            } else if r.b() > b.b() {
+                t.scroll += r.b() - b.b();
+            }
         }
         self.clamp_scroll();
+        if self.tab().view == View::Columns {
+            crate::views::reveal_columns(self);
+        }
     }
 
     pub fn item_at(&self, x: f32, y: f32) -> Option<usize> {
@@ -610,17 +650,26 @@ impl App {
                 let i = r * g.cols + c;
                 (i < t.entries.len() && crate::paint::tile_hit(self, i, x, y)).then_some(i)
             }
-            _ => {
-                let i = ((y - self.lay.body.y + t.scroll) / layout::ROW_H) as usize;
-                (i < t.entries.len()).then_some(i)
+            View::Gallery => (0..t.entries.len()).find(|&i| crate::views::strip_tile(self, i).contains(x, y)),
+            View::Columns => {
+                let cx = crate::views::col_x(self, t.cols_left.len());
+                if x < cx || x >= cx + layout::COL_W {
+                    return None;
+                }
+                let ry = y - self.lay.body.y - 4.0 + t.scroll;
+                let i = (ry / layout::ROW_H).floor();
+                (i >= 0.0 && (i as usize) < t.entries.len()).then_some(i as usize)
+            }
+            View::List => {
+                let ry = y - self.lay.body.y - 4.0 + t.scroll;
+                let i = (ry / layout::ROW_H).floor();
+                (i >= 0.0 && (i as usize) < t.entries.len()).then_some(i as usize)
             }
         }
     }
 
     pub fn items_in(&self, band: &Rect) -> Vec<usize> {
-        (0..self.tab().entries.len())
-            .filter(|&i| self.item_rect(i).inset(layout::INSET, 2.0).intersects(band))
-            .collect()
+        (0..self.tab().entries.len()).filter(|&i| self.item_rect(i).inset(layout::INSET, 2.0).intersects(band)).collect()
     }
 
     pub fn page_rows(&self) -> isize {
@@ -629,6 +678,7 @@ impl App {
                 let g = self.grid();
                 ((self.lay.body.h / g.tile_h) as isize).max(1) * g.cols as isize
             }
+            View::Gallery => 5,
             _ => ((self.lay.body.h / layout::ROW_H) as isize - 1).max(1),
         }
     }
@@ -687,6 +737,9 @@ impl App {
         }
         if l.status.contains(x, y) {
             return crate::paint::status_hit(self, x, y);
+        }
+        if l.body.contains(x, y) && self.tab().view == View::Columns {
+            return crate::views::columns_hit(self, x, y);
         }
         if l.body.contains(x, y) {
             return self.item_at(x, y).map(Hit::Row).unwrap_or(Hit::Empty);
@@ -822,6 +875,8 @@ impl App {
                     keep,
                 };
             }
+            Hit::ColRow(k, r) => crate::views::column_click(self, k, Some(r)),
+            Hit::ColEmpty(k) => crate::views::column_click(self, k, None),
             Hit::IconSlider => {
                 self.drag = Drag::Slider;
                 crate::paint::slider_set(self, x);
@@ -829,6 +884,7 @@ impl App {
             Hit::Search => crate::win::focus_search(self),
             _ => {}
         }
+        crate::views::sync_columns(self);
         self.invalidate();
     }
 
@@ -891,6 +947,10 @@ impl App {
 
     pub fn double_click(&mut self, x: f32, y: f32) {
         match self.hit(x, y) {
+            Hit::Row(i) if self.tab().view == View::Columns && self.tab().entries[i].is_dir => {
+                crate::views::column_right(self, true);
+                self.invalidate();
+            }
             Hit::Row(i) => self.open(i, false),
             Hit::Drag => crate::win::caption(self, Cap::Max),
             Hit::Empty if self.lay.tabs.is_some_and(|t| t.contains(x, y)) => {
@@ -947,7 +1007,14 @@ impl App {
             let max = (crate::paint::sidebar_height(self) - self.lay.sidebar.h).max(0.0);
             self.side_scroll = (self.side_scroll - step).clamp(0.0, max);
         } else {
-            self.tab_mut().scroll -= step;
+            match self.tab().view {
+                View::Columns => {
+                    crate::views::column_wheel(self, x, step);
+                    self.invalidate();
+                    return;
+                }
+                _ => self.tab_mut().scroll -= step,
+            }
             self.clamp_scroll();
             if matches!(self.drag, Drag::Band { .. }) {
                 self.update_band();
@@ -961,11 +1028,8 @@ impl App {
     pub fn key(&mut self, vk: VIRTUAL_KEY, ctrl: bool, shift: bool, alt: bool) -> bool {
         self.kb = true;
         let n = self.tab().entries.len();
-        let cols = if self.tab().view == View::Icons {
-            self.grid().cols as isize
-        } else {
-            1
-        };
+        let view = self.tab().view;
+        let cols = if view == View::Icons { self.grid().cols as isize } else { 1 };
         let mv = |app: &mut App, d: isize| {
             app.tab_mut().sel.move_by(d, shift, ctrl && !shift);
             app.reveal_focus();
@@ -987,8 +1051,16 @@ impl App {
             }
             (VK_UP, _, _, false) => mv(self, -cols),
             (VK_DOWN, _, _, false) => mv(self, cols),
-            (VK_LEFT, _, _, false) if cols > 1 => mv(self, -1),
-            (VK_RIGHT, _, _, false) if cols > 1 => mv(self, 1),
+            (VK_LEFT, _, _, false) if cols > 1 || view == View::Gallery => mv(self, -1),
+            (VK_RIGHT, _, _, false) if cols > 1 || view == View::Gallery => mv(self, 1),
+            (VK_LEFT, false, false, false) if view == View::Columns => {
+                crate::views::column_left(self);
+                self.invalidate();
+            }
+            (VK_RIGHT, false, false, false) if view == View::Columns => {
+                crate::views::column_right(self, true);
+                self.invalidate();
+            }
             (VK_HOME, ..) => mv(self, -(n as isize)),
             (VK_END, ..) => mv(self, n as isize),
             (VK_PRIOR, ..) => {
@@ -1080,6 +1152,7 @@ impl App {
             }
             _ => return false,
         }
+        crate::views::sync_columns(self);
         true
     }
 
@@ -1094,6 +1167,7 @@ impl App {
         if let Some(i) = TypeSelect::find(&prefix, &names, t.sel.focus) {
             self.tab_mut().sel.select_only(i);
             self.reveal_focus();
+            crate::views::sync_columns(self);
             self.invalidate();
         }
     }

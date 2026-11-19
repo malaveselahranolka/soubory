@@ -21,6 +21,7 @@ mod sidebar;
 mod tags;
 mod theme;
 mod thumbs;
+mod views;
 mod win;
 
 use std::path::PathBuf;

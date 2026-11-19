@@ -70,7 +70,9 @@ pub fn paint(app: &mut App, c: &mut Canvas) {
     c.push_clip(l.body);
     match app.tab().view {
         View::Icons => icon_view(app, c, &t),
-        _ => list_view(app, c, &t),
+        View::Columns => crate::views::paint_columns(app, c, &t),
+        View::Gallery => crate::views::paint_gallery(app, c, &t),
+        View::List => list_view(app, c, &t),
     }
     band(app, c, &t);
     if let Some(r) = crate::win::rename_rect(app) {
@@ -83,7 +85,7 @@ pub fn paint(app: &mut App, c: &mut Canvas) {
         header(app, c, &t, h);
     }
     if let Some(p) = l.preview {
-        crate::quicklook::paint_inspector(app, c, &t, p);
+        crate::views::paint_inspector(app, c, &t, p);
     }
     status(app, c, &t);
 }
@@ -673,6 +675,7 @@ fn list_view(app: &mut App, c: &mut Canvas, t: &Theme) {
                         .and_then(|p| p.parent())
                         .map(|p| p.to_string_lossy().into_owned())
                         .unwrap_or_default();
+                    let loc = c.fit_path(&loc, Font::Body, cell.w - 16.0);
                     c.text(&loc, cell.inset(8.0, 0.0), Font::Body, ink2, Align::Start);
                 }
             }
@@ -795,13 +798,18 @@ fn icon_view(app: &mut App, c: &mut Canvas, t: &Theme) {
         }
         let idx = ensure_icon(app, i);
         let dim = if e.is_hidden() { 0.55 } else { 1.0 };
-        let img = crate::thumbs::get(app, i);
-        match img {
-            Some((bmp, w, h)) => {
-                let k = (icon.w / w).min(icon.h / h).min(1.0);
-                let r = icon.center(w * k, h * k).snap(c.scale);
+        let path = app.tab().path_of(i);
+        match crate::thumbs::image(app, c, &path, e.modified, e.attrs, icon.w) {
+            Some((bmp, w, h, is_thumb)) => {
+                let is_thumb = is_thumb && !e.is_dir;
+                let k = (icon.w / w).min(icon.h / h);
+                let k = if is_thumb { k } else { k.min(1.0).max(icon.w / w.max(h)) };
+                let r = Rect::new(icon.cx() - w * k / 2.0, icon.b() - h * k, w * k, h * k).snap(c.scale);
                 c.bitmap(&bmp, r, dim);
-                c.round_stroke(r, 2.0, t.edge, 0.0);
+                if is_thumb {
+                    // Photos and pages get a hairline frame, like Finder.
+                    c.round_stroke(r, 2.0, t.edge, 0.0);
+                }
             }
             None => app.icons.draw(c, idx, icon, dim),
         }

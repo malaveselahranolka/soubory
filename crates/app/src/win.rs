@@ -1257,7 +1257,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     TIMER_FS => {
                         let _ = KillTimer(Some(hwnd), TIMER_FS);
                         if edit_of(EditKind::Rename).is_none() {
+                            crate::thumbs::refresh();
                             app.reload(None);
+                            crate::views::refresh_columns(app);
                             app.invalidate();
                         }
                     }

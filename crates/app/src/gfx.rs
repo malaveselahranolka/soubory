@@ -710,6 +710,21 @@ impl Canvas<'_> {
         self.g.measure(s, font)
     }
 
+    /// A path shortened from the left so it fits `w`: "…\\demo\\Projekty".
+    pub fn fit_path(&self, s: &str, font: Font, w: f32) -> String {
+        if self.measure(s, font) <= w {
+            return s.to_string();
+        }
+        let parts: Vec<&str> = s.split('\\').collect();
+        for k in 1..parts.len() {
+            let t = format!("…\\{}", parts[k..].join("\\"));
+            if self.measure(&t, font) <= w {
+                return t;
+            }
+        }
+        format!("…\\{}", parts.last().unwrap_or(&""))
+    }
+
     /// Pixel snap helper.
     pub fn px(&self, v: f32) -> f32 {
         (v * self.scale).round() / self.scale
