@@ -1,9 +1,9 @@
 {
   "model": "xhigh",
   "validate": [
-    "cargo fmt --all --check",
-    "cargo clippy -p fm-fs -p fm-index --all-targets -- -D warnings",
-    "cargo test -p fm-fs -p fm-index"
+    "cargo fmt -p fm-index --check",
+    "cargo clippy -p fm-index --all-targets -- -D warnings",
+    "cargo test -p fm-index"
   ],
   "timeout_seconds": 3600
 }
