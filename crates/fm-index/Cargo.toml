@@ -1,0 +1,9 @@
+[package]
+name = "fm-index"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+fm-fs = { workspace = true }
+rayon = { workspace = true }
+memchr = { workspace = true }

@@ -1,0 +1,10 @@
+[package]
+name = "fm-fs"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+unicode-normalization = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true }
