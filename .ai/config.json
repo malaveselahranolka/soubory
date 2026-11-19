@@ -1,5 +1,9 @@
 {
   "model": "xhigh",
-  "validate": [],
-  "timeout_seconds": 2400
+  "validate": [
+    "cargo fmt --all --check",
+    "cargo clippy -p fm-fs -p fm-index --all-targets -- -D warnings",
+    "cargo test -p fm-fs -p fm-index"
+  ],
+  "timeout_seconds": 3600
 }
