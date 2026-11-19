@@ -58,6 +58,8 @@ foreach ($c in $cases) {
   try {
     $q = Kit --act query --hwnd $d.Hwnd
     Check 'query folder' ($q -match ('^OK	' + [regex]::Escape($dir) + '	')) $q
+    $qms = if (($q -join ' ') -match '(\d+)\s*ms') { [int]$Matches[1] } else { 99999 }
+    Check "query within 200 ms budget ($qms ms)" ($qms -le 200) $q
     $a = Kit --act anchor --hwnd $d.Hwnd
     Check 'anchor found' ($a -match 'Some\(RECT') $a
     $list = Kit --act list --hwnd $d.Hwnd

@@ -2,3 +2,4 @@ target/
 .ai/work/
 .playwright-mcp/
 *.pdb
+dist/
