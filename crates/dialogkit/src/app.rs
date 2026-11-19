@@ -137,6 +137,9 @@ fn is_ours(hwnd: HWND) -> bool {
 }
 
 fn on_foreground(hwnd: HWND) {
+    if std::env::var_os("FM_DIALOGKIT_TRACE").is_some() {
+        log(format!("foreground {:?} class={}", hwnd.0, class_of(hwnd)));
+    }
     if with(|s| s.paused) || hwnd.is_invalid() {
         return detach();
     }
@@ -163,6 +166,7 @@ fn on_foreground(hwnd: HWND) {
 
 fn attach(hwnd: HWND, kind: Kind) {
     let target = detect::target(hwnd);
+    log(format!("attach {:?} dialog in {} (pid {}, 32-bit={}, above={})", kind, target.exe, target.pid, target.is32, target.above_us));
     if target.above_us {
         let first = with(|s| s.warned.insert(target.pid));
         if first {
@@ -222,9 +226,11 @@ fn reanchor() {
         }
     }
     let anchor = UIA.with(|u| u.borrow().as_ref().and_then(|a| detect::anchor(t.hwnd, t.kind, a)));
-    let Some(anchor) = anchor else { return pill::hide() };
-    let scale = unsafe { GetDpiForWindow(t.hwnd) } as f32 / 96.0;
-    pill::place(anchor, style_for(t.kind), scale.max(1.0));
+    let Some(anchor) = anchor else {
+        log(format!("no anchor for {:?} dialog in {}", t.kind, t.target.exe));
+        return pill::hide();
+    };
+    pill::place(anchor, style_for(t.kind), monitor_scale(t.hwnd));
 }
 
 /// Moves follow the dialog immediately; a resize re-reads the command bar layout once it settles.
@@ -477,9 +483,10 @@ pub fn act_cli(args: &[String]) -> i32 {
                 1
             }
         },
+        Some("preview") => preview(hwnd, kind, get("--out").unwrap_or_else(|| "preview.bmp".into())),
         Some("anchor") => {
             let a = detect::uia().and_then(|u| detect::anchor(hwnd, kind, &u));
-            println!("{kind:?} {a:?} dpi={}", unsafe { GetDpiForWindow(hwnd) });
+            println!("{kind:?} {a:?} window_dpi={} monitor_scale={}", unsafe { GetDpiForWindow(hwnd) }, monitor_scale(hwnd));
             0
         }
         Some(cmd @ ("list" | "new")) => {
@@ -517,6 +524,82 @@ pub fn act_cli(args: &[String]) -> i32 {
             println!("ERR\tunknown action");
             2
         }
+    }
+}
+
+/// Renders the dialog (PrintWindow) with the button composited at its real anchor, normal and
+/// hovered side by side, into a 32-bit BMP. Needs no foreground and captures nothing else on screen.
+fn preview(hwnd: HWND, kind: Kind, out: String) -> i32 {
+    use windows::Win32::{Graphics::Gdi::*, Storage::Xps::{PRINT_WINDOW_FLAGS, PrintWindow}};
+    let main = unsafe { CreateWindowExW(WS_EX_TOOLWINDOW, w!("STATIC"), w!(""), WS_POPUP, 0, 0, 0, 0, None, None, None, None).unwrap_or_default() };
+    if pill::create(main).is_err() {
+        println!("ERR\tpill");
+        return 1;
+    }
+    let Some(anchor) = detect::uia().and_then(|u| detect::anchor(hwnd, kind, &u)) else {
+        println!("ERR\tno anchor");
+        return 1;
+    };
+    unsafe {
+        let mut r = RECT::default();
+        let _ = GetWindowRect(hwnd, &mut r);
+        let (w, h) = (rect_w(&r), rect_h(&r));
+        let screen = GetDC(None);
+        let mem = CreateCompatibleDC(Some(screen));
+        let header = BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: w * 2,
+            biHeight: -h,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        };
+        let bmi = BITMAPINFO { bmiHeader: header, ..Default::default() };
+        let mut bits = std::ptr::null_mut();
+        let Ok(dib) = CreateDIBSection(Some(mem), &bmi, DIB_RGB_COLORS, &mut bits, None, 0) else { return 1 };
+        let old = SelectObject(mem, dib.into());
+        // PrintWindow returns a DPI-unaware window at its logical size; map our physical anchor onto it.
+        let window_scale = GetDpiForWindow(hwnd) as f32 / 96.0;
+        let f = monitor_scale(hwnd) / window_scale.max(1.0);
+        let m = |v: i32| (v as f32 / f).round() as i32;
+        let local = RECT { left: m(anchor.left - r.left), top: m(anchor.top - r.top), right: m(anchor.right - r.left), bottom: m(anchor.bottom - r.top) };
+        let scale = window_scale.max(1.0);
+        for (i, hover) in [false, true].into_iter().enumerate() {
+            let part = CreateCompatibleDC(Some(screen));
+            let pbmi = BITMAPINFO { bmiHeader: BITMAPINFOHEADER { biWidth: w, ..header }, ..Default::default() };
+            let mut pbits = std::ptr::null_mut();
+            if let Ok(pdib) = CreateDIBSection(Some(part), &pbmi, DIB_RGB_COLORS, &mut pbits, None, 0) {
+                let pold = SelectObject(part, pdib.into());
+                let _ = PrintWindow(hwnd, part, PRINT_WINDOW_FLAGS(2));
+                pill::preview(part, local, style_for(kind), scale.max(1.0), hover);
+                let _ = BitBlt(mem, i as i32 * w, 0, w, h, Some(part), 0, 0, SRCCOPY);
+                SelectObject(part, pold);
+                let _ = DeleteObject(pdib.into());
+            }
+            let _ = DeleteDC(part);
+        }
+        // BMP: file header + info header + top-down 32-bit pixels.
+        let pixels = std::slice::from_raw_parts(bits as *const u8, (w * 2 * h * 4) as usize);
+        let mut file = Vec::with_capacity(pixels.len() + 54);
+        file.extend_from_slice(b"BM");
+        file.extend_from_slice(&(54 + pixels.len() as u32).to_le_bytes());
+        file.extend_from_slice(&[0, 0, 0, 0]);
+        file.extend_from_slice(&54u32.to_le_bytes());
+        file.extend_from_slice(&40u32.to_le_bytes());
+        file.extend_from_slice(&(w * 2).to_le_bytes());
+        file.extend_from_slice(&(-h).to_le_bytes());
+        file.extend_from_slice(&1u16.to_le_bytes());
+        file.extend_from_slice(&32u16.to_le_bytes());
+        file.extend_from_slice(&[0u8; 24]);
+        file.extend_from_slice(pixels);
+        let ok = std::fs::write(&out, file).is_ok();
+        SelectObject(mem, old);
+        let _ = DeleteObject(dib.into());
+        let _ = DeleteDC(mem);
+        ReleaseDC(None, screen);
+        println!("{}\t{out}\tanchor={anchor:?}", if ok { "OK" } else { "ERR" });
+        0
     }
 }
 

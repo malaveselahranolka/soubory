@@ -164,6 +164,24 @@ pub fn set_pressed(pressed: bool) {
     });
 }
 
+/// Diagnostics: alpha-blends the button (in the given state) onto `dc` at `anchor` (dc coordinates).
+pub fn preview(dc: HDC, anchor: RECT, style: Style, scale: f32, hover: bool) {
+    PILL.with(|p| {
+        let mut p = p.borrow_mut();
+        let Some(p) = p.as_mut() else { return };
+        p.style = style;
+        p.scale = scale;
+        p.hover = hover;
+        let h = if rect_h(&anchor) > 0 { rect_h(&anchor) } else { (32.0 * scale) as i32 };
+        let w = p.measure_width();
+        p.with_dib(w, h, |_, mem, _| unsafe {
+            let blend = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, SourceConstantAlpha: 255, AlphaFormat: AC_SRC_ALPHA as u8, ..Default::default() };
+            let _ = AlphaBlend(dc, anchor.left, anchor.top, w, h, mem, 0, 0, w, h, blend);
+        });
+        p.hover = false;
+    });
+}
+
 /// Keeps the stored position in sync after the window was moved directly.
 pub fn shift(dx: i32, dy: i32) {
     PILL.with(|p| {
@@ -260,6 +278,17 @@ impl Pill {
 
     fn render(&mut self) {
         let (w, h) = (rect_w(&self.rect).max(1), rect_h(&self.rect).max(1));
+        self.with_dib(w, h, |p, mem, screen| unsafe {
+            let pos = POINT { x: p.rect.left, y: p.rect.top };
+            let size = SIZE { cx: w, cy: h };
+            let src = POINT::default();
+            let blend = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, SourceConstantAlpha: 255, AlphaFormat: AC_SRC_ALPHA as u8, ..Default::default() };
+            let _ = UpdateLayeredWindow(p.hwnd, Some(screen), Some(&pos), Some(&size), Some(mem), Some(&src), COLORREF(0), Some(&blend), ULW_ALPHA);
+        });
+    }
+
+    /// Draws the button into a premultiplied 32-bit DIB and hands the memory DC to `use_dib`.
+    fn with_dib(&self, w: i32, h: i32, use_dib: impl FnOnce(&Self, HDC, HDC)) {
         unsafe {
             let screen = GetDC(None);
             let mem = CreateCompatibleDC(Some(screen));
@@ -283,11 +312,7 @@ impl Pill {
             };
             let old = SelectObject(mem, dib.into());
             self.draw(mem, w, h);
-            let pos = POINT { x: self.rect.left, y: self.rect.top };
-            let size = SIZE { cx: w, cy: h };
-            let src = POINT::default();
-            let blend = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, SourceConstantAlpha: 255, AlphaFormat: AC_SRC_ALPHA as u8, ..Default::default() };
-            let _ = UpdateLayeredWindow(self.hwnd, Some(screen), Some(&pos), Some(&size), Some(mem), Some(&src), COLORREF(0), Some(&blend), ULW_ALPHA);
+            use_dib(self, mem, screen);
             SelectObject(mem, old);
             let _ = DeleteObject(dib.into());
             let _ = DeleteDC(mem);

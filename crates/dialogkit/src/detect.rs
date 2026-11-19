@@ -1,11 +1,12 @@
 //! Recognises Windows file dialogs and finds where our button belongs.
 use crate::util::*;
+use windows::Win32::Graphics::Dwm::{DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute};
 use windows::{
     Win32::{
         Foundation::*,
         Security::*,
         System::{Com::*, SystemInformation::*, Threading::*, Variant::VARIANT},
-        UI::{Accessibility::*, HiDpi::GetDpiForWindow, WindowsAndMessaging::*},
+        UI::{Accessibility::*, WindowsAndMessaging::*},
     },
     core::*,
 };
@@ -129,20 +130,29 @@ fn item_anchor(h: HWND, automation: &IUIAutomation) -> Option<RECT> {
 
 fn legacy_anchor(h: HWND) -> Option<RECT> {
     unsafe {
-        let scale: f32 = GetDpiForWindow(h) as f32 / 96.0;
+        let scale: f32 = monitor_scale(h);
         let height = (28.0 * scale).round() as i32;
-        // Places bar is ctl1 (0x4A0); place the button right under it.
-        if let Ok(places) = GetDlgItem(Some(h), 0x4A0) {
+        let gap = (8.0 * scale).round() as i32;
+        // The Places bar is the tall toolbar on the left; the space under it is empty.
+        let mut places: Option<RECT> = None;
+        for k in descendants(h) {
             let mut r = RECT::default();
-            if IsWindowVisible(places).as_bool() && GetWindowRect(places, &mut r).is_ok() {
-                let top = r.bottom + (8.0 * scale) as i32;
-                return Some(RECT { left: r.left, top, right: r.left, bottom: top + height });
+            if class_of(k) == "ToolbarWindow32" && IsWindowVisible(k).as_bool() && GetWindowRect(k, &mut r).is_ok() && rect_h(&r) > rect_w(&r) * 2 {
+                places = Some(r);
             }
         }
+        if let Some(r) = places {
+            let top = r.bottom + gap;
+            return Some(RECT { left: r.left, top, right: r.left, bottom: top + height });
+        }
+        // No Places bar: bottom-left corner of the visible frame (GetWindowRect includes invisible borders).
         let mut r = RECT::default();
-        GetWindowRect(h, &mut r).ok()?;
+        let frame = DwmGetWindowAttribute(h, DWMWA_EXTENDED_FRAME_BOUNDS, &mut r as *mut _ as *mut _, std::mem::size_of::<RECT>() as u32);
+        if frame.is_err() {
+            GetWindowRect(h, &mut r).ok()?;
+        }
         let left = r.left + (12.0 * scale) as i32;
-        let bottom = r.bottom - (14.0 * scale) as i32;
+        let bottom = r.bottom - (12.0 * scale) as i32;
         Some(RECT { left, top: bottom - height, right: left, bottom })
     }
 }

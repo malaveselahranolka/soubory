@@ -89,3 +89,17 @@ pub fn high_contrast() -> bool {
             && (hc.dwFlags.0 & HCF_HIGHCONTRASTON.0) != 0
     }
 }
+
+/// Scale factor of the monitor the window is on. Used instead of the window's own DPI: a
+/// DPI-unaware dialog reports 96 but is stretched on screen, and our button must match what is shown.
+pub fn monitor_scale(h: HWND) -> f32 {
+    use windows::Win32::{Graphics::Gdi::*, UI::HiDpi::*};
+    unsafe {
+        let mon = MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST);
+        let (mut x, mut y) = (96u32, 96u32);
+        if GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &mut x, &mut y).is_err() {
+            x = 96;
+        }
+        (x as f32 / 96.0).max(1.0)
+    }
+}
