@@ -1,3 +1,3 @@
 [build]
-# Build output outside OneDrive (sync churn, file locks).
-target-dir = "C:/Users/adame/AppData/Local/cargo-target/file-manager"
+# Build output outside OneDrive (sync churn, file locks) and outside AppData (the Claude app virtualizes AppData writes).
+target-dir = "C:/Users/adame/.fm-target"
