@@ -1,0 +1,3 @@
+[build]
+# Build output outside OneDrive (sync churn, file locks).
+target-dir = "C:/Users/adame/AppData/Local/cargo-target/file-manager"
