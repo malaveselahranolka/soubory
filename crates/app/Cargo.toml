@@ -1,0 +1,15 @@
+[package]
+name = "fm-app"
+version.workspace = true
+edition.workspace = true
+description = "fm: a Finder-style file manager for Windows."
+
+[[bin]]
+name = "fm"
+path = "src/main.rs"
+
+[dependencies]
+windows = { workspace = true }
+windows-core = { workspace = true }
+windows-numerics = "0.3"
+fm-fs = { workspace = true }

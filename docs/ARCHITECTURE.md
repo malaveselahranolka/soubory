@@ -23,10 +23,13 @@ Coverage of "every dialog" in v1:
 
 ## 2. Decisions
 
-**UI: Win32 plus comctl32 v6** through `windows` 0.62.2 (latest stable, 2025-10-06).
-- A virtual `SysListView32` (`LVS_OWNERDATA`) handles 100k+ rows and includes rename, type-to-select, IME and UI Automation.
-- The shell's context menu and drag and drop need a real WndProc, and the dialog helper uses the same toolkit.
-- All logic sits in UI-free `app-core`, so a later reskin (Direct2D, or Slint 1.19.0) replaces only `app`.
+**UI: one Win32 window drawn with Direct2D/DirectWrite on a DirectComposition swap chain** (revised 2026-11-20). The user made the Finder look a hard requirement (unified toolbar, translucent sidebar, inset rounded selection, icon/list/column/gallery views); a stock ListView cannot get there, and the earlier plan already named Direct2D as the reskin target.
+- Native where Windows does it better: rename is a child `EDIT` (IME), context menus are the shell's `IContextMenu`, copy/paste/Properties are shell verbs, conflicts use the shell's dialogs, drag and drop is OLE with the folder's own `IDropTarget`.
+- Mica (`DWMSBT_MAINWINDOW`) shows through transparent pixels of the composition swap chain (`WS_EX_NOREDIRECTIONBITMAP`). Nothing in the layout depends on it: the opaque fallback colour is a token.
+- Paint code takes an `ID2D1RenderTarget`, so `fm.exe --render` draws the same frame into a WIC bitmap and writes a PNG. That is the visual test harness; no screen capture is used.
+- Pure state (selection, layout rects, hit-testing, sorting, history, tabs, type-to-select) lives in `app-core` with unit tests; `fm.exe --act` drives the real window for E2E checks.
+- Accessibility: full keyboard operation and high-contrast tokens; a UI Automation provider for the custom views is a known gap until built.
+- Pivot rule: if the custom list is not navigable in time, a virtual ListView goes behind the same model.
 - Rejected:
   - Tauri 2: WebView2 memory, weak native drag and context menu.
   - egui 0.37.0, iced 0.14.0.
