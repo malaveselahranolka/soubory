@@ -217,6 +217,29 @@ fn evict(s: &mut State) {
     }
 }
 
+/// Synchronous variant for Quick Look's fallback image (cached; placeholder-safe).
+pub fn image_blocking(c: &crate::gfx::Canvas, path: &std::path::Path, e: &crate::fsys::Entry, dip: f32) -> Option<(ID2D1Bitmap, f32, f32)> {
+    let key = Key { path: path.to_path_buf(), px: bucket(dip * c.scale), mtime: e.modified };
+    let img = S.with(|s| match s.borrow().slots.get(&key) {
+        Some(Slot::Ready(img, _)) => Some(img.clone()),
+        _ => None,
+    });
+    let img = match img {
+        Some(i) => i,
+        None => {
+            let i = Rc::new(load(path, key.px, e.is_placeholder())?);
+            S.with(|s| {
+                let mut s = s.borrow_mut();
+                s.bytes += i.data.len();
+                s.slots.insert(key, Slot::Ready(i.clone(), 0));
+            });
+            i
+        }
+    };
+    let bmp = c.bitmap_from_bgra(img.w, img.h, &img.data)?;
+    Some((bmp, img.w as f32 / c.scale, img.h as f32 / c.scale))
+}
+
 /// Folder changed: drop failed lookups and pending markers so they are retried.
 pub fn refresh() {
     S.with(|s| s.borrow_mut().slots.retain(|_, v| matches!(v, Slot::Ready(..))));

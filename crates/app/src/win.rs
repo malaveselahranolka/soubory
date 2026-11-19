@@ -180,6 +180,9 @@ fn dev_flags(app: &mut App) {
     if args.iter().any(|a| a == "--dev-goto") {
         go_to_folder(app);
     }
+    if args.iter().any(|a| a == "--dev-ql") {
+        crate::quicklook::toggle(app);
+    }
     app.invalidate();
 }
 
@@ -351,6 +354,7 @@ fn paint_now(app: &mut App) {
     }
     app.gfx = Some(g);
     position_edits(app);
+    crate::quicklook::follow(app);
 }
 
 // ---- folder watching -------------------------------------------------------------------------------------
@@ -627,6 +631,17 @@ pub fn renaming_index(_app: &App) -> Option<usize> {
 /// Where the rename field sits, so paint can draw its frame around the EDIT.
 pub fn rename_rect(app: &App) -> Option<crate::geom::Rect> {
     edit_of(EditKind::Rename).map(|(_, i)| edit_rect(app, EditKind::Rename, i))
+}
+
+/// Quick Look forwards navigation keys to the main window's selection.
+pub fn forward_key(vk: VIRTUAL_KEY) {
+    let p = app_ptr();
+    if p.is_null() {
+        return;
+    }
+    let app = unsafe { &mut *p };
+    app.key(vk, false, false, false);
+    app.invalidate();
 }
 
 pub fn path_editing() -> bool {
@@ -963,6 +978,20 @@ fn frame_thickness(hwnd: HWND) -> (i32, i32) {
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { wndproc_inner(hwnd, msg, wparam, lparam) })) {
+        Ok(r) => r,
+        Err(e) => {
+            crate::prefs::log(&format!("panic in wndproc (msg {msg:#x}): {}", panic_text(&e)));
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+    }
+}
+
+pub fn panic_text(e: &Box<dyn std::any::Any + Send>) -> String {
+    e.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| e.downcast_ref::<String>().cloned()).unwrap_or_default()
+}
+
+unsafe fn wndproc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
         if msg == WM_NCCREATE {
             let cs = &*(lparam.0 as *const CREATESTRUCTW);

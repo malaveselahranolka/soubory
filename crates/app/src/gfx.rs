@@ -287,6 +287,32 @@ impl Gfx {
         }
     }
 
+    /// A plain HWND render target, for windows that host foreign child windows (Quick Look's
+    /// preview handlers), which a composition-only window cannot show.
+    pub fn hwnd_target(&self, hwnd: HWND, w: u32, h: u32, scale: f32) -> Result<ID2D1HwndRenderTarget> {
+        let props = D2D1_RENDER_TARGET_PROPERTIES {
+            r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
+            pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
+            dpiX: 96.0 * scale,
+            dpiY: 96.0 * scale,
+            usage: D2D1_RENDER_TARGET_USAGE_NONE,
+            minLevel: D2D1_FEATURE_LEVEL_DEFAULT,
+        };
+        let hp = D2D1_HWND_RENDER_TARGET_PROPERTIES {
+            hwnd,
+            pixelSize: D2D_SIZE_U { width: w.max(1), height: h.max(1) },
+            presentOptions: D2D1_PRESENT_OPTIONS_NONE,
+        };
+        unsafe { self.d2d.CreateHwndRenderTarget(&props, &hp) }
+    }
+
+    /// Draws one frame into an HWND render target. False when the target must be recreated.
+    pub fn frame_hwnd(&self, rt: &ID2D1HwndRenderTarget, scale: f32, paint: impl FnOnce(&mut Canvas)) -> bool {
+        let Ok(dc) = rt.cast::<ID2D1DeviceContext>() else { return false };
+        unsafe { dc.SetDpi(96.0 * scale, 96.0 * scale) };
+        draw_into(self, &dc, scale, paint)
+    }
+
     pub fn resize(&mut self, w: u32, h: u32) {
         if let Some(d) = &mut self.dev {
             let (w, h) = (w.max(1), h.max(1));

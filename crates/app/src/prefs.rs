@@ -9,6 +9,20 @@ pub fn data_dir() -> PathBuf {
         .join("fm")
 }
 
+/// Appends a line to `%LOCALAPPDATA%\\fm\\fm.log` (kept under 1 MB).
+pub fn log(line: &str) {
+    use std::io::Write;
+    let path = data_dir().join("fm.log");
+    let _ = std::fs::create_dir_all(data_dir());
+    if std::fs::metadata(&path).map(|m| m.len() > 1 << 20).unwrap_or(false) {
+        let _ = std::fs::remove_file(&path);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let _ = writeln!(f, "{secs} {line}");
+    }
+}
+
 fn file() -> PathBuf {
     data_dir().join("prefs.txt")
 }
