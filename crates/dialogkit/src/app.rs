@@ -18,6 +18,13 @@ use windows::{
 const HOTKEY_ID: i32 = 0x464D;
 const TIMER_CLASSIFY: usize = 1;
 const TIMER_REANCHOR: usize = 2;
+const TIMER_SELECT: usize = 3;
+/// Posted by the x86 worker thread with a `Box<String>` reply.
+const WM_APP_X86_REPLY: u32 = WM_APP + 3;
+/// Budget for reading the folder before the menu opens; a hung dialog falls back to the address bar.
+const QUERY_TIMEOUT: Duration = Duration::from_millis(600);
+/// Longest default name the New menu produces ("Nová komprimovaná složka (metoda ZIP) (99).zip" ≈ 46).
+const NAME_RESERVE: usize = 48;
 
 #[derive(Clone)]
 struct Tracked {
@@ -38,6 +45,15 @@ struct State {
     hotkey: bool,
     warned: HashSet<u32>,
     taskbar_created: u32,
+    /// WinEvent hooks scoped to the tracked dialog's thread (moves, minimize, destroy).
+    dialog_hooks: Vec<HWINEVENTHOOK>,
+    pending_select: Option<PendingSelect>,
+}
+
+struct PendingSelect {
+    hook: Option<HHOOK>,
+    name: String,
+    exe: String,
 }
 
 thread_local! {
@@ -45,6 +61,7 @@ thread_local! {
     static INJECTOR: RefCell<Option<Injector>> = const { RefCell::new(None) };
     static UIA: RefCell<Option<IUIAutomation>> = const { RefCell::new(None) };
     static ACTIVE_MENU: RefCell<Option<NewMenu>> = const { RefCell::new(None) };
+    static ATOMS: RefCell<Vec<u16>> = const { RefCell::new(Vec::new()) };
 }
 
 fn with<R>(f: impl FnOnce(&mut State) -> R) -> R {
@@ -86,12 +103,8 @@ pub fn run() -> i32 {
         }
         tray::add(main, false);
         let flags = WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS;
-        let hooks = [
-            SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, None, Some(on_event), 0, 0, flags),
-            SetWinEventHook(EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND, None, Some(on_event), 0, 0, flags),
-            SetWinEventHook(EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE, None, Some(on_event), 0, 0, flags),
-            SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE, None, Some(on_event), 0, 0, flags),
-        ];
+        // Only the foreground hook is global; the rest are scoped to the tracked dialog in attach().
+        let hooks = [SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, None, Some(on_event), 0, 0, flags)];
         log("started");
         on_foreground(GetForegroundWindow());
         let mut msg = MSG::default();
@@ -178,12 +191,34 @@ fn attach(hwnd: HWND, kind: Kind) {
     unsafe {
         let _ = GetWindowRect(hwnd, &mut rect);
     }
-    with(|s| s.tracked = Some(Tracked { hwnd, kind, target, rect }));
+    unhook_dialog();
+    let (pid, tid) = (target.pid, unsafe { GetWindowThreadProcessId(hwnd, None) });
+    let flags = WINEVENT_OUTOFCONTEXT;
+    let hooks = unsafe {
+        vec![
+            SetWinEventHook(EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND, None, Some(on_event), pid, tid, flags),
+            SetWinEventHook(EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE, None, Some(on_event), pid, tid, flags),
+            SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE, None, Some(on_event), pid, tid, flags),
+        ]
+    };
+    with(|s| {
+        s.tracked = Some(Tracked { hwnd, kind, target, rect });
+        s.dialog_hooks = hooks;
+    });
     set_hotkey(true);
     reanchor();
 }
 
+fn unhook_dialog() {
+    for h in with(|s| std::mem::take(&mut s.dialog_hooks)) {
+        unsafe {
+            let _ = UnhookWinEvent(h);
+        }
+    }
+}
+
 fn detach() {
+    unhook_dialog();
     with(|s| {
         s.tracked = None;
         s.candidate = None;
@@ -268,6 +303,7 @@ fn on_timer(id: usize) {
     }
     match id {
         TIMER_REANCHOR => reanchor(),
+        TIMER_SELECT => finish_select(Err("timeout".into())),
         TIMER_CLASSIFY => {
             let Some((hwnd, tries)) = with(|s| s.candidate) else { return };
             if unsafe { GetForegroundWindow() } != hwnd {
@@ -287,7 +323,7 @@ fn on_timer(id: usize) {
 
 fn query_folder(t: &Tracked) -> std::result::Result<FolderReply, String> {
     let reply = INJECTOR.with(|i| {
-        i.borrow().as_ref().map(|i| i.call(t.hwnd, t.target.is32, CMD_QUERY as isize, Duration::from_millis(3000)))
+        i.borrow().as_ref().map(|i| i.call(t.hwnd, t.target.is32, CMD_QUERY as isize, QUERY_TIMEOUT))
     });
     match reply.unwrap_or_else(|| Err("injector unavailable".into())).and_then(|r| parse_query_reply(&r)) {
         Ok(f) => Ok(f),
@@ -298,6 +334,58 @@ fn query_folder(t: &Tracked) -> std::result::Result<FolderReply, String> {
     }
 }
 
+/// Starts select-and-rename without blocking; the result comes back via WM_COPYDATA / x86 reply.
+fn start_select(t: &Tracked, name: &str) {
+    let atom = unsafe { GlobalAddAtomW(PCWSTR(wide(name).as_ptr())) };
+    if atom == 0 {
+        return;
+    }
+    let lparam = CMD_SELECT as isize | ((atom as isize) << 8);
+    let main = with(|s| s.main);
+    let started = INJECTOR.with(|i| {
+        let i = i.borrow();
+        let i = i.as_ref().ok_or("injector unavailable".to_string())?;
+        if t.target.is32 != cfg!(target_pointer_width = "32") {
+            i.start_other_bitness(t.hwnd, lparam, Duration::from_millis(3000), main, WM_APP_X86_REPLY).map(|_| None)
+        } else {
+            i.start(t.hwnd, lparam).map(Some)
+        }
+    });
+    match started {
+        Ok(hook) => {
+            with(|s| s.pending_select = Some(PendingSelect { hook, name: name.to_string(), exe: t.target.exe.clone() }));
+            unsafe { SetTimer(Some(main), TIMER_SELECT, 4000, None) };
+        }
+        Err(e) => log(format!("select start failed: {e}")),
+    }
+    // The DLL copies the name out of the atom when the request is handled; keep it until then.
+    ATOMS.with(|a| a.borrow_mut().push(atom));
+}
+
+fn finish_select(reply: std::result::Result<String, String>) {
+    let main = with(|s| s.main);
+    unsafe {
+        let _ = KillTimer(Some(main), TIMER_SELECT);
+    }
+    let Some(p) = with(|s| s.pending_select.take()) else { return };
+    if let Some(h) = p.hook {
+        unsafe {
+            let _ = UnhookWindowsHookEx(h);
+        }
+    }
+    for atom in ATOMS.with(|a| std::mem::take(&mut *a.borrow_mut())) {
+        unsafe { GlobalDeleteAtom(atom) };
+    }
+    match reply {
+        Ok(r) if r == "OK" => {}
+        other => {
+            log(format!("select '{}' failed in {}: {other:?}", p.name, p.exe));
+            balloon(&format!("Vytvořeno: {}", p.name), "Dialog položku nezobrazuje – nejspíš ji skrývá filtr typů souborů.");
+        }
+    }
+}
+
+#[allow(dead_code)] // used by --act, which waits for the result
 fn select_in_dialog(t: &Tracked, name: &str) -> std::result::Result<(), String> {
     let atom = unsafe { GlobalAddAtomW(PCWSTR(wide(name).as_ptr())) };
     if atom == 0 {
@@ -322,6 +410,9 @@ fn info_menu(text: &str) -> Option<HMENU> {
 }
 
 fn open_menu() {
+    if with(|s| s.pending_select.is_some()) {
+        return; // previous item is still being selected
+    }
     let Some(t) = with(|s| s.tracked.clone()) else { return };
     let main = with(|s| {
         s.busy = true;
@@ -330,13 +421,16 @@ fn open_menu() {
     pill::set_pressed(true);
     let folder = query_folder(&t);
     let fs_dir = folder.as_ref().ok().and_then(|f| f.fs_path.clone());
-    let menu = fs_dir.as_deref().map(NewMenu::for_folder);
+    // Most apps cannot open paths of 260+ characters, so refuse rather than create such an item.
+    let too_long = fs_dir.as_deref().is_some_and(|d| d.encode_utf16().count() + 1 + NAME_RESERVE >= 260);
+    let menu = if too_long { None } else { fs_dir.as_deref().map(NewMenu::for_folder) };
     let (popup, info) = match &menu {
         Some(Ok(m)) => (m.popup, None),
         Some(Err(e)) => {
             log(format!("New menu failed for {fs_dir:?}: {e}"));
             (HMENU::default(), info_menu("Tady nelze nic vytvořit"))
         }
+        None if too_long => (HMENU::default(), info_menu("Cesta ke složce je příliš dlouhá")),
         None if folder.is_ok() => (HMENU::default(), info_menu("Ve virtuální složce nelze vytvářet")),
         None => (HMENU::default(), info_menu("Složku dialogu se nepodařilo zjistit")),
     };
@@ -382,10 +476,7 @@ fn create_and_select(t: &Tracked, dir: &Path, cmd: u32, owner: HWND) {
     let Some(name) = newmenu::created_since(dir, &before) else {
         return; // e.g. the shortcut wizard: nothing new yet
     };
-    if let Err(e) = select_in_dialog(t, &name) {
-        log(format!("select '{name}' failed in {}: {e}", t.target.exe));
-        balloon(&format!("Vytvořeno: {name}"), "Dialog položku nezobrazuje – nejspíš ji skrývá filtr typů souborů.");
-    }
+    start_select(t, &name);
 }
 
 fn balloon(title: &str, text: &str) {
@@ -395,7 +486,20 @@ fn balloon(title: &str, text: &str) {
 unsafe extern "system" fn main_proc(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     unsafe {
         match m {
-            WM_COPYDATA if crate::inject::on_copydata(l) => return LRESULT(1),
+            WM_COPYDATA if crate::inject::on_copydata(l) => {
+                // Synchronous waits take the reply themselves; anything left is an async select reply.
+                if with(|s| s.pending_select.is_some()) {
+                    if let Some(r) = crate::inject::take_reply() {
+                        finish_select(Ok(r));
+                    }
+                }
+                return LRESULT(1);
+            }
+            WM_APP_X86_REPLY => {
+                let text = *Box::from_raw(l.0 as *mut String);
+                finish_select(Ok(text));
+                return LRESULT(0);
+            }
             WM_INITMENUPOPUP | WM_MEASUREITEM | WM_DRAWITEM | WM_MENUCHAR => {
                 if let Some(r) = ACTIVE_MENU.with(|x| x.borrow().as_ref().and_then(|x| x.handle_menu_message(m, w, l))) {
                     return r;

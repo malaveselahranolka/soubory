@@ -36,6 +36,11 @@ pub fn on_copydata(lparam: LPARAM) -> bool {
     }
 }
 
+/// Takes a reply that arrived outside a synchronous wait.
+pub fn take_reply() -> Option<String> {
+    REPLY.with(|r| r.borrow_mut().take())
+}
+
 pub struct Injector {
     module: HMODULE,
     proc_: HOOKPROC,
@@ -83,6 +88,47 @@ impl Injector {
             let _ = UnhookWindowsHookEx(hook);
             result
         }
+    }
+
+    /// Starts a request without waiting; the reply arrives later as WM_COPYDATA on the sink window.
+    /// Returns the hook to remove once the reply (or a timeout) arrived.
+    pub fn start(&self, dlg: HWND, lparam: isize) -> std::result::Result<HHOOK, String> {
+        unsafe {
+            let tid = GetWindowThreadProcessId(dlg, None);
+            if tid == 0 {
+                return Err("dialog is gone".into());
+            }
+            let hook = SetWindowsHookExW(WH_GETMESSAGE, self.proc_, Some(HINSTANCE(self.module.0)), tid).map_err(|e| format!("hook: {e}"))?;
+            if let Err(e) = PostMessageW(Some(dlg), self.message, WPARAM(self.sink.0 as usize), LPARAM(lparam)) {
+                let _ = UnhookWindowsHookEx(hook);
+                return Err(format!("post: {e}"));
+            }
+            Ok(hook)
+        }
+    }
+
+    /// 32-bit variant of [`Injector::start`]: the x86 helper runs on a worker thread and its reply
+    /// is posted to `notify` as `msg` with a `Box<String>` in lParam.
+    pub fn start_other_bitness(&self, dlg: HWND, lparam: isize, timeout: Duration, notify: HWND, msg: u32) -> std::result::Result<(), String> {
+        let exe = self.x86_exe.clone().ok_or("32-bit helper not installed")?;
+        let (dlg_v, notify_v) = (dlg.0 as usize, notify.0 as usize);
+        std::thread::spawn(move || {
+            let out = std::process::Command::new(exe)
+                .args(["--inject", &dlg_v.to_string(), &lparam.to_string(), &timeout.as_millis().to_string()])
+                .creation_flags(CREATE_NO_WINDOW.0)
+                .output();
+            let text = match out {
+                Ok(o) => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+                Err(e) => format!("ERR\tx86 helper: {e}"),
+            };
+            let boxed = Box::into_raw(Box::new(text));
+            unsafe {
+                if PostMessageW(Some(HWND(notify_v as *mut c_void)), msg, WPARAM(0), LPARAM(boxed as isize)).is_err() {
+                    drop(Box::from_raw(boxed));
+                }
+            }
+        });
+        Ok(())
     }
 
     fn call_other_bitness(&self, dlg: HWND, lparam: isize, timeout: Duration) -> std::result::Result<String, String> {

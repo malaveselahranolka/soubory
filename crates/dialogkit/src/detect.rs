@@ -90,8 +90,18 @@ fn integrity_of(process: HANDLE) -> Option<u32> {
     }
 }
 
+/// UI Automation client with short timeouts, so a hung dialog cannot stall the helper for long.
 pub fn uia() -> Option<IUIAutomation> {
-    unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).ok() }
+    unsafe {
+        let a: IUIAutomation = CoCreateInstance(&CUIAutomation8, None, CLSCTX_INPROC_SERVER)
+            .or_else(|_| CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER))
+            .ok()?;
+        if let Ok(a2) = a.cast::<IUIAutomation2>() {
+            let _ = a2.SetConnectionTimeout(1000);
+            let _ = a2.SetTransactionTimeout(1000);
+        }
+        Some(a)
+    }
 }
 
 /// Screen rectangle where our button goes.

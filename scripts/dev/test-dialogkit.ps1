@@ -11,7 +11,9 @@ function Open-Dialog([string]$Dir, [string]$Kind, [switch]$X86) {
   $type = if ($Kind -eq 'save') { 'SaveFileDialog' } else { 'OpenFileDialog' }
   $auto = if ($Kind -eq 'legacy') { '$false' } else { '$true' }
   $ps = if ($X86) { "$env:WINDIR\SysWOW64\WindowsPowerShell\v1.0\powershell.exe" } else { 'powershell.exe' }
-  $cmd = "Add-Type -A System.Windows.Forms; `$d=New-Object System.Windows.Forms.$type; `$d.AutoUpgradeEnabled=$auto; `$d.Filter='Vše|*.*'; `$d.InitialDirectory='$Dir'; [void]`$d.ShowDialog()"
+  # 'hung': a timer on the dialog's own thread sleeps 10 s, so the dialog stops pumping messages.
+  $hang = if ($Kind -eq 'hung') { "`$t=New-Object System.Windows.Forms.Timer; `$t.Interval=1500; `$t.add_Tick({ `$t.Stop(); Start-Sleep 10 }); `$t.Start();" } else { '' }
+  $cmd = "Add-Type -A System.Windows.Forms; $hang `$d=New-Object System.Windows.Forms.$type; `$d.AutoUpgradeEnabled=$auto; `$d.Filter='Vše|*.*'; `$d.InitialDirectory='$Dir'; [void]`$d.ShowDialog()"
   $p = Start-Process $ps -ArgumentList '-NoProfile', '-STA', '-Command', $cmd -PassThru -WindowStyle Hidden
   for ($i = 0; $i -lt 40; $i++) {
     Start-Sleep -Milliseconds 200
@@ -36,6 +38,16 @@ $cases = @(
   @{ Name = 'item save 32'; Kind = 'save'; X86 = $true },
   @{ Name = 'diacritics dir'; Kind = 'save'; Sub = 'Žluťoučký kůň' }
 )
+# Hung dialog: the helper must give up within its budget instead of freezing.
+$hdir = Join-Path $Root 'hung'; New-Item -ItemType Directory -Force $hdir | Out-Null
+"=== hung dialog"
+$d = Open-Dialog $hdir 'hung'
+Start-Sleep -Milliseconds 1800
+$sw = [Diagnostics.Stopwatch]::StartNew(); $q = Kit --act query --hwnd $d.Hwnd; $ms = $sw.ElapsedMilliseconds
+Check "query returns fast on a hung dialog ($ms ms)" ($ms -lt 2500) $q
+"  $q"
+Stop-Process -Id $d.Proc.Id -ErrorAction SilentlyContinue
+
 foreach ($c in $cases) {
   $dir = Join-Path $Root ($c.Name -replace ' ', '_')
   if ($c.Sub) { $dir = Join-Path $dir $c.Sub }
