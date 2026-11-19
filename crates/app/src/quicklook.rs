@@ -369,7 +369,8 @@ fn decode_text(b: &[u8]) -> Option<String> {
     }
     match std::str::from_utf8(b) {
         Ok(s) => Some(s.to_string()),
-        Err(e) if e.valid_up_to() + 4 >= b.len() => Some(String::from_utf8_lossy(b).into_owned()),
+        // Only a multibyte sequence cut off by the size limit: still UTF-8.
+        Err(e) if e.error_len().is_none() => Some(String::from_utf8_lossy(b).into_owned()),
         Err(_) => Some(cp1250(b)),
     }
 }
