@@ -1,0 +1,13 @@
+[package]
+name = "fm-dialog-hook"
+version.workspace = true
+edition.workspace = true
+description = "Tiny DLL loaded on demand into a file dialog's UI thread to read its folder and select new items."
+
+[lib]
+name = "fm_dialog_hook"
+# cdylib: injected via SetWindowsHookEx. rlib: dialogkit shares the protocol constants.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+windows = { workspace = true }

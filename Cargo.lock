@@ -34,6 +34,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0e9c71c2167ca323c882b99918929403426e2373ea17242ff5653e0d5e1058be"
 
 [[package]]
+name = "fm-dialog-hook"
+version = "0.1.0"
+dependencies = [
+ "windows",
+]
+
+[[package]]
+name = "fm-dialogkit"
+version = "0.1.0"
+dependencies = [
+ "fm-dialog-hook",
+ "windows",
+ "windows-numerics",
+]
+
+[[package]]
 name = "fm-fs"
 version = "0.1.0"
 dependencies = [

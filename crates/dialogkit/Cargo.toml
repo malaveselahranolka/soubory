@@ -1,0 +1,14 @@
+[package]
+name = "fm-dialogkit"
+version.workspace = true
+edition.workspace = true
+description = "Adds a native-looking New menu to every Windows Open/Save dialog."
+
+[[bin]]
+name = "fm-dialogkit"
+path = "src/main.rs"
+
+[dependencies]
+windows = { workspace = true }
+fm-dialog-hook = { path = "../dialog-hook" }
+windows-numerics = "0.3"
