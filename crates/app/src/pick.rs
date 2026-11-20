@@ -80,12 +80,13 @@ impl Picker {
         !self.pipe.is_invalid() && unsafe { WriteFile(self.pipe, Some(&b), None, None) }.is_ok()
     }
 
-    /// The window is up. False when the host gave up meanwhile: the window then closes.
-    pub fn ready(&mut self) -> bool {
+    /// The window is up (the shim brings it back when the host is brought forward). False when
+    /// the host gave up meanwhile: the window then closes.
+    pub fn ready(&mut self, hwnd: HWND) -> bool {
         if self.pipe.is_invalid() {
             return true;
         }
-        self.ready = self.send(&Msg::Ready);
+        self.ready = self.send(&Msg::Ready(hwnd.0 as isize));
         if !self.ready {
             self.let_go();
         }
@@ -246,9 +247,17 @@ fn is_file(app: &App, i: usize) -> bool {
     p.is_absolute() && crate::shell::link_folder(&p).is_none()
 }
 
-/// What App::open does in a picker: a file is picked; None leaves folders to App::open.
+/// What App::open does in a picker: a file is picked; None leaves folders (and shortcuts to them)
+/// to App::open. Anything else (a phone's file, a Control Panel item) is neither picked nor launched.
 pub fn open(app: &mut App, i: usize) -> Option<()> {
-    is_file(app, i).then(|| accept(app, &[i]))
+    if is_file(app, i) {
+        accept(app, &[i]);
+        return Some(());
+    }
+    let t = app.tab();
+    let e = t.entries.get(i)?;
+    let enters = e.is_dir || (!matches!(t.loc, Loc::Shell { .. }) && e.shell.is_none() && crate::shell::link_folder(&t.path_of(i)).is_some());
+    (!enters).then_some(())
 }
 
 /// Enter and the OK button: the selected files, or into the one selected folder.
@@ -511,6 +520,11 @@ mod tests {
         assert_eq!(app.tab().sel.count(), 4);
         // Only files are picked; one folder is opened instead.
         assert!(!is_file(&app, 0) && is_file(&app, 1));
+        assert_eq!(open(&mut app, 0), None, "a folder is left to App::open");
+        // A shell item (as a phone's file is) is neither picked nor launched.
+        app.tab_mut().entries[3].shell = crate::shellns::ShellId::known(&windows::Win32::UI::Shell::FOLDERID_RecycleBinFolder);
+        assert_eq!(open(&mut app, 3), Some(()));
+        assert!(app.pick.is_some(), "nothing was answered");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -6,7 +6,7 @@
 //!    otherwise it starts `fm.exe --pick <pipe>` (only an exe carrying [`MARKER`]).
 //! 2. fm connects, the shim checks the client's process id and writes the request again as the
 //!    pipe's first message, so both ways in read it from there.
-//! 3. fm sends [`Msg::Ready`] once its window is up (this ends the shim's connect clock), then
+//! 3. fm sends [`Msg::Ready`] with its window once that is up (this ends the shim's connect clock), then
 //!    exactly one [`Msg::Picked`] or [`Msg::Cancelled`]. A pipe that breaks without an answer
 //!    means the picker is gone: the shim shows the system dialog instead.
 //!
@@ -63,6 +63,14 @@ fn join(items: &[String]) -> Vec<u16> {
     items.join("\0").encode_utf16().collect()
 }
 
+/// A window handle: `{:#x}` prints a negative one as its 64-bit two's complement.
+fn handle(v: &str) -> Option<isize> {
+    match v.strip_prefix("0x") {
+        Some(h) => u64::from_str_radix(h, 16).ok().map(|u| u as isize),
+        None => v.parse().ok(),
+    }
+}
+
 fn split(w: &[u16]) -> Vec<String> {
     String::from_utf16_lossy(w).split('\0').map(str::to_string).collect()
 }
@@ -97,12 +105,7 @@ impl Request {
             let Some((k, v)) = it.split_once('=') else { continue };
             match k {
                 "pipe" => r.pipe = v.to_string(),
-                "owner" => {
-                    r.owner = match v.strip_prefix("0x") {
-                        Some(h) => i64::from_str_radix(h, 16).ok()? as isize,
-                        None => v.parse().ok()?,
-                    }
-                }
+                "owner" => r.owner = handle(v)?,
                 "title" => r.title = v.to_string(),
                 "ok" => r.ok = v.to_string(),
                 "folder" => r.folder = v.to_string(),
@@ -125,8 +128,8 @@ impl Request {
 /// fm's messages on the pipe.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Msg {
-    /// The picker window is up.
-    Ready,
+    /// The picker window (an `HWND` as an integer) is up.
+    Ready(isize),
     /// Full paths of the picked files.
     Picked(Vec<String>),
     Cancelled,
@@ -135,7 +138,7 @@ pub enum Msg {
 impl Msg {
     pub fn encode(&self) -> Vec<u16> {
         let items: Vec<String> = match self {
-            Msg::Ready => vec![READY.into()],
+            Msg::Ready(h) => vec![READY.into(), format!("hwnd={h:#x}")],
             Msg::Picked(p) => [REPLY.to_string(), "ok".into()].into_iter().chain(p.iter().map(|s| clean(s))).chain(["end".into()]).collect(),
             Msg::Cancelled => vec![REPLY.into(), "cancel".into(), "end".into()],
         };
@@ -146,7 +149,7 @@ impl Msg {
     pub fn decode(w: &[u16]) -> Option<Msg> {
         let items = split(w);
         match items.as_slice() {
-            [r] if r == READY => Some(Msg::Ready),
+            [r, h] if r == READY => h.strip_prefix("hwnd=").and_then(handle).map(Msg::Ready),
             [r, kind, rest @ .., end] if r == REPLY && end == "end" => match kind.as_str() {
                 "cancel" if rest.is_empty() => Some(Msg::Cancelled),
                 "ok" if !rest.is_empty() && rest.iter().all(|p| !p.is_empty()) => Some(Msg::Picked(rest.to_vec())),
@@ -193,6 +196,10 @@ mod tests {
         // Through the pipe's bytes too.
         let r = req();
         assert_eq!(Request::decode(&from_bytes(&to_bytes(&r.encode())).unwrap()), Some(r));
+        // A negative handle (a sign-extended HWND) survives the hex.
+        let mut r = req();
+        r.owner = -0x7ffe_1234;
+        assert_eq!(Request::decode(&r.encode()), Some(r));
         // NULs inside a value cannot split it.
         let mut r = req();
         r.title = "a\0pipe=x".into();
@@ -216,12 +223,14 @@ mod tests {
 
     #[test]
     fn messages() {
-        for m in [Msg::Ready, Msg::Cancelled, Msg::Picked(vec![r"C:\a.txt".into(), r"D:\b c\ď.png".into()])] {
+        for m in [Msg::Ready(0x0012_0abc), Msg::Ready(-2), Msg::Ready(0), Msg::Cancelled, Msg::Picked(vec![r"C:\a.txt".into(), r"D:\b c\ď.png".into()])] {
             assert_eq!(Msg::decode(&m.encode()), Some(m));
         }
         let full = Msg::Picked(vec![r"C:\a.txt".into()]).encode();
         assert_eq!(Msg::decode(&full[..full.len() - 4]), None, "truncated");
         assert_eq!(Msg::decode(&Msg::Picked(vec![]).encode()), None, "nothing picked");
         assert_eq!(Msg::decode(&req().encode()), None);
+        let bare: Vec<u16> = READY.encode_utf16().collect();
+        assert_eq!(Msg::decode(&bare), None, "Ready without its window");
     }
 }

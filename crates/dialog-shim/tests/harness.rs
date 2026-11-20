@@ -88,7 +88,7 @@ fn fake_fm(pipe: String, answer: Msg) {
         let req = Request::decode(&proto::from_bytes(&buf[..n as usize]).unwrap()).expect("the request is the pipe's first message");
         let owner_off = req.owner != 0 && !IsWindowEnabled(HWND(req.owner as *mut c_void)).as_bool();
         SEEN.lock().unwrap().push((req, owner_off));
-        send(h, &Msg::Ready);
+        send(h, &Msg::Ready(0));
         send(h, &answer);
         let _ = CloseHandle(h);
     }
@@ -376,6 +376,11 @@ fn picker_through_the_wrapper() {
         let d = electron(FOS_PICKFOLDERS);
         assert!(show(&d, owner).is_err());
         assert!(last_show(&fm).ends_with("\tdelegate: pick folders\tsystem: cancelled"), "{}", last_show(&fm));
+        // What the picker cannot honour: a name to create, a shortcut picked as itself.
+        for (o, why) in [(FOS_CREATEPROMPT, "create prompt"), (FOS_NODEREFERENCELINKS, "shortcuts as files")] {
+            assert!(show(&electron(o), owner).is_err());
+            assert!(last_show(&fm).ends_with(&format!("\tdelegate: {why}\tsystem: cancelled")), "{}", last_show(&fm));
+        }
         assert!(SEEN.lock().unwrap().is_empty(), "fm was never asked");
 
         // 7. Kill switch: comdlg32's factory again, nothing logged.

@@ -75,7 +75,7 @@ pub fn run(req: &mut Request, owner: HWND, hosts: &Hosts) -> std::result::Result
     };
     let r = {
         let _owner = OwnerOff::new(owner);
-        pipe.wait(pid, child, &payload, hosts.connect)
+        pipe.wait(pid, child, &payload, hosts.connect, owner)
     };
     if let Some(h) = child {
         unsafe {
@@ -185,6 +185,29 @@ impl Drop for OwnerOff {
     }
 }
 
+/// The picker has no owner and ours is disabled: when the user brings the host forward (its
+/// taskbar button, Alt+Tab), the picker comes back on top, restored if minimized. Only while the
+/// host is the foreground app, which then may hand the foreground on.
+fn refocus(picker: HWND, owner: HWND) {
+    unsafe {
+        let fg = GetForegroundWindow();
+        if picker.is_invalid() || fg.is_invalid() || fg == picker || !IsWindow(Some(picker)).as_bool() {
+            return;
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(fg, Some(&mut pid));
+        if fg == owner || pid == GetCurrentProcessId() {
+            if IsIconic(picker).as_bool() {
+                let _ = ShowWindow(picker, SW_RESTORE);
+            }
+            let _ = SetForegroundWindow(picker);
+        }
+    }
+}
+
+/// The longest reply taken from fm (about 30 000 long paths); a longer one is an fm bug, not a pick.
+const MAX_MSG: usize = 8 << 20;
+
 /// One instance, message mode, local clients only, overlapped on our side.
 struct Pipe {
     name: String,
@@ -203,6 +226,8 @@ enum Read {
     /// More of a long message follows.
     More,
     Closed,
+    /// Longer than [`MAX_MSG`].
+    TooLong,
 }
 
 fn is(e: &Error, w: WIN32_ERROR) -> bool {
@@ -278,6 +303,9 @@ impl Pipe {
             return Read::More;
         }
         self.pending = false;
+        if self.msg.len() + n as usize > MAX_MSG {
+            return Read::TooLong;
+        }
         match r {
             Ok(()) => {
                 self.msg.extend_from_slice(&self.chunk[..n as usize]);
@@ -320,16 +348,24 @@ impl Pipe {
         Ok(())
     }
 
-    fn wait(&mut self, pid: u32, child: Option<HANDLE>, request: &[u16], connect: Duration) -> std::result::Result<Msg, String> {
+    fn wait(&mut self, pid: u32, child: Option<HANDLE>, request: &[u16], connect: Duration, owner: HWND) -> std::result::Result<Msg, String> {
+        const REFOCUS: Duration = Duration::from_millis(250);
         let start = Instant::now();
         let mut connected = false;
-        let mut ready = false;
+        // The picker's window, once fm said it is up.
+        let mut ready = None;
         let mut child = child;
+        let mut checked = Instant::now();
         loop {
             let mut handles = vec![self.ev];
             handles.extend(child);
-            let timeout = if ready {
-                INFINITE
+            let timeout = if let Some(picker) = ready {
+                // Checked by the clock, not on a timeout alone: a busy host's messages would starve it.
+                if checked.elapsed() >= REFOCUS {
+                    refocus(picker, owner);
+                    checked = Instant::now();
+                }
+                REFOCUS.saturating_sub(checked.elapsed()).as_millis() as u32
             } else {
                 let left = connect.saturating_sub(start.elapsed());
                 if left.is_zero() {
@@ -352,15 +388,16 @@ impl Pipe {
                             return Err("fm closed the pipe".into());
                         }
                     }
-                    Read::Closed => return Err(if ready { "picker closed without an answer" } else { "fm closed before its window" }.into()),
+                    Read::Closed => return Err(if ready.is_some() { "picker closed without an answer" } else { "fm closed before its window" }.into()),
+                    Read::TooLong => return Err("reply too long".into()),
                     Read::Done(bytes) => {
                         match proto::from_bytes(&bytes).and_then(|w| Msg::decode(&w)) {
-                            Some(Msg::Ready) => ready = true,
+                            Some(Msg::Ready(h)) => ready = Some(HWND(h as *mut _)),
                             Some(m) => return Ok(m),
                             None => return Err("unreadable message".into()),
                         }
                         if !self.start_read() {
-                            return Err(if ready { "picker closed without an answer" } else { "fm closed before its window" }.into());
+                            return Err(if ready.is_some() { "picker closed without an answer" } else { "fm closed before its window" }.into());
                         }
                     }
                 },

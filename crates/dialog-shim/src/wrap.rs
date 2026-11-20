@@ -406,8 +406,20 @@ fn valid(paths: &[String], multi: bool) -> bool {
     (multi || paths.len() == 1) && paths.iter().all(|p| Path::new(p).is_absolute() && Path::new(p).is_file())
 }
 
+/// A reference of our own while `Show()` runs: the host may release its last one from a message
+/// handler that runs inside our wait (or the real dialog's).
+struct Hold(*mut c_void);
+
+impl Drop for Hold {
+    fn drop(&mut self) {
+        unsafe { d_release(self.0) };
+    }
+}
+
 unsafe extern "system" fn show(this: *mut c_void, owner: HWND) -> HRESULT {
     guard(|| unsafe {
+        d_add(this);
+        let _hold = Hold(this);
         let d = me(this);
         let real_show = || (d.vt().base__.base__.Show)(d.raw(), owner);
         // The real dialog took every setter, so it knows the options best (defaults included).
@@ -424,6 +436,10 @@ unsafe extern "system" fn show(this: *mut c_void, owner: HWND) -> HRESULT {
                 Some("pick folders".into())
             } else if opts & FOS_ALLNONSTORAGEITEMS.0 != 0 {
                 Some("non-storage items".into())
+            } else if opts & FOS_CREATEPROMPT.0 != 0 {
+                Some("create prompt".into())
+            } else if opts & FOS_NODEREFERENCELINKS.0 != 0 {
+                Some("shortcuts as files".into())
             } else {
                 None
             };

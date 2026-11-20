@@ -125,6 +125,10 @@ pub fn restore_window(app: &App) -> bool {
 }
 
 pub fn save(app: &App) {
+    // A picker's size, place, forced hidden files and file type are not the user's defaults.
+    if app.pick.is_some() {
+        return;
+    }
     let view = match app.tab().view {
         View::Icons => "icons",
         View::List => "list",

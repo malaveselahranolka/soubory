@@ -779,7 +779,7 @@ pub fn open_window(loc: Loc, near: Option<HWND>, pick: Option<crate::pick::Picke
             let _ = SetForegroundWindow(hwnd);
             SetTimer(Some(hwnd), TIMER_PICK, 1000, None);
             // The host stopped waiting meanwhile: nobody to pick for.
-            if app.pick.as_mut().is_some_and(|p| !p.ready()) {
+            if app.pick.as_mut().is_some_and(|p| !p.ready(hwnd)) {
                 close(app);
             }
         } else if near.is_some_and(|n| GetWindowRect(n, &mut near_rect).is_ok() && !IsIconic(n).as_bool()) {
@@ -947,7 +947,7 @@ unsafe extern "system" fn hub_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
                 // (a logoff ends the process anyway; Restart Manager may not).
                 if w.0 != 0 {
                     for_each_app(|a| {
-                        if !dev_run() && a.pick.is_none() {
+                        if !dev_run() {
                             crate::prefs::save(a);
                         }
                     });
@@ -1456,6 +1456,10 @@ pub fn to_screen(app: &App, x: f32, y: f32) -> POINT {
 
 /// Ctrl+N: a new window on the same folder (Explorer), in this process.
 pub fn new_window(app: &App) {
+    // A picker answers one dialog; a --pick fm would live on for a window that is not one.
+    if app.pick.is_some() {
+        return;
+    }
     let loc = match &app.tab().loc {
         Loc::Search { .. } => crate::fsys::known_folder(&FOLDERID_Profile).map_or(Loc::Computer, Loc::Folder),
         other => other.clone(),
@@ -2837,8 +2841,7 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                     return LRESULT(0);
                 }
                 crate::quicklook::close();
-                // A picker's size, place and forced hidden files are not the user's defaults.
-                if !dev_run() && app.pick.is_none() {
+                if !dev_run() {
                     crate::prefs::save(app);
                 }
                 let _ = DestroyWindow(hwnd);
