@@ -51,17 +51,56 @@ pub(crate) fn is_skipped_name(name: &str, in_appdata: bool) -> bool {
         .any(|s| name.eq_ignore_ascii_case(s))
 }
 
-/// `true` if the folder at `path` (full, or relative to a drive root) is skipped or lies inside a
-/// skipped folder.
+/// `true` if the folder at `path` (relative to the walk root) is skipped or lies inside a skipped
+/// folder.
 pub(crate) fn under_skipped_dir(path: &str) -> bool {
+    skip_context(path).0
+}
+
+/// `(skipped, inside AppData)` for the folder at `path` (relative to the walk root). A folder
+/// moved between two paths with the same context keeps the same parts of its subtree indexed.
+pub(crate) fn skip_context(path: &str) -> (bool, bool) {
     let mut in_appdata = false;
     for seg in path.split('\\') {
         if is_skipped_name(seg, in_appdata) {
-            return true;
+            return (true, false);
         }
         in_appdata |= seg.eq_ignore_ascii_case("AppData");
     }
-    false
+    (false, in_appdata)
+}
+
+/// Removes what an index from before [`SKIPPED_DIRS`] holds inside skipped folders (the folders
+/// stay), so a snapshot saved by an older fm does not show it until the first re-walk. Returns
+/// `true` if anything was removed.
+pub(crate) fn drop_skipped_contents(idx: &mut Index) -> bool {
+    let mut doomed = vec![false; idx.parent.len()];
+    let mut any = false;
+    let mut stack: Vec<(EntryId, bool)> = idx.roots.iter().map(|&r| (r, false)).collect();
+    while let Some((dir, in_appdata)) = stack.pop() {
+        let mut c = idx.first_child[dir as usize];
+        while c != NONE {
+            if idx.is_dir(c) {
+                let name = idx.display_str_unchecked(c);
+                if is_skipped_name(name, in_appdata) {
+                    let mut k = idx.first_child[c as usize];
+                    while k != NONE {
+                        doomed[k as usize] = true;
+                        any = true;
+                        k = idx.next_sibling[k as usize];
+                    }
+                } else {
+                    stack.push((c, in_appdata || name.eq_ignore_ascii_case("AppData")));
+                }
+            }
+            c = idx.next_sibling[c as usize];
+        }
+    }
+    if any {
+        idx.remove_flagged(&doomed);
+        idx.compact();
+    }
+    any
 }
 
 /// Default 64 KiB enumeration buffer size for `GetFileInformationByHandleEx`.
@@ -1690,5 +1729,42 @@ mod tests {
         assert_eq!(live.len(), 2 + 17 * 2);
         assert!(live.lookup("R:\\D\\c3\\inner.txt").is_some());
         assert_eq!(live.lookup("R:\\D\\c4"), None);
+    }
+
+    #[test]
+    fn snapshot_from_an_older_fm_loses_skipped_contents_but_keeps_the_folders() {
+        let m = |attrs| Meta {
+            attrs,
+            size: 1,
+            mtime: 1,
+            file_id: 0,
+        };
+        let mut idx = Index::new();
+        let root = idx.add_root(r"R:\");
+        let proj = idx.insert(root, "proj", m(DIRECTORY));
+        idx.insert(proj, "app.js", m(ARCHIVE));
+        let nm = idx.insert(proj, "Node_Modules", m(DIRECTORY));
+        let react = idx.insert(nm, "react", m(DIRECTORY));
+        idx.insert(react, "index.js", m(ARCHIVE));
+        let users = idx.insert(root, "Users", m(DIRECTORY));
+        let a = idx.insert(users, "a", m(DIRECTORY));
+        let own_temp = idx.insert(a, "Temp", m(DIRECTORY));
+        idx.insert(own_temp, "mine.txt", m(ARCHIVE));
+        let appdata = idx.insert(a, "AppData", m(DIRECTORY));
+        let local = idx.insert(appdata, "Local", m(DIRECTORY));
+        let temp = idx.insert(local, "Temp", m(DIRECTORY));
+        idx.insert(temp, "x.tmp", m(ARCHIVE));
+
+        assert!(drop_skipped_contents(&mut idx));
+        let has = |p: &str| idx.lookup(p).is_some();
+        assert!(has(r"R:\proj\node_modules"));
+        assert!(!has(r"R:\proj\node_modules\react"));
+        assert!(!has(r"R:\proj\node_modules\react\index.js"));
+        assert!(has(r"R:\Users\a\AppData\Local\Temp"));
+        assert!(!has(r"R:\Users\a\AppData\Local\Temp\x.tmp"));
+        assert!(has(r"R:\proj\app.js"));
+        assert!(has(r"R:\Users\a\Temp\mine.txt"));
+        assert_eq!(idx.len(), 11);
+        assert!(!drop_skipped_contents(&mut idx), "nothing left to drop");
     }
 }

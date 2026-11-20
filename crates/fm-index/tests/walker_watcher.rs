@@ -1295,11 +1295,16 @@ fn paced_walk_rests_between_slices_and_lists_the_same() {
         .unwrap();
         (idx.len(), t.elapsed())
     };
-    let (full, fast) = walk(100);
+    let (full, _) = walk(100);
     let (paced, slow) = walk(40);
     assert_eq!((full, paced), (81, 81));
-    // 40 % duty rests 1.5x every slice of work; the last slice may end without a rest.
-    assert!(slow >= fast * 9 / 5, "paced {slow:?} vs flat out {fast:?}");
+    // 41 listings of >= 8 ms are >= 328 ms of work. At 40 % duty every 50 ms slice is followed
+    // by a rest 1.5x as long, so >= 1.5 x (328 - 50) ms of rests come on top: >= ~745 ms. A lower
+    // bound only, so a loaded CPU cannot fail it (a ratio to the flat-out run could).
+    assert!(
+        slow >= Duration::from_millis(700),
+        "paced walk took only {slow:?}"
+    );
 }
 
 #[test]

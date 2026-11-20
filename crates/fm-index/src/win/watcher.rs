@@ -28,7 +28,8 @@ use windows::core::PCWSTR;
 
 use crate::arena::{EntryId, Index, Meta, NONE, eq_case_insensitive};
 use crate::win::walker::{
-    DirSource, MAX_WALK_DEPTH, WalkFolderRef, Win32DirSource, under_skipped_dir,
+    DirSource, MAX_WALK_DEPTH, WalkFolderRef, Win32DirSource, is_skipped_name, skip_context,
+    under_skipped_dir,
 };
 use crate::win::{
     WinHandle, decode_utf16_le_into, is_cloud_reparse_tag, join_child_path, lock_or_recover,
@@ -281,6 +282,15 @@ impl DeniedFilter {
         if parent_rel_of(&rec.rel_path).is_some_and(under_skipped_dir) {
             return true;
         }
+        // The same by the parent's FileId, which also sees through an 8.3 name (`NODE_M~1`).
+        if let Some((index, root_id)) = idx
+            && use_file_id
+            && rec.parent_file_id != 0
+            && let Some(pid) = index.by_file_id(rec.parent_file_id)
+            && index_skip_context(index, root_id, pid).is_some_and(|(skipped, _)| skipped)
+        {
+            return true;
+        }
         if self.is_empty() {
             return false;
         }
@@ -320,6 +330,29 @@ impl DeniedFilter {
         }
         false
     }
+}
+
+/// [`skip_context`] of folder `id` read from the names in `idx` (long names, unlike a record's
+/// path), counted below `root_id`; `None` if `id` is not under it.
+fn index_skip_context(idx: &Index, root_id: EntryId, id: EntryId) -> Option<(bool, bool)> {
+    let mut chain = Vec::new();
+    let mut cur = id;
+    while cur != root_id {
+        if cur == NONE {
+            return None;
+        }
+        chain.push(cur);
+        cur = idx.parent[cur as usize];
+    }
+    let mut in_appdata = false;
+    for &c in chain.iter().rev() {
+        let name = idx.display_str_unchecked(c);
+        if is_skipped_name(name, in_appdata) {
+            return Some((true, false));
+        }
+        in_appdata |= name.eq_ignore_ascii_case("AppData");
+    }
+    Some((false, in_appdata))
 }
 
 fn is_descendant_of(idx: &Index, mut node: EntryId, ancestor: EntryId) -> bool {
@@ -995,25 +1028,31 @@ fn apply_added_record(
     };
     let eid = idx.insert(parent_id, &leaf, meta);
 
+    // Counted below the root like the walk (a root inside AppData\..\Temp is still indexed).
+    let (skipped, in_appdata) = index_skip_context(idx, root_id, eid).unwrap_or_default();
     let should_descend = is_dir
         && ((rec.attrs & REPARSE_POINT) == 0 || is_cloud_reparse_tag(rec.reparse_tag))
-        && !under_skipped_dir(&rec.rel_path);
+        && !skipped;
     if should_descend && idx.first_child[eid as usize] == NONE {
         let start_depth = entry_depth(idx, eid);
         if start_depth < MAX_WALK_DEPTH {
             let mut queue = VecDeque::new();
-            queue.push_back((eid, idx.path(eid), start_depth));
-            while let Some((dir_id, dir_path, depth)) = queue.pop_front() {
+            queue.push_back((eid, idx.path(eid), start_depth, in_appdata));
+            while let Some((dir_id, dir_path, depth, in_appdata)) = queue.pop_front() {
                 for child in fs.list_dir_children(&dir_path) {
                     let c_is_dir = (child.meta.attrs & DIRECTORY) != 0;
                     let c_id = idx.insert(dir_id, &child.name, child.meta);
-                    let c_path = join_child_path(&dir_path, &child.name);
                     let c_descend = c_is_dir
                         && ((child.meta.attrs & REPARSE_POINT) == 0
                             || is_cloud_reparse_tag(child.reparse_tag))
-                        && !under_skipped_dir(&c_path);
+                        && !is_skipped_name(&child.name, in_appdata);
                     if c_descend && depth + 1 < MAX_WALK_DEPTH {
-                        queue.push_back((c_id, c_path, depth + 1));
+                        queue.push_back((
+                            c_id,
+                            join_child_path(&dir_path, &child.name),
+                            depth + 1,
+                            in_appdata || child.name.eq_ignore_ascii_case("AppData"),
+                        ));
                     }
                 }
             }
@@ -1089,7 +1128,11 @@ fn apply_modified_record(
 
 #[inline]
 fn splits_into_remove_add(old: &NotifyRecord, new: &NotifyRecord, use_file_id: bool) -> bool {
-    use_file_id && old.file_id != 0 && new.file_id != 0 && old.file_id != new.file_id
+    (use_file_id && old.file_id != 0 && new.file_id != 0 && old.file_id != new.file_id)
+        // A folder crossing a skip boundary (node_modules -> nm_old, into or out of AppData) is
+        // listed afresh: the parts of its subtree the walk skips change with the path.
+        || ((new.attrs & DIRECTORY) != 0
+            && skip_context(&old.rel_path) != skip_context(&new.rel_path))
 }
 
 fn resolve_rename_source(
@@ -1185,19 +1228,6 @@ fn apply_rename_pair(
     if idx.meta(target) != new_meta {
         idx.update_meta(target, new_meta);
         changed = true;
-    }
-    // Renamed to a skipped name (e.g. npm's staging folder -> node_modules): keep only the folder.
-    // shortcut: the reverse (node_modules -> other) keeps an empty folder until the next walk.
-    if is_dir && under_skipped_dir(&new.rel_path) {
-        while let Some(child) = idx
-            .first_child
-            .get(target as usize)
-            .copied()
-            .filter(|&c| c != NONE)
-        {
-            idx.remove(child);
-            changed = true;
-        }
     }
     changed
 }
@@ -3329,7 +3359,9 @@ mod tests {
             let a = idx.insert(users, "a", meta(DIRECTORY, 11));
             idx.insert(a, "Desktop", meta(DIRECTORY, 12));
             let appdata = idx.insert(a, "AppData", meta(DIRECTORY, 13));
-            idx.insert(appdata, "Local", meta(DIRECTORY, 14));
+            let local = idx.insert(appdata, "Local", meta(DIRECTORY, 14));
+            let foo = idx.insert(local, "Foo", meta(DIRECTORY, 30));
+            idx.insert(foo, "Temp", meta(DIRECTORY, 31));
 
             let recs = [
                 rec(NotifyAction::Added, r"proj\node_modules", 5, 2, DIRECTORY),
@@ -3340,6 +3372,8 @@ mod tests {
                     5,
                     ARCHIVE,
                 ),
+                // An 8.3 name in the path: only the parent's FileId shows where it goes.
+                rec(NotifyAction::Added, r"proj\NODE_M~1\y.js", 21, 5, ARCHIVE),
                 rec(NotifyAction::Added, r"proj\lib", 7, 2, DIRECTORY),
                 rec(
                     NotifyAction::Added,
@@ -3391,6 +3425,7 @@ mod tests {
             // The folders are found by name; nothing inside them is indexed.
             assert!(has(r"R:\proj\node_modules"), "{ctx}");
             assert!(!has(r"R:\proj\node_modules\x.js"), "{ctx}");
+            assert!(!has(r"R:\proj\node_modules\y.js"), "{ctx}");
             assert!(!has(r"R:\proj\node_modules\inner.js"), "{ctx}");
             assert!(has(r"R:\Users\a\AppData\Local\Temp"), "{ctx}");
             assert!(!has(r"R:\Users\a\AppData\Local\Temp\t.tmp"), "{ctx}");
@@ -3401,6 +3436,96 @@ mod tests {
             // Ordinary folders, and a "Temp" of one's own, are listed as before.
             assert!(has(r"R:\proj\lib\inner.js"), "{ctx}");
             assert!(has(r"R:\Users\a\Desktop\Temp\inner.js"), "{ctx}");
+
+            // Out of a skip: node_modules renamed away, a folder moved out of AppData (its Temp
+            // was skipped there). Both are listed afresh, not moved with what the index lacks.
+            let recs = [
+                rec(
+                    NotifyAction::RenamedOldName,
+                    r"proj\node_modules",
+                    5,
+                    2,
+                    DIRECTORY,
+                ),
+                rec(
+                    NotifyAction::RenamedNewName,
+                    r"proj\nm_old",
+                    5,
+                    2,
+                    DIRECTORY,
+                ),
+                rec(
+                    NotifyAction::RenamedOldName,
+                    r"Users\a\AppData\Local\Foo",
+                    30,
+                    14,
+                    DIRECTORY,
+                ),
+                rec(
+                    NotifyAction::RenamedNewName,
+                    r"Users\a\Desktop\Foo",
+                    30,
+                    12,
+                    DIRECTORY,
+                ),
+            ];
+            let resolved = renames_resolved_in_index(
+                &idx,
+                root,
+                &recs,
+                None,
+                &DeniedFilter::default(),
+                use_file_id,
+            );
+            assert!(resolved.is_empty(), "{ctx}: listed from disk, {resolved:?}");
+            apply_records_filtered(
+                &mut idx,
+                root,
+                &recs,
+                &OneFile,
+                &DeniedFilter::default(),
+                use_file_id,
+            );
+            let has = |p: &str| idx.lookup(p).is_some();
+            assert!(!has(r"R:\proj\node_modules"), "{ctx}");
+            assert!(has(r"R:\proj\nm_old\inner.js"), "{ctx}");
+            assert!(!has(r"R:\Users\a\AppData\Local\Foo"), "{ctx}");
+            assert!(has(r"R:\Users\a\Desktop\Foo\inner.js"), "{ctx}");
         }
+    }
+
+    #[test]
+    fn added_folder_under_a_root_inside_appdata_temp_is_listed_whole() {
+        /// `sub` holds `deeper`, which holds `f.txt`.
+        struct Nested;
+        impl WatcherFs for Nested {
+            fn resolve_long_leaf(&self, _full_path: &str) -> Option<String> {
+                None
+            }
+            fn list_dir_children(&self, full_dir_path: &str) -> Vec<AddedChild> {
+                let (name, attrs) = if full_dir_path.ends_with(r"\sub") {
+                    ("deeper", DIRECTORY)
+                } else if full_dir_path.ends_with(r"\deeper") {
+                    ("f.txt", ARCHIVE)
+                } else {
+                    return Vec::new();
+                };
+                vec![AddedChild {
+                    name: name.to_owned(),
+                    meta: meta(attrs, 0),
+                    reparse_tag: 0,
+                }]
+            }
+        }
+        // Skips count below the root, as in the walk (a dev index under %TEMP%).
+        let mut idx = Index::new();
+        let root = idx.add_root(r"R:\Users\a\AppData\Local\Temp\dev");
+        idx.set_file_id(root, 1);
+        let recs = [rec(NotifyAction::Added, "sub", 2, 1, DIRECTORY)];
+        assert!(apply_records(&mut idx, root, &recs, &Nested));
+        assert!(
+            idx.lookup(r"R:\Users\a\AppData\Local\Temp\dev\sub\deeper\f.txt")
+                .is_some()
+        );
     }
 }

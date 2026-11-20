@@ -22,7 +22,7 @@ use crate::arena::Index;
 use crate::query::{CancelToken, SearchOptions, parse_query};
 use crate::win::walker::{
     DirSource, WalkBatch, WalkFolderRef, WalkFoldersReport, WalkOptions, Win32DirSource,
-    merge_index_with_report, walk_with_source_streaming,
+    drop_skipped_contents, merge_index_with_report, walk_with_source_streaming,
 };
 use crate::win::watcher::{
     DeniedFilter, NoopWatcherFs, NotifyRecord, VolumeWatcher, WatcherConfig, Win32WatcherFs,
@@ -1114,7 +1114,12 @@ fn load_snapshot_for_root(path: &Path, volume_serial: u32, root: &str) -> Index 
         None
     };
     match Index::load(&mut reader, expected) {
-        Ok(idx) if !idx.is_empty() && idx.lookup(root).is_some() => idx,
+        Ok(mut idx) if !idx.is_empty() && idx.lookup(root).is_some() => {
+            // A snapshot from an older fm still holds node_modules & co.; the watcher no longer
+            // updates them, so they go now rather than at the end of the first re-walk.
+            drop_skipped_contents(&mut idx);
+            idx
+        }
         _ => Index::new(),
     }
 }
