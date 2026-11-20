@@ -60,7 +60,7 @@ Nothing here has been tried by hand in daily use yet; see "Not verified" at the 
 | Cold start ≈ 200 ms (D3D device built in parallel, power-saving GPU) | ✅ (`--dev-startup`) |
 | Folder sizes in list view, live from the index | ⬜ |
 | Filter the current folder as you type | 🔶 (search scoped to the folder) |
-| Command palette (Ctrl+K) | ⬜ |
+| Command palette (Ctrl+K): every command plus every sidebar place, diacritics-insensitive | 🔶 (filtering tested and captured; running uses the menu handlers) |
 
 ## Not verified
 - By hand: real drags from Explorer, the desktop and a browser; the Mica look on the user's machine; idle CPU over hours.

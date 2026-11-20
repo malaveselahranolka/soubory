@@ -37,35 +37,35 @@ const CMIC_MASK_UNICODE: u32 = 0x4000;
 const CMIC_MASK_ASYNCOK: u32 = 0x0010_0000;
 
 // Our own menu command ids (OWN + n).
-const C_QUICKLOOK: u32 = OWN + 1;
-const C_NEW_TAB: u32 = OWN + 2;
-const C_COPY_PATH: u32 = OWN + 3;
-const C_FAVORITE: u32 = OWN + 4;
-const C_NEW_FOLDER: u32 = OWN + 5;
-const C_PASTE: u32 = OWN + 6;
-const C_TERMINAL: u32 = OWN + 7;
-const C_PROPS: u32 = OWN + 8;
-const C_HIDDEN: u32 = OWN + 9;
-const C_FOLDERS_FIRST: u32 = OWN + 10;
-const C_PREVIEW: u32 = OWN + 11;
-const C_SIDEBAR: u32 = OWN + 12;
-const C_GOTO: u32 = OWN + 13;
-const C_NEW_WINDOW: u32 = OWN + 14;
-const C_VIEW0: u32 = OWN + 20; // +0..3
-const C_SORT0: u32 = OWN + 30; // +0..4
-const C_TAG0: u32 = OWN + 40; // +0..6
-const C_TAG_CLEAR: u32 = OWN + 47;
-const C_OPEN: u32 = OWN + 50;
-const C_REMOVE_FAV: u32 = OWN + 51;
-const C_EJECT: u32 = OWN + 52;
-const C_DUPLICATE: u32 = OWN + 53;
-const C_NEW_FOLDER_WITH: u32 = OWN + 54;
-const C_SELECT_ALL: u32 = OWN + 55;
-const C_REFRESH: u32 = OWN + 56;
-const C_MAP_DRIVE: u32 = OWN + 57;
-const C_UNMAP_DRIVE: u32 = OWN + 58;
-const C_SAVE_SEARCH: u32 = OWN + 59;
-const C_REMOVE_SEARCH: u32 = OWN + 60;
+pub(crate) const C_QUICKLOOK: u32 = OWN + 1;
+pub(crate) const C_NEW_TAB: u32 = OWN + 2;
+pub(crate) const C_COPY_PATH: u32 = OWN + 3;
+pub(crate) const C_FAVORITE: u32 = OWN + 4;
+pub(crate) const C_NEW_FOLDER: u32 = OWN + 5;
+pub(crate) const C_PASTE: u32 = OWN + 6;
+pub(crate) const C_TERMINAL: u32 = OWN + 7;
+pub(crate) const C_PROPS: u32 = OWN + 8;
+pub(crate) const C_HIDDEN: u32 = OWN + 9;
+pub(crate) const C_FOLDERS_FIRST: u32 = OWN + 10;
+pub(crate) const C_PREVIEW: u32 = OWN + 11;
+pub(crate) const C_SIDEBAR: u32 = OWN + 12;
+pub(crate) const C_GOTO: u32 = OWN + 13;
+pub(crate) const C_NEW_WINDOW: u32 = OWN + 14;
+pub(crate) const C_VIEW0: u32 = OWN + 20; // +0..3
+pub(crate) const C_SORT0: u32 = OWN + 30; // +0..4
+pub(crate) const C_TAG0: u32 = OWN + 40; // +0..6
+pub(crate) const C_TAG_CLEAR: u32 = OWN + 47;
+pub(crate) const C_OPEN: u32 = OWN + 50;
+pub(crate) const C_REMOVE_FAV: u32 = OWN + 51;
+pub(crate) const C_EJECT: u32 = OWN + 52;
+pub(crate) const C_DUPLICATE: u32 = OWN + 53;
+pub(crate) const C_NEW_FOLDER_WITH: u32 = OWN + 54;
+pub(crate) const C_SELECT_ALL: u32 = OWN + 55;
+pub(crate) const C_REFRESH: u32 = OWN + 56;
+pub(crate) const C_MAP_DRIVE: u32 = OWN + 57;
+pub(crate) const C_UNMAP_DRIVE: u32 = OWN + 58;
+pub(crate) const C_SAVE_SEARCH: u32 = OWN + 59;
+pub(crate) const C_REMOVE_SEARCH: u32 = OWN + 60;
 
 thread_local! {
     /// Context menus that are being tracked; their owner-draw/init messages are forwarded.
@@ -738,6 +738,20 @@ fn more_menu_at(app: &mut App, pt: POINT) {
         let _ = DestroyMenu(m);
         own_command(app, cmd);
     }
+}
+
+/// Commands the palette runs by the same IDs as the More menu.
+pub(crate) mod cmd {
+    pub(crate) use super::{
+        C_GOTO as GOTO, C_HIDDEN as HIDDEN, C_MAP_DRIVE as MAP_DRIVE, C_NEW_FOLDER as NEW_FOLDER, C_NEW_TAB as NEW_TAB,
+        C_NEW_WINDOW as NEW_WINDOW, C_PREVIEW as PREVIEW, C_PROPS as PROPS, C_REFRESH as REFRESH, C_SAVE_SEARCH as SAVE_SEARCH,
+        C_SELECT_ALL as SELECT_ALL, C_SIDEBAR as SIDEBAR, C_SORT0 as SORT0, C_TERMINAL as TERMINAL, C_UNMAP_DRIVE as UNMAP_DRIVE,
+        C_VIEW0 as VIEW0,
+    };
+}
+
+pub fn run_command(app: &mut App, cmd: u32) {
+    own_command(app, cmd);
 }
 
 fn own_command(app: &mut App, cmd: u32) {

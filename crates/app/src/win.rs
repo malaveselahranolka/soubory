@@ -37,6 +37,7 @@ const EDIT_RENAME: usize = 101;
 const EDIT_PATH: usize = 102;
 const EDIT_BATCH_A: usize = 103;
 const EDIT_BATCH_B: usize = 104;
+const EDIT_PALETTE: usize = 105;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum EditKind {
@@ -45,6 +46,7 @@ enum EditKind {
     Path,
     BatchA,
     BatchB,
+    Palette,
 }
 
 struct Edit {
@@ -413,6 +415,15 @@ fn dev_flags(app: &mut App) {
         focus_search(app);
         if let Some((h, _)) = edit_of(app.hwnd, EditKind::Search) {
             let w = wide(&t);
+            unsafe {
+                let _ = SetWindowTextW(h, PCWSTR(w.as_ptr()));
+            }
+        }
+    }
+    if let Some(q) = val("--dev-palette") {
+        crate::palette::open(app);
+        if let Some((h, _)) = edit_of(app.hwnd, EditKind::Palette) {
+            let w = wide(&q);
             unsafe {
                 let _ = SetWindowTextW(h, PCWSTR(w.as_ptr()));
             }
@@ -882,6 +893,7 @@ fn edit_rect(app: &App, kind: EditKind, index: usize) -> crate::geom::Rect {
     match kind {
         EditKind::BatchA => crate::batch::edit_rect(app, 0),
         EditKind::BatchB => crate::batch::edit_rect(app, 1),
+        EditKind::Palette => crate::palette::edit_rect(app),
         EditKind::Search => app
             .lay
             .search
@@ -920,6 +932,7 @@ fn create_edit(
         EditKind::Search | EditKind::Path => (paint::over(t.field, t.chrome), t.ink),
         EditKind::Rename => (t.card, t.ink),
         EditKind::BatchA | EditKind::BatchB => (paint::over(t.field, t.card), t.ink),
+        EditKind::Palette => (t.card, t.ink),
     };
     let r = edit_rect(app, kind, index);
     let id = match kind {
@@ -928,6 +941,7 @@ fn create_edit(
         EditKind::Path => EDIT_PATH,
         EditKind::BatchA => EDIT_BATCH_A,
         EditKind::BatchB => EDIT_BATCH_B,
+        EditKind::Palette => EDIT_PALETTE,
     };
     let w = wide(text);
     unsafe {
@@ -1047,6 +1061,26 @@ fn position_edits(app: &App) {
 }
 
 /// (Re)creates the batch rename sheet's fields for its current mode, or removes them.
+/// Shows (and focuses) or removes the palette's text field.
+pub fn palette_field(app: &mut App, on: bool) {
+    if !on {
+        destroy_edit(app.hwnd, EditKind::Palette);
+        unsafe {
+            let _ = SetFocus(Some(app.hwnd));
+        }
+        return;
+    }
+    let h = match edit_of(app.hwnd, EditKind::Palette) {
+        Some((h, _)) => Some(h),
+        None => create_edit(app, EditKind::Palette, 0, "", (0, 0)),
+    };
+    if let Some(h) = h {
+        unsafe {
+            let _ = SetFocus(Some(h));
+        }
+    }
+}
+
 pub fn batch_fields(app: &mut App) {
     destroy_edit(app.hwnd, EditKind::BatchA);
     destroy_edit(app.hwnd, EditKind::BatchB);
@@ -1345,6 +1379,15 @@ unsafe extern "system" fn edit_proc(
                         return LRESULT(0);
                     }
                 }
+                EDIT_PALETTE => {
+                    // Home/End stay with the text; the list takes the rest.
+                    if !is_char && !matches!(vk, VK_HOME | VK_END) && crate::palette::key(app, vk) {
+                        return LRESULT(0);
+                    }
+                    if is_char && (w.0 == 13 || w.0 == 27) {
+                        return LRESULT(0);
+                    }
+                }
                 EDIT_BATCH_A | EDIT_BATCH_B => {
                     if !is_char && vk == VK_RETURN {
                         crate::batch::apply(app);
@@ -1400,6 +1443,14 @@ unsafe extern "system" fn edit_proc(
         (WM_KILLFOCUS, EDIT_RENAME) => {
             let r = unsafe { DefSubclassProc(h, m, w, l) };
             commit_rename(app, false);
+            return r;
+        }
+        (WM_KILLFOCUS, EDIT_PALETTE) => {
+            // A click in the window keeps it open (the click decides); another app closes it.
+            let r = unsafe { DefSubclassProc(h, m, w, l) };
+            if w.0 as *mut c_void != app.hwnd.0 {
+                crate::palette::close(app);
+            }
             return r;
         }
         (WM_KILLFOCUS, EDIT_PATH) => {
@@ -1755,6 +1806,12 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                             if id == EDIT_BATCH_A { b.a = t } else { b.b = t }
                         }
                         app.invalidate();
+                    }
+                }
+                if id == EDIT_PALETTE && code == EN_CHANGE {
+                    if let Some((h, _)) = edit_of(app.hwnd, EditKind::Palette) {
+                        let t = edit_text(h);
+                        crate::palette::filter(app, &t);
                     }
                 }
                 if id == EDIT_SEARCH && code == EN_CHANGE {

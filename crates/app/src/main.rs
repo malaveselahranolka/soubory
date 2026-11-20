@@ -13,6 +13,7 @@ mod gfx;
 mod icons;
 mod layout;
 mod paint;
+mod palette;
 mod prefs;
 mod quicklook;
 mod render;

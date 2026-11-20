@@ -163,6 +163,9 @@ pub enum Hit {
     Scope(usize),
     /// Batch rename sheet controls (see batch.rs codes).
     Batch(u8),
+    /// Command palette: visible row k, or elsewhere on its card.
+    Palette(usize),
+    PaletteCard,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -226,6 +229,7 @@ pub struct App {
     pub search_prev: Option<Loc>,
     /// Open "Rename N items" sheet.
     pub batch: Option<crate::batch::Batch>,
+    pub palette: Option<crate::palette::Palette>,
     /// Scope pill rects from the last frame, for hit testing.
     pub scope_rects: std::cell::RefCell<Vec<Rect>>,
     pub pressed: Hit,
@@ -278,6 +282,7 @@ impl App {
             drop_hl: None,
             search_prev: None,
             batch: None,
+            palette: None,
             scope_rects: std::cell::RefCell::new(Vec::new()),
             pressed: Hit::None,
             focus: Focus::Content,
@@ -773,6 +778,9 @@ impl App {
                 return Hit::Caption([Cap::Min, Cap::Max, Cap::Close][k]);
             }
         }
+        if self.palette.is_some() {
+            return crate::palette::hit(self, x, y);
+        }
         if self.batch.is_some() {
             // The sheet is modal for the window, as in Finder; the title bar still moves it.
             let h = crate::batch::hit(self, x, y);
@@ -923,6 +931,14 @@ impl App {
 
     pub fn mouse_down(&mut self, x: f32, y: f32, ctrl: bool, shift: bool) {
         let h = self.hit(x, y);
+        if self.palette.is_some() {
+            match h {
+                Hit::Palette(_) => self.pressed = h,
+                Hit::PaletteCard => crate::win::palette_field(self, true),
+                _ => crate::palette::close(self),
+            }
+            return;
+        }
         self.pressed = h;
         self.kb = false;
         match h {
@@ -1031,6 +1047,7 @@ impl App {
                 Col::Location => {}
             },
             Hit::Batch(code) => crate::batch::click(self, code),
+            Hit::Palette(k) => crate::palette::run(self, Some(k)),
             Hit::Scope(k) => {
                 let folder = self.search_prev.as_ref().and_then(|l| l.folder()).map(Path::to_path_buf);
                 if let Loc::Search { scope, .. } = &mut self.tab_mut().loc {
@@ -1131,6 +1148,10 @@ impl App {
     // ---- keyboard -----------------------------------------------------------------------------
 
     pub fn key(&mut self, vk: VIRTUAL_KEY, ctrl: bool, shift: bool, alt: bool) -> bool {
+        if self.palette.is_some() {
+            crate::palette::key(self, vk);
+            return true;
+        }
         if self.batch.is_some() {
             match vk {
                 VK_ESCAPE => crate::batch::close(self),
@@ -1204,6 +1225,7 @@ impl App {
             (VK_D, true, false, false) => crate::shell::duplicate(self),
             (VK_DELETE, false, s, false) => crate::shell::delete(self, s),
             (VK_F2, false, false, false) => crate::win::begin_rename(self),
+            (VK_K, true, false, false) => crate::palette::open(self),
             (VK_F5, false, false, false) => {
                 self.side_rows = sidebar::build(&self.prefs);
                 self.reload(None);
