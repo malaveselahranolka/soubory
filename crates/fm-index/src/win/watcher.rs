@@ -27,7 +27,9 @@ use windows::Win32::System::Threading::{
 use windows::core::PCWSTR;
 
 use crate::arena::{EntryId, Index, Meta, NONE, eq_case_insensitive};
-use crate::win::walker::{DirSource, MAX_WALK_DEPTH, WalkFolderRef, Win32DirSource};
+use crate::win::walker::{
+    DirSource, MAX_WALK_DEPTH, WalkFolderRef, Win32DirSource, under_skipped_dir,
+};
 use crate::win::{
     WinHandle, decode_utf16_le_into, is_cloud_reparse_tag, join_child_path, lock_or_recover,
     normalize_display_path, open_dir_handle, read_or_recover, to_extended_path, wide_null,
@@ -255,7 +257,7 @@ impl DeniedFilter {
     }
 
     fn matches_rel_dir(&self, rel_dir: &str) -> bool {
-        if self.root_denied {
+        if self.root_denied || under_skipped_dir(rel_dir) {
             return true;
         }
         if rel_dir.is_empty() || self.rel_prefixes_folded.is_empty() {
@@ -275,6 +277,10 @@ impl DeniedFilter {
         rec: &NotifyRecord,
         use_file_id: bool,
     ) -> bool {
+        // Inside a skipped folder (node_modules, ...): no walk entered it, so neither does a change.
+        if parent_rel_of(&rec.rel_path).is_some_and(under_skipped_dir) {
+            return true;
+        }
         if self.is_empty() {
             return false;
         }
@@ -989,8 +995,9 @@ fn apply_added_record(
     };
     let eid = idx.insert(parent_id, &leaf, meta);
 
-    let should_descend =
-        is_dir && ((rec.attrs & REPARSE_POINT) == 0 || is_cloud_reparse_tag(rec.reparse_tag));
+    let should_descend = is_dir
+        && ((rec.attrs & REPARSE_POINT) == 0 || is_cloud_reparse_tag(rec.reparse_tag))
+        && !under_skipped_dir(&rec.rel_path);
     if should_descend && idx.first_child[eid as usize] == NONE {
         let start_depth = entry_depth(idx, eid);
         if start_depth < MAX_WALK_DEPTH {
@@ -1000,11 +1007,13 @@ fn apply_added_record(
                 for child in fs.list_dir_children(&dir_path) {
                     let c_is_dir = (child.meta.attrs & DIRECTORY) != 0;
                     let c_id = idx.insert(dir_id, &child.name, child.meta);
+                    let c_path = join_child_path(&dir_path, &child.name);
                     let c_descend = c_is_dir
                         && ((child.meta.attrs & REPARSE_POINT) == 0
-                            || is_cloud_reparse_tag(child.reparse_tag));
+                            || is_cloud_reparse_tag(child.reparse_tag))
+                        && !under_skipped_dir(&c_path);
                     if c_descend && depth + 1 < MAX_WALK_DEPTH {
-                        queue.push_back((c_id, join_child_path(&dir_path, &child.name), depth + 1));
+                        queue.push_back((c_id, c_path, depth + 1));
                     }
                 }
             }
@@ -1176,6 +1185,19 @@ fn apply_rename_pair(
     if idx.meta(target) != new_meta {
         idx.update_meta(target, new_meta);
         changed = true;
+    }
+    // Renamed to a skipped name (e.g. npm's staging folder -> node_modules): keep only the folder.
+    // shortcut: the reverse (node_modules -> other) keeps an empty folder until the next walk.
+    if is_dir && under_skipped_dir(&new.rel_path) {
+        while let Some(child) = idx
+            .first_child
+            .get(target as usize)
+            .copied()
+            .filter(|&c| c != NONE)
+        {
+            idx.remove(child);
+            changed = true;
+        }
     }
     changed
 }
@@ -3265,6 +3287,120 @@ mod tests {
             assert!(idx.lookup("R:\\D\\Q\\c1.txt").is_some(), "{use_file_id}");
             assert!(idx.lookup("R:\\D\\Q\\c2.txt").is_some(), "{use_file_id}");
             assert_eq!(idx.lookup("R:\\D\\Q\\stale.txt"), None, "{use_file_id}");
+        }
+    }
+
+    #[test]
+    fn skipped_folders_stay_empty_when_created_or_renamed_later() {
+        use crate::win::walker::under_skipped_dir;
+        assert!(under_skipped_dir(r"proj\node_modules"));
+        assert!(under_skipped_dir(r"proj\NODE_MODULES\react\index.js"));
+        assert!(under_skipped_dir(r"Users\a\AppData\Local\Temp"));
+        assert!(under_skipped_dir(r"Users\a\AppData\Roaming\Code\Cache\x"));
+        assert!(!under_skipped_dir(r"Users\a\Desktop\Temp"));
+        assert!(!under_skipped_dir(r"Projekty\Cache"));
+        assert!(!under_skipped_dir(
+            r"Users\a\AppData\Local\Packages\X\LocalCache"
+        ));
+
+        /// Every folder lists one file.
+        struct OneFile;
+        impl WatcherFs for OneFile {
+            fn resolve_long_leaf(&self, _full_path: &str) -> Option<String> {
+                None
+            }
+            fn list_dir_children(&self, _full_dir_path: &str) -> Vec<AddedChild> {
+                vec![AddedChild {
+                    name: "inner.js".to_owned(),
+                    meta: meta(ARCHIVE, 0),
+                    reparse_tag: 0,
+                }]
+            }
+        }
+
+        for use_file_id in [true, false] {
+            let mut idx = Index::new();
+            let root = idx.add_root("R:\\");
+            idx.set_file_id(root, 1);
+            let proj = idx.insert(root, "proj", meta(DIRECTORY, 2));
+            let stage = idx.insert(proj, ".staging-1", meta(DIRECTORY, 3));
+            idx.insert(stage, "a.js", meta(ARCHIVE, 4));
+            let users = idx.insert(root, "Users", meta(DIRECTORY, 10));
+            let a = idx.insert(users, "a", meta(DIRECTORY, 11));
+            idx.insert(a, "Desktop", meta(DIRECTORY, 12));
+            let appdata = idx.insert(a, "AppData", meta(DIRECTORY, 13));
+            idx.insert(appdata, "Local", meta(DIRECTORY, 14));
+
+            let recs = [
+                rec(NotifyAction::Added, r"proj\node_modules", 5, 2, DIRECTORY),
+                rec(
+                    NotifyAction::Added,
+                    r"proj\node_modules\x.js",
+                    6,
+                    5,
+                    ARCHIVE,
+                ),
+                rec(NotifyAction::Added, r"proj\lib", 7, 2, DIRECTORY),
+                rec(
+                    NotifyAction::Added,
+                    r"Users\a\AppData\Local\Temp",
+                    15,
+                    14,
+                    DIRECTORY,
+                ),
+                rec(
+                    NotifyAction::Added,
+                    r"Users\a\AppData\Local\Temp\t.tmp",
+                    16,
+                    15,
+                    ARCHIVE,
+                ),
+                rec(
+                    NotifyAction::Added,
+                    r"Users\a\Desktop\Temp",
+                    17,
+                    12,
+                    DIRECTORY,
+                ),
+                // npm stages a package and renames it into place.
+                rec(
+                    NotifyAction::RenamedOldName,
+                    r"proj\.staging-1",
+                    3,
+                    2,
+                    DIRECTORY,
+                ),
+                rec(
+                    NotifyAction::RenamedNewName,
+                    r"proj\lib\node_modules",
+                    3,
+                    7,
+                    DIRECTORY,
+                ),
+            ];
+            assert!(apply_records_filtered(
+                &mut idx,
+                root,
+                &recs,
+                &OneFile,
+                &DeniedFilter::default(),
+                use_file_id,
+            ));
+            let has = |p: &str| idx.lookup(p).is_some();
+            let ctx = format!("use_file_id={use_file_id}");
+            // The folders are found by name; nothing inside them is indexed.
+            assert!(has(r"R:\proj\node_modules"), "{ctx}");
+            assert!(!has(r"R:\proj\node_modules\x.js"), "{ctx}");
+            assert!(!has(r"R:\proj\node_modules\inner.js"), "{ctx}");
+            assert!(has(r"R:\Users\a\AppData\Local\Temp"), "{ctx}");
+            assert!(!has(r"R:\Users\a\AppData\Local\Temp\t.tmp"), "{ctx}");
+            assert!(!has(r"R:\Users\a\AppData\Local\Temp\inner.js"), "{ctx}");
+            assert!(has(r"R:\proj\lib\node_modules"), "{ctx}");
+            assert!(!has(r"R:\proj\lib\node_modules\a.js"), "{ctx}");
+            assert!(!has(r"R:\proj\.staging-1"), "{ctx}");
+            // Ordinary folders, and a "Temp" of one's own, are listed as before.
+            assert!(has(r"R:\proj\lib\inner.js"), "{ctx}");
+            assert!(has(r"R:\Users\a\Desktop\Temp\inner.js"), "{ctx}");
         }
     }
 }

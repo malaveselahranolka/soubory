@@ -16,9 +16,9 @@ use fm_fs::attrs::{
 };
 use fm_index::win::service::{Event, Service, default_roots};
 use fm_index::win::walker::{
-    DirEntryRef, DirSource, MAX_WALK_DEPTH, RootInfo, WalkBatch, WalkFolderRef, WalkOptions,
-    Win32DirSource, merge_index, merge_index_with_report, walk_root, walk_with_source,
-    walk_with_source_report, walk_with_source_streaming,
+    DirEntryRef, DirSource, MAX_WALK_DEPTH, RootInfo, WalkBatch, WalkOptions, Win32DirSource,
+    merge_index, merge_index_with_report, walk_root, walk_with_source, walk_with_source_report,
+    walk_with_source_streaming,
 };
 use fm_index::win::watcher::{
     NoopWatcherFs, NotifyAction, NotifyRecord, VolumeWatcher, WatcherConfig, WatcherFs,
@@ -2449,7 +2449,7 @@ fn walk_on_one_or_eight_threads_builds_the_same_index() {
 }
 
 #[test]
-fn walk_lists_winsxs_but_never_enters_it_and_a_merge_drops_its_old_contents() {
+fn walk_lists_skipped_folders_but_never_enters_them_and_a_merge_drops_old_contents() {
     let entry = |name: &str, attrs: u32, file_id: u64| MockEntry {
         name: name.to_owned(),
         attrs,
@@ -2458,6 +2458,7 @@ fn walk_lists_winsxs_but_never_enters_it_and_a_merge_drops_its_old_contents() {
         file_id,
         reparse_tag: 0,
     };
+    let dir = |name: &str, file_id| entry(name, DIRECTORY, file_id);
     let mut mock = MockDirSource::new(
         RootInfo {
             volume_serial: 7,
@@ -2467,25 +2468,39 @@ fn walk_lists_winsxs_but_never_enters_it_and_a_merge_drops_its_old_contents() {
         },
         32,
     );
-    mock.nodes.insert(
-        r"M:\".to_owned(),
-        MockNodeKind::Dir(vec![entry("Windows", DIRECTORY, 2)]),
-    );
-    mock.nodes.insert(
-        r"M:\Windows".to_owned(),
-        MockNodeKind::Dir(vec![
-            entry("winsxs", DIRECTORY, 3),
-            entry("System32", DIRECTORY, 4),
-        ]),
-    );
-    mock.nodes.insert(
-        r"M:\Windows\System32".to_owned(),
-        MockNodeKind::Dir(vec![entry("kernel32.dll", ARCHIVE, 5)]),
-    );
-    mock.nodes.insert(
-        r"M:\Windows\winsxs".to_owned(),
-        MockNodeKind::Dir(vec![entry("a.dll", ARCHIVE, 6)]),
-    );
+    let tree: &[(&str, Vec<MockEntry>)] = &[
+        (
+            r"M:\",
+            vec![dir("Windows", 2), dir("proj", 3), dir("Users", 4)],
+        ),
+        (r"M:\Windows", vec![dir("winsxs", 5), dir("System32", 6)]),
+        (
+            r"M:\Windows\System32",
+            vec![entry("kernel32.dll", ARCHIVE, 7)],
+        ),
+        (r"M:\Windows\winsxs", vec![entry("a.dll", ARCHIVE, 8)]),
+        (
+            r"M:\proj",
+            vec![dir("Node_Modules", 9), entry("app.js", ARCHIVE, 10)],
+        ),
+        (
+            r"M:\proj\Node_Modules",
+            vec![entry("react.js", ARCHIVE, 11)],
+        ),
+        (r"M:\Users", vec![dir("a", 12)]),
+        (r"M:\Users\a", vec![dir("AppData", 13), dir("Temp", 14)]),
+        (r"M:\Users\a\Temp", vec![entry("mine.txt", ARCHIVE, 15)]),
+        (r"M:\Users\a\AppData", vec![dir("Local", 16)]),
+        (r"M:\Users\a\AppData\Local", vec![dir("Temp", 17)]),
+        (
+            r"M:\Users\a\AppData\Local\Temp",
+            vec![entry("x.tmp", ARCHIVE, 18)],
+        ),
+    ];
+    for (path, children) in tree {
+        mock.nodes
+            .insert((*path).to_owned(), MockNodeKind::Dir(children.clone()));
+    }
 
     let (fresh, stats, report) = walk_with_source_report(
         &mock,
@@ -2495,31 +2510,32 @@ fn walk_lists_winsxs_but_never_enters_it_and_a_merge_drops_its_old_contents() {
         |_| {},
     )
     .expect("walk succeeds");
+    let has = |idx: &Index, p: &str| idx.lookup(p).is_some();
+    let opened: Vec<String> = mock.dir_opens.lock().unwrap().keys().cloned().collect();
+    for skipped in [
+        r"M:\Windows\WinSxS",
+        r"M:\proj\node_modules",
+        r"M:\Users\a\AppData\Local\Temp",
+    ] {
+        assert!(has(&fresh, skipped), "{skipped} itself is listed");
+        assert!(
+            !opened.iter().any(|p| p.eq_ignore_ascii_case(skipped)),
+            "{skipped} is never opened"
+        );
+    }
+    assert!(!has(&fresh, r"M:\Windows\winsxs\a.dll"));
+    assert!(!has(&fresh, r"M:\proj\node_modules\react.js"));
+    assert!(!has(&fresh, r"M:\Users\a\AppData\Local\Temp\x.tmp"));
+    assert!(has(&fresh, r"M:\Windows\System32\kernel32.dll"));
+    assert!(has(&fresh, r"M:\proj\app.js"));
     assert!(
-        fresh
-            .lookup(r"M:\Windows\WinSxS")
-            .is_some_and(|id| fresh.is_dir(id))
+        has(&fresh, r"M:\Users\a\Temp\mine.txt"),
+        "a Temp of one's own stays"
     );
-    assert!(fresh.lookup(r"M:\Windows\System32\kernel32.dll").is_some());
-    assert_eq!(fresh.lookup(r"M:\Windows\winsxs\a.dll"), None);
-    assert!(
-        !mock
-            .dir_opens
-            .lock()
-            .unwrap()
-            .contains_key(r"M:\Windows\winsxs")
-    );
-    // Reported as denied, so the watcher drops changes inside it; not counted as an error.
-    assert_eq!(
-        report.denied,
-        vec![WalkFolderRef {
-            file_id: 3,
-            rel_path: r"Windows\winsxs".to_owned(),
-        }]
-    );
+    assert_eq!(report, Default::default());
     assert_eq!((stats.denied, stats.errors), (0, 0));
 
-    // An index from before the exclusion loses the folder's contents, keeps the folder.
+    // An index from before the exclusion loses the folders' contents, keeps the folders.
     let mut live = Index::new();
     let root = live.add_root(r"M:\");
     let meta = |attrs, file_id| fm_index::Meta {
@@ -2529,10 +2545,15 @@ fn walk_lists_winsxs_but_never_enters_it_and_a_merge_drops_its_old_contents() {
         file_id,
     };
     let win = live.insert(root, "Windows", meta(DIRECTORY, 2));
-    let sxs = live.insert(win, "winsxs", meta(DIRECTORY, 3));
-    live.insert(sxs, "a.dll", meta(ARCHIVE, 6));
+    let sxs = live.insert(win, "winsxs", meta(DIRECTORY, 5));
+    live.insert(sxs, "a.dll", meta(ARCHIVE, 8));
+    let proj = live.insert(root, "proj", meta(DIRECTORY, 3));
+    let nm = live.insert(proj, "Node_Modules", meta(DIRECTORY, 9));
+    live.insert(nm, "react.js", meta(ARCHIVE, 11));
     merge_index_with_report(&mut live, fresh, &report, true);
-    assert!(live.lookup(r"M:\Windows\winsxs").is_some());
-    assert_eq!(live.lookup(r"M:\Windows\winsxs\a.dll"), None);
-    assert!(live.lookup(r"M:\Windows\System32\kernel32.dll").is_some());
+    assert!(has(&live, r"M:\Windows\winsxs"));
+    assert!(has(&live, r"M:\proj\node_modules"));
+    assert!(!has(&live, r"M:\Windows\winsxs\a.dll"));
+    assert!(!has(&live, r"M:\proj\node_modules\react.js"));
+    assert!(has(&live, r"M:\Users\a\Temp\mine.txt"));
 }

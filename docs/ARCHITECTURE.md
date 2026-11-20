@@ -276,7 +276,7 @@ Preconditions:
 
 **M4a: scanner and bench**
 - Scope:
-  - Walker: thread pool, `FileIdBothDirectoryInfo` (§2), no reparse points except cloud folders, access denied counted and skipped, `SKIPPED_DIRS` (WinSxS) listed but not entered and treated like a denied folder, depth cap 512.
+  - Walker: thread pool, `FileIdBothDirectoryInfo` (§2), no reparse points except cloud folders, access denied counted and skipped, `SKIPPED_DIRS` (node_modules, WinSxS, npm-cache, site-packages, Code Cache; Temp and Cache only inside AppData) listed but never entered, and the watcher drops changes inside them, depth cap 512.
   - `examples/scan.rs`.
 - Acceptance:
   - [A] The walker matches `std::fs::read_dir` on a tree with a junction loop, a path over 260 characters and diacritics.
