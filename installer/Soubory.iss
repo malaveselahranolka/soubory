@@ -239,6 +239,8 @@ begin
 end;
 
 procedure CurPageChanged(CurPageID: Integer);
+var
+  Delta: Integer;
 begin
   { Coming from the old scripts with dialogkit installed: keep it. }
   if (CurPageID = wpSelectTasks) and not KitPreset then begin
@@ -254,6 +256,9 @@ begin
       WizardForm.FinishedLabel.Caption := CustomMessage('FinishedDefault')
     else
       WizardForm.FinishedLabel.Caption := CustomMessage('FinishedPlain');
+    { Inno placed the "Otevřít Soubory" checkbox under its own, shorter text. }
+    Delta := WizardForm.AdjustLabelHeight(WizardForm.FinishedLabel);
+    WizardForm.RunList.Top := WizardForm.RunList.Top + Delta;
   end;
 end;
 
