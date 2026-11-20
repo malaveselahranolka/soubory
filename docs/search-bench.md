@@ -18,9 +18,20 @@
 
 Earlier run (`d97f340`, before the fixes): 4.2 M entries, 71 s walk, queries 3–10 ms.
 
-## The app, the same night
+## The app, after the merge (`4c4ed0d`, release)
 
-A normal `fm.exe` (not `--new-instance`) on this machine: the startup re-walk of C: took about 40 s at background priority (~3.6 cores on average, 144 CPU-seconds), then 0.0 % CPU over the next 30 s, 449 MB working set, 29 threads. Closing the window exited in under 100 ms.
+A normal `fm.exe` (not `--new-instance`), started twice in a row, closed with WM_CLOSE:
+
+| | Run 1 (snapshot from the old build) | Run 2 (snapshot from run 1) |
+|---|---|---|
+| Startup re-walk of C: (background priority) | ~20 s, 119 CPU-s | ~20 s, 116 CPU-s |
+| Working set during the walk | 242 → 440 MB (the old snapshot was not usable; rebuilt) | 601 → 817 MB peak (snapshot loaded + fresh walk in parallel) |
+| Idle afterwards | 0–3 % of one core (0.2–0.3 CPU-s per 10 s now and then) | 0.0 % over 50 s |
+| Working set idle | 440 MB, 29 threads | 451 MB, 29 threads |
+| Snapshot | rewritten at exit (294 MB) | rewritten at exit |
+| `fm.log` index errors | none | none |
+
+Exit took under 100 ms both times. Before the merge (same night): 40 s walk, 144 CPU-s, 449 MB idle.
 
 ## Synthetic suite (2 M entries)
 

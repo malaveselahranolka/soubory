@@ -127,7 +127,9 @@ fn perform(owner: HWND, op: &Op) -> std::result::Result<(), String> {
         return Err("Položky už na místě nejsou.".into());
     }
     let (op, owner) = (op.clone(), owner.0 as usize);
+    let guard = crate::win::OpGuard::new();
     std::thread::spawn(move || unsafe {
+        let _guard = guard;
         let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED);
         run_sync(HWND(owner as *mut c_void), &op);
         windows::Win32::System::Com::CoUninitialize();

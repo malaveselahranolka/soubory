@@ -28,6 +28,98 @@ pub const WM_APP_INDEX: u32 = WM_APP + 13;
 pub const WM_APP_OPDONE: u32 = WM_APP + 14;
 pub const WM_APP_SHELLLIST: u32 = WM_APP + 15;
 pub const WM_APP_DRIVES: u32 = WM_APP + 16;
+/// The last running file operation finished (see [`OpGuard`]).
+const WM_APP_OPS_IDLE: u32 = WM_APP + 17;
+
+/// Work still running off the windows: fm's own copy/move/delete threads ([`OpGuard`]) and the
+/// shell's (a drop from Explorer, Properties, Extract All) through the process reference below.
+/// Closing the last window does not end the process while any runs, as in Explorer.
+static OPS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// The hub for threads that cannot read the UI thread's [`hub`].
+static HUB_ANY: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+fn ops_add() {
+    OPS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn ops_release() -> u32 {
+    let left = OPS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) - 1;
+    if left == 0 {
+        let hub = HWND(HUB_ANY.load(std::sync::atomic::Ordering::SeqCst) as *mut c_void);
+        unsafe {
+            let _ = PostMessageW(Some(hub), WM_APP_OPS_IDLE, WPARAM(0), LPARAM(0));
+        }
+    }
+    left as u32
+}
+
+/// Held by a worker thread for the length of one file operation; create it on the UI thread
+/// before the worker starts.
+pub struct OpGuard(());
+
+impl OpGuard {
+    pub fn new() -> OpGuard {
+        ops_add();
+        OpGuard(())
+    }
+}
+
+impl Drop for OpGuard {
+    fn drop(&mut self) {
+        ops_release();
+    }
+}
+
+/// The process reference shell threads take with `SHGetInstanceExplorer` (`CTF_PROCESS_REF`)
+/// and release when done. A static object: its count is [`OPS`].
+#[repr(C)]
+struct ProcRef {
+    vtbl: *const windows::core::IUnknown_Vtbl,
+}
+// SAFETY: immutable; its methods touch only atomics.
+unsafe impl Sync for ProcRef {}
+
+static PROC_REF_VTBL: windows::core::IUnknown_Vtbl = windows::core::IUnknown_Vtbl {
+    QueryInterface: proc_ref_qi,
+    AddRef: proc_ref_add,
+    Release: proc_ref_release,
+};
+static PROC_REF: ProcRef = ProcRef { vtbl: &PROC_REF_VTBL };
+
+unsafe extern "system" fn proc_ref_qi(this: *mut c_void, iid: *const windows::core::GUID, out: *mut *mut c_void) -> windows::core::HRESULT {
+    if out.is_null() {
+        return windows::Win32::Foundation::E_POINTER;
+    }
+    unsafe {
+        if !iid.is_null() && *iid == <windows::core::IUnknown as windows::core::Interface>::IID {
+            ops_add();
+            *out = this;
+            return windows::Win32::Foundation::S_OK;
+        }
+        *out = std::ptr::null_mut();
+    }
+    windows::Win32::Foundation::E_NOINTERFACE
+}
+
+unsafe extern "system" fn proc_ref_add(_: *mut c_void) -> u32 {
+    OPS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) as u32 + 1
+}
+
+unsafe extern "system" fn proc_ref_release(_: *mut c_void) -> u32 {
+    ops_release()
+}
+
+/// Offers [`PROC_REF`] to shell threads started in this process.
+fn register_proc_ref() {
+    let raw = &PROC_REF as *const ProcRef as *mut c_void;
+    unsafe {
+        // Borrowed: SHSetInstanceExplorer keeps the pointer without a reference of its own.
+        if let Some(unk) = windows::core::IUnknown::from_raw_borrowed(&raw) {
+            windows::Win32::UI::Shell::SHSetInstanceExplorer(unk);
+        }
+    }
+}
+
 /// Hub timer that coalesces a burst of drive notifications (one USB stick sends several).
 const TIMER_DRIVES: usize = 0xD1;
 const TIMER_FS: usize = 1;
@@ -193,6 +285,8 @@ pub fn run(start: Loc) -> i32 {
             None,
         ) {
             HUB.with(|c| c.set(h.0 as isize));
+            HUB_ANY.store(h.0 as isize, std::sync::atomic::Ordering::SeqCst);
+            register_proc_ref();
             watch_drives(h);
         }
 
@@ -361,6 +455,12 @@ unsafe extern "system" fn hub_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
             }
             WM_APP_INDEX => {
                 crate::search::index_event(w, l);
+                Some(LRESULT(0))
+            }
+            WM_APP_OPS_IDLE => {
+                if windows().is_empty() && OPS.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                    PostQuitMessage(0);
+                }
                 Some(LRESULT(0))
             }
             WM_APP_DRIVES => {
@@ -540,6 +640,21 @@ fn dev_keys(app: &mut App, script: &str, out: Option<String>) {
             for e in t.entries.iter().filter(|e| e.origin.as_deref().unwrap_or("").contains("scratchpad")) {
                 log += &format!("  {} | from {} | deleted>0={} | shell={}\n", e.name, e.origin.clone().unwrap_or_default(), e.modified > 0, e.shell.is_some());
             }
+        } else if step == "procref" {
+            // What a shell thread with CTF_PROCESS_REF sees.
+            let before = OPS.load(std::sync::atomic::Ordering::SeqCst);
+            let held = unsafe { windows::Win32::UI::Shell::SHGetInstanceExplorer() };
+            let during = OPS.load(std::sync::atomic::Ordering::SeqCst);
+            let ok = held.is_ok();
+            drop(held);
+            log += &format!("procref ok={ok} ops {before} -> {during} -> {}\n", OPS.load(std::sync::atomic::Ordering::SeqCst));
+        } else if step == "close" {
+            // Last step: the window goes once the message loop runs.
+            unsafe {
+                let _ = PostMessageW(Some(app.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+            }
+            log += &format!("close with ops={}\n", OPS.load(std::sync::atomic::Ordering::SeqCst));
+            break;
         } else if step == "dump" {
             app.reload(None);
             let names: Vec<String> = app.tab().entries.iter().map(|e| e.name.clone()).collect();
@@ -1618,7 +1733,8 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
             if !p.is_null() {
                 drop(Box::from_raw(p));
             }
-            if windows().is_empty() {
+            // With a copy or move still running the process stays (windowless) until it ends.
+            if windows().is_empty() && OPS.load(std::sync::atomic::Ordering::SeqCst) == 0 {
                 PostQuitMessage(0);
             }
             return DefWindowProcW(hwnd, msg, wparam, lparam);

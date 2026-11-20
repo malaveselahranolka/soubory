@@ -1149,7 +1149,9 @@ pub enum Op {
 pub fn file_op(owner: HWND, paths: Vec<PathBuf>, dest: Option<PathBuf>, op: Op, record: bool) {
     let owner_raw = owner.0 as usize;
     let hub = crate::win::hub().0 as usize;
+    let guard = crate::win::OpGuard::new();
     std::thread::spawn(move || unsafe {
+        let _guard = guard;
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
         let done = file_op_sync(HWND(owner_raw as *mut c_void), &paths, dest.as_deref(), op);
         if record {
@@ -1345,7 +1347,9 @@ fn duplicate_into(app: &mut App, dir: &Path, paths: Vec<PathBuf>) {
         made.push(dir.join(&target));
         std::thread::spawn({
             let (p, dir, owner) = (p.clone(), dir.to_path_buf(), app.hwnd.0 as usize);
+            let guard = crate::win::OpGuard::new();
             move || unsafe {
+                let _guard = guard;
                 let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
                 let run = || -> Result<()> {
                     let fo: IFileOperation = CoCreateInstance(&FileOperation, None, CLSCTX_ALL)?;
