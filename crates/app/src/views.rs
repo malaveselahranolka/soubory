@@ -388,7 +388,7 @@ fn column_row(app: &mut App, c: &mut Canvas, t: &Theme, r: Rect, e: &Entry, icon
     }
     c.text(&e.name, name_r, Font::Body, Color { a: ink.a * dim, ..ink }, Align::Start);
     if e.is_dir {
-        c.glyph(crate::paint::g::RIGHT, Rect::new(cap.r() - 20.0, r.y, 16.0, r.h), 8, if sel.is_some() { ink } else { t.ink3 });
+        c.icon(crate::paint::g::RIGHT, crate::phosphor::Weight::Bold, Rect::new(cap.r() - 20.0, r.y, 16.0, r.h), 10.0, if sel.is_some() { ink } else { t.ink3 });
     }
 }
 

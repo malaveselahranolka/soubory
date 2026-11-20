@@ -9,27 +9,30 @@ use crate::theme::{Color, Mode, Theme};
 use windows::Win32::Foundation::POINT;
 
 pub mod g {
-    pub const PANE: char = '\u{E8A0}';
-    pub const BACK: char = '\u{E72B}';
-    pub const FWD: char = '\u{E72A}';
-    pub const MORE: char = '\u{E712}';
-    pub const SEARCH: char = '\u{E721}';
+    use crate::phosphor::Ico;
+    pub const PANE: Ico = Ico::SidebarSimple;
+    pub const BACK: Ico = Ico::ArrowLeft;
+    pub const FWD: Ico = Ico::ArrowRight;
+    pub const MORE: Ico = Ico::DotsThree;
+    pub const SEARCH: Ico = Ico::MagnifyingGlass;
+    // The caption buttons stay Segoe: they are Windows' own.
     pub const MIN: char = '\u{E921}';
     pub const MAX: char = '\u{E922}';
     pub const RESTORE: char = '\u{E923}';
     pub const CLOSE: char = '\u{E8BB}';
-    pub const UP: char = '\u{E70E}';
-    pub const DOWN: char = '\u{E70D}';
-    pub const RIGHT: char = '\u{E76C}';
-    pub const ADD: char = '\u{E710}';
-    pub const CLOUD: char = '\u{E753}';
-    pub const PINNED: char = '\u{E73E}';
-    pub const WARN: char = '\u{E7BA}';
-    pub const EMPTY: char = '\u{E8B7}';
-    pub const VIEW_ICONS: char = '\u{F0E2}';
-    pub const VIEW_LIST: char = '\u{EA37}';
-    pub const VIEW_COLUMNS: char = '\u{E8C0}';
-    pub const VIEW_GALLERY: char = '\u{E8B9}';
+    pub const TAB_CLOSE: Ico = Ico::X;
+    pub const UP: Ico = Ico::CaretUp;
+    pub const DOWN: Ico = Ico::CaretDown;
+    pub const RIGHT: Ico = Ico::CaretRight;
+    pub const ADD: Ico = Ico::Plus;
+    pub const CLOUD: Ico = Ico::Cloud;
+    pub const PINNED: Ico = Ico::Check;
+    pub const WARN: Ico = Ico::Warning;
+    pub const EMPTY: Ico = Ico::FolderOpen;
+    pub const VIEW_ICONS: Ico = Ico::SquaresFour;
+    pub const VIEW_LIST: Ico = Ico::ListBullets;
+    pub const VIEW_COLUMNS: Ico = Ico::Columns;
+    pub const VIEW_GALLERY: Ico = Ico::Slideshow;
 }
 
 fn with_alpha(c: Color, a: f32) -> Color {
@@ -120,7 +123,7 @@ pub fn paint(app: &mut App, c: &mut Canvas) {
 
 // ---- toolbar --------------------------------------------------------------------------------------
 
-fn button(app: &App, c: &mut Canvas, t: &Theme, r: Rect, hit: Hit, glyph: char, enabled: bool) {
+fn button(app: &App, c: &mut Canvas, t: &Theme, r: Rect, hit: Hit, glyph: crate::phosphor::Ico, enabled: bool) {
     let bg = if !enabled {
         None
     } else if app.pressed == hit && app.hover == hit {
@@ -140,7 +143,7 @@ fn button(app: &App, c: &mut Canvas, t: &Theme, r: Rect, hit: Hit, glyph: char, 
     } else {
         t.ink2
     };
-    c.glyph(glyph, r, 16, ink);
+    c.icon(glyph, crate::phosphor::Weight::Bold, r, 16.0, ink);
 }
 
 fn toolbar(app: &App, c: &mut Canvas, t: &Theme) {
@@ -198,7 +201,7 @@ fn toolbar(app: &App, c: &mut Canvas, t: &Theme) {
         } else if app.hover == Hit::View(k) {
             c.round(inner, 5.0, t.hover);
         }
-        c.glyph(gl, *r, 14, if k == cur { t.ink } else { t.ink2 });
+        c.icon(gl, crate::phosphor::Weight::Bold, *r, 16.0, if k == cur { t.ink } else { t.ink2 });
     }
     button(app, c, t, l.more, Hit::More, g::MORE, true);
 
@@ -216,7 +219,7 @@ fn toolbar(app: &App, c: &mut Canvas, t: &Theme) {
         edge,
         if app.focus == Focus::Search { 1.5 } else { 0.0 },
     );
-    c.glyph(g::SEARCH, l.search.left(30.0), 12, t.ink3);
+    c.icon(g::SEARCH, crate::phosphor::Weight::Bold, l.search.left(30.0), 14.0, t.ink3);
     if !crate::win::search_active(app) {
         let (txt, ink) = if app.search_text.is_empty() {
             ("Hledat", t.ink3)
@@ -599,13 +602,13 @@ fn tabs(app: &App, c: &mut Canvas, t: &Theme, r: Rect) {
             if app.hover == Hit::TabClose(k) {
                 c.round(x, 4.0, t.hover);
             }
-            c.glyph(g::CLOSE, x, 8, t.ink2);
+            c.icon(g::TAB_CLOSE, crate::phosphor::Weight::Bold, x, 10.0, t.ink2);
         }
     }
     if app.hover == Hit::NewTab {
         c.round(plus.center(26.0, 24.0), 5.0, t.hover);
     }
-    c.glyph(g::ADD, plus, 12, t.ink2);
+    c.icon(g::ADD, crate::phosphor::Weight::Bold, plus, 12.0, t.ink2);
     c.hline(plus.x, plus.r(), plus.b() - 1.0 / c.scale, t.edge);
 }
 
@@ -683,12 +686,7 @@ fn header(app: &App, c: &mut Canvas, t: &Theme, h: Rect) {
             } else {
                 tr.x + c.measure(col.title(), Font::Small) + 4.0
             };
-            c.glyph(
-                if tab.asc { g::UP } else { g::DOWN },
-                Rect::new(gx, r.y, 14.0, r.h),
-                8,
-                t.ink2,
-            );
+            c.icon(if tab.asc { g::UP } else { g::DOWN }, crate::phosphor::Weight::Bold, Rect::new(gx, r.y, 14.0, r.h), 10.0, t.ink2);
         }
         if k > 0 {
             c.vline(r.x, r.y + 8.0, r.b() - 8.0, t.edge);
@@ -833,12 +831,7 @@ fn list_view(app: &mut App, c: &mut Canvas, t: &Theme) {
                     let mut nr = Rect::new(cell.x + 28.0, r.y, cell.w - 36.0, r.h);
                     let status = cloud_glyph(&e);
                     if let Some(gl) = status {
-                        c.glyph(
-                            gl,
-                            nr.right(18.0),
-                            12,
-                            if selected { sel_ink } else { t.ink3 },
-                        );
+                        c.icon(gl, crate::phosphor::Weight::Bold, nr.right(18.0), 12.0, if selected { sel_ink } else { t.ink3 });
                         nr = nr.cut_right(22.0);
                     }
                     let mask = crate::tags::mask(&app.tab().path_of(i));
@@ -954,7 +947,7 @@ fn group_header(app: &App, c: &mut Canvas, t: &Theme, r: Rect, label: &str, coun
     c.hline(left, right, r.b() - 1.0, t.edge);
 }
 
-fn cloud_glyph(e: &fsys::Entry) -> Option<char> {
+fn cloud_glyph(e: &fsys::Entry) -> Option<crate::phosphor::Ico> {
     use fm_fs::attrs::*;
     if e.attrs & PINNED != 0 {
         Some(g::PINNED)
@@ -1020,7 +1013,7 @@ fn empty_state(app: &App, c: &mut Canvas, t: &Theme, b: Rect) {
         ),
     };
     let mid = b.center(b.w.min(420.0), 120.0);
-    c.glyph(glyph, mid.top(40.0), 28, t.ink3);
+    c.icon(glyph, crate::phosphor::Weight::Bold, mid.top(40.0), 28.0, t.ink3);
     c.text(
         &title,
         Rect::new(mid.x, mid.y + 48.0, mid.w, 24.0),
@@ -1351,7 +1344,7 @@ fn status(app: &App, c: &mut Canvas, t: &Theme) {
             if app.hover == Hit::CrumbMenu(k) {
                 c.round(ch, 4.0, t.hover);
             }
-            c.glyph(g::RIGHT, ch, 8, t.ink3);
+            c.icon(g::RIGHT, crate::phosphor::Weight::Bold, ch, 10.0, t.ink3);
         }
     }
     let tab = app.tab();

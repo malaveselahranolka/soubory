@@ -13,7 +13,7 @@ const NAMES = [
   'hard-drive', 'hard-drives', 'usb', 'network', 'desktop-tower', 'folder', 'eject', 'trash', 'file-magnifying-glass',
   // toolbar, headers, tabs, states
   'sidebar-simple', 'arrow-left', 'arrow-right', 'dots-three', 'magnifying-glass', 'squares-four', 'list-bullets', 'columns',
-  'slideshow', 'caret-up', 'caret-down', 'caret-right', 'plus', 'x', 'push-pin', 'warning', 'folder-open',
+  'slideshow', 'caret-up', 'caret-down', 'caret-right', 'plus', 'x', 'push-pin', 'warning', 'folder-open', 'check',
   // file types: 16 px glyphs and the glyph inside the large page
   'file', 'file-zip', 'file-image', 'file-audio', 'file-video', 'file-code', 'disc', 'text-align-left', 'hash', 'article',
   'archive', 'table', 'presentation-chart', 'text-aa', 'brackets-curly', 'code',

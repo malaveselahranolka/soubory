@@ -39,6 +39,7 @@ pub enum Ico {
     PushPin,
     Warning,
     FolderOpen,
+    Check,
     File,
     FileZip,
     FileImage,
@@ -65,7 +66,7 @@ pub enum Weight {
 }
 
 impl Ico {
-    pub const ALL: [Ico; 51] = [Ico::ClockCounterClockwise, Ico::House, Ico::Monitor, Ico::FileText, Ico::DownloadSimple, Ico::Image, Ico::MusicNotes, Ico::FilmStrip, Ico::Cloud, Ico::HardDrive, Ico::HardDrives, Ico::Usb, Ico::Network, Ico::DesktopTower, Ico::Folder, Ico::Eject, Ico::Trash, Ico::FileMagnifyingGlass, Ico::SidebarSimple, Ico::ArrowLeft, Ico::ArrowRight, Ico::DotsThree, Ico::MagnifyingGlass, Ico::SquaresFour, Ico::ListBullets, Ico::Columns, Ico::Slideshow, Ico::CaretUp, Ico::CaretDown, Ico::CaretRight, Ico::Plus, Ico::X, Ico::PushPin, Ico::Warning, Ico::FolderOpen, Ico::File, Ico::FileZip, Ico::FileImage, Ico::FileAudio, Ico::FileVideo, Ico::FileCode, Ico::Disc, Ico::TextAlignLeft, Ico::Hash, Ico::Article, Ico::Archive, Ico::Table, Ico::PresentationChart, Ico::TextAa, Ico::BracketsCurly, Ico::Code];
+    pub const ALL: [Ico; 52] = [Ico::ClockCounterClockwise, Ico::House, Ico::Monitor, Ico::FileText, Ico::DownloadSimple, Ico::Image, Ico::MusicNotes, Ico::FilmStrip, Ico::Cloud, Ico::HardDrive, Ico::HardDrives, Ico::Usb, Ico::Network, Ico::DesktopTower, Ico::Folder, Ico::Eject, Ico::Trash, Ico::FileMagnifyingGlass, Ico::SidebarSimple, Ico::ArrowLeft, Ico::ArrowRight, Ico::DotsThree, Ico::MagnifyingGlass, Ico::SquaresFour, Ico::ListBullets, Ico::Columns, Ico::Slideshow, Ico::CaretUp, Ico::CaretDown, Ico::CaretRight, Ico::Plus, Ico::X, Ico::PushPin, Ico::Warning, Ico::FolderOpen, Ico::Check, Ico::File, Ico::FileZip, Ico::FileImage, Ico::FileAudio, Ico::FileVideo, Ico::FileCode, Ico::Disc, Ico::TextAlignLeft, Ico::Hash, Ico::Article, Ico::Archive, Ico::Table, Ico::PresentationChart, Ico::TextAa, Ico::BracketsCurly, Ico::Code];
 
     pub fn path(self, w: Weight) -> &'static str {
         match (self, w) {
@@ -139,6 +140,8 @@ impl Ico {
             (Ico::Warning, Weight::Fill) => "M236.8,188.09,149.35,36.22h0a24.76,24.76,0,0,0-42.7,0L19.2,188.09a23.51,23.51,0,0,0,0,23.72A24.35,24.35,0,0,0,40.55,224h174.9a24.35,24.35,0,0,0,21.33-12.19A23.51,23.51,0,0,0,236.8,188.09ZM120,104a8,8,0,0,1,16,0v40a8,8,0,0,1-16,0Zm8,88a12,12,0,1,1,12-12A12,12,0,0,1,128,192Z",
             (Ico::FolderOpen, Weight::Bold) => "M248.23,112.31A20,20,0,0,0,232,104H220V88a20,20,0,0,0-20-20H132L105.34,48a20.12,20.12,0,0,0-12-4H40A20,20,0,0,0,20,64V208a12,12,0,0,0,12,12H211.1a12,12,0,0,0,11.33-8l28.49-81.47.06-.17A20,20,0,0,0,248.23,112.31ZM92,68l28.8,21.6A12,12,0,0,0,128,92h68v12H69.77a20,20,0,0,0-18.94,13.58L44,137.15V68ZM202.59,196H48.89l23.72-68H226.37Z",
             (Ico::FolderOpen, Weight::Fill) => "M245,110.64A16,16,0,0,0,232,104H216V88a16,16,0,0,0-16-16H130.67L102.94,51.2a16.14,16.14,0,0,0-9.6-3.2H40A16,16,0,0,0,24,64V208h0a8,8,0,0,0,8,8H211.1a8,8,0,0,0,7.59-5.47l28.49-85.47A16.05,16.05,0,0,0,245,110.64ZM93.34,64,123.2,86.4A8,8,0,0,0,128,88h72v16H69.77a16,16,0,0,0-15.18,10.94L40,158.7V64Z",
+            (Ico::Check, Weight::Bold) => "M232.49,80.49l-128,128a12,12,0,0,1-17,0l-56-56a12,12,0,1,1,17-17L96,183,215.51,63.51a12,12,0,0,1,17,17Z",
+            (Ico::Check, Weight::Fill) => "M216,40H40A16,16,0,0,0,24,56V200a16,16,0,0,0,16,16H216a16,16,0,0,0,16-16V56A16,16,0,0,0,216,40ZM205.66,85.66l-96,96a8,8,0,0,1-11.32,0l-40-40a8,8,0,0,1,11.32-11.32L104,164.69l90.34-90.35a8,8,0,0,1,11.32,11.32Z",
             (Ico::File, Weight::Bold) => "M216.49,79.52l-56-56A12,12,0,0,0,152,20H56A20,20,0,0,0,36,40V216a20,20,0,0,0,20,20H200a20,20,0,0,0,20-20V88A12,12,0,0,0,216.49,79.52ZM160,57l23,23H160ZM60,212V44h76V92a12,12,0,0,0,12,12h48V212Z",
             (Ico::File, Weight::Fill) => "M213.66,82.34l-56-56A8,8,0,0,0,152,24H56A16,16,0,0,0,40,40V216a16,16,0,0,0,16,16H200a16,16,0,0,0,16-16V88A8,8,0,0,0,213.66,82.34ZM152,88V44l44,44Z",
             (Ico::FileZip, Weight::Bold) => "M188,140H172a12,12,0,0,0-12,12v56a12,12,0,0,0,24,0v-4h4a32,32,0,0,0,0-64Zm0,40h-4V164h4a8,8,0,0,1,0,16Zm-48-28v56a12,12,0,0,1-24,0V152a12,12,0,0,1,24,0ZM96,208a12,12,0,0,1-12,12H52a12,12,0,0,1-10.42-17.95L63.32,164H52a12,12,0,0,1,0-24H84A12,12,0,0,1,94.42,158L72.68,196H84A12,12,0,0,1,96,208ZM216.49,79.52l-56-56A12,12,0,0,0,152,20H56A20,20,0,0,0,36,40v68a12,12,0,0,0,24,0V44h76V92a12,12,0,0,0,12,12h48v4a12,12,0,0,0,24,0V88A12,12,0,0,0,216.49,79.52ZM160,80V57l23,23Z",

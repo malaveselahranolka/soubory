@@ -251,7 +251,7 @@ pub fn paint(app: &App, c: &mut Canvas, t: &Theme) {
     }
     c.round(card, 12.0, t.card);
     c.round_stroke(card, 12.0, t.edge, 0.0);
-    c.glyph(crate::paint::g::SEARCH, Rect::new(card.x + 14.0, card.y, 20.0, FIELD), 14, t.ink3);
+    c.icon(crate::paint::g::SEARCH, crate::phosphor::Weight::Bold, Rect::new(card.x + 14.0, card.y, 20.0, FIELD), 14.0, t.ink3);
     c.hline(card.x, card.r(), card.y + FIELD, t.edge);
     if p.shown.is_empty() {
         let r = Rect::new(card.x + 16.0, card.y + FIELD + 6.0, card.w - 32.0, ROW);
