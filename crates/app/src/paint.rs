@@ -3,7 +3,7 @@ use crate::app::{App, Cap, Drag, Focus, Hit, Loc, View};
 use crate::fsys::{self, SortKey};
 use crate::geom::Rect;
 use crate::gfx::{Align, Canvas, Font};
-use crate::layout::{self, Col, INSET, ROW_H, SIDE_HEADER, SIDE_ROW};
+use crate::layout::{self, Col, INSET, SIDE_HEADER, SIDE_ROW};
 use crate::sidebar::Row;
 use crate::theme::{Color, Mode, Theme};
 use windows::Win32::Foundation::POINT;
@@ -690,19 +690,26 @@ fn list_view(app: &mut App, c: &mut Canvas, t: &Theme) {
         empty_state(app, c, t, b);
         return;
     }
-    let first = (app.tab().scroll / ROW_H) as usize;
-    let last = (((app.tab().scroll + b.h) / ROW_H).ceil() as usize + 1).min(n);
     let cols = col_layout(app);
     let (sel_fill, sel_ink) = sel_colors(app, t);
     let renaming = crate::win::renaming_index(app);
-    for i in first..last {
+    let geo_groups = app.shown_groups().to_vec();
+    // Each group's rows: stripes restart and selections do not merge across a header.
+    let span = |i: usize| match geo_groups.get(geo_groups.partition_point(|g| g.start <= i).wrapping_sub(1)) {
+        Some(g) => (g.start, g.start + g.len),
+        None => (0, n),
+    };
+    let under_pin = pin_clip(app, c);
+    for i in app.visible_items() {
         let r = app.row_rect(i);
         let cap = r.inset(INSET, 0.0);
         let selected = app.tab().sel.is(i);
+        let (start, end) = span(i);
+        let odd = (i - start) % 2 == 1;
         if selected {
             // Adjacent selected rows merge into one capsule, like Finder.
-            let prev = i > 0 && app.tab().sel.is(i - 1);
-            let next = app.tab().sel.is(i + 1);
+            let prev = i > start && app.tab().sel.is(i - 1);
+            let next = i + 1 < end && app.tab().sel.is(i + 1);
             let rad = 6.0;
             c.round_corners(
                 cap,
@@ -715,7 +722,7 @@ fn list_view(app: &mut App, c: &mut Canvas, t: &Theme) {
                 sel_fill,
                 None,
             );
-        } else if i % 2 == 1 {
+        } else if odd {
             c.round(cap, 6.0, t.stripe);
         }
         if app.kb && app.tab().sel.focus == Some(i) && app.focus == Focus::Content && !selected {
@@ -751,7 +758,7 @@ fn list_view(app: &mut App, c: &mut Canvas, t: &Theme) {
                     if mask != 0 {
                         let bg = if selected {
                             sel_fill
-                        } else if i % 2 == 1 {
+                        } else if odd {
                             over(t.stripe, t.card)
                         } else {
                             t.card
@@ -809,6 +816,54 @@ fn list_view(app: &mut App, c: &mut Canvas, t: &Theme) {
             }
         }
     }
+    if under_pin {
+        c.pop_clip();
+    }
+    group_headers(app, c, t);
+}
+
+/// Items are not painted under the pinned group header (the card is translucent over Mica, so
+/// covering them would not hide them). Returns whether a clip was pushed.
+fn pin_clip(app: &App, c: &mut Canvas) -> bool {
+    let Some((_, r)) = app.pinned_header() else { return false };
+    let b = app.lay.body;
+    c.push_clip(Rect::new(b.x, r.b(), b.w, (b.b() - r.b()).max(0.0)));
+    true
+}
+
+/// Group by headers, then the one pinned to the top over the rows scrolling under it.
+fn group_headers(app: &App, c: &mut Canvas, t: &Theme) {
+    let groups = app.shown_groups();
+    if groups.is_empty() {
+        return;
+    }
+    let b = app.lay.body;
+    let pinned = app.pinned_header();
+    for (g, gr) in groups.iter().enumerate() {
+        let r = app.group_header_rect(g);
+        if r.b() <= b.y || r.y >= b.b() || pinned.is_some_and(|(p, _)| p == g) {
+            continue;
+        }
+        group_header(app, c, t, r, &gr.label, gr.len);
+    }
+    if let Some((g, r)) = pinned {
+        group_header(app, c, t, r, &groups[g].label, groups[g].len);
+    }
+}
+
+fn group_header(app: &App, c: &mut Canvas, t: &Theme, r: Rect, label: &str, count: usize) {
+    // Aligned with the items: the list's icon column, or the icon grid's left edge.
+    let (left, right) = if app.tab().view == View::Icons {
+        let g = app.grid();
+        (g.x0 + 8.0, g.x0 + g.cols as f32 * g.tile_w - 8.0)
+    } else {
+        (r.x + INSET + 6.0, r.r() - INSET)
+    };
+    let text = Rect::new(left, r.b() - 26.0, (right - left).max(0.0), 22.0);
+    let w = c.measure(label, Font::BodyStrong).min(text.w);
+    c.text(label, text, Font::BodyStrong, t.ink, Align::Start);
+    c.text(&count.to_string(), Rect::new(text.x + w + 8.0, text.y, 80.0, text.h), Font::Small, t.ink3, Align::Start);
+    c.hline(left, right, r.b() - 1.0, t.edge);
 }
 
 fn cloud_glyph(e: &fsys::Entry) -> Option<char> {
@@ -916,12 +971,10 @@ fn icon_view(app: &mut App, c: &mut Canvas, t: &Theme) {
         empty_state(app, c, t, b);
         return;
     }
-    let grid = app.grid();
-    let first_row = ((app.tab().scroll - 8.0) / grid.tile_h).floor().max(0.0) as usize;
-    let rows_vis = (b.h / grid.tile_h).ceil() as usize + 2;
     let (sel_fill, sel_ink) = sel_colors(app, t);
     let renaming = crate::win::renaming_index(app);
-    for i in (first_row * grid.cols)..((first_row + rows_vis) * grid.cols).min(n) {
+    let under_pin = pin_clip(app, c);
+    for i in app.visible_items() {
         let (icon, name) = tile_parts(app, i);
         let selected = app.tab().sel.is(i);
         let e = app.tab().entries[i].clone();
@@ -1010,6 +1063,10 @@ fn icon_view(app: &mut App, c: &mut Canvas, t: &Theme) {
             );
         }
     }
+    if under_pin {
+        c.pop_clip();
+    }
+    group_headers(app, c, t);
 }
 
 fn band(app: &App, c: &mut Canvas, t: &Theme) {
@@ -1039,7 +1096,10 @@ fn crumb_layout(app: &App) -> Vec<(Rect, Loc, String)> {
     };
     let Some(gfx) = app.gfx() else { return out };
     let mut x = s.x + 12.0;
-    let max_x = s.r() - 220.0;
+    // The crumbs end where the status text (and the icon-size slider) begin.
+    let text_w = gfx.measure(&status_line(app), Font::Caption).min(260.0);
+    let slider_w = if app.tab().view == View::Icons { slider_rect(app).w + 24.0 } else { 0.0 };
+    let max_x = s.r() - 12.0 - slider_w - text_w - 20.0;
     // Collapse leading crumbs when the bar is too narrow.
     let widths: Vec<f32> = crumbs
         .iter()
@@ -1158,15 +1218,7 @@ fn status(app: &App, c: &mut Canvas, t: &Theme) {
         c.circle(kx, sr.cy(), 3.5, t.accent_glyph);
         right = right.cut_right(sr.w + 24.0);
     }
-    let text = if let Some((note, at)) = &app.status_note {
-        if at.elapsed().as_secs_f32() < 3.0 {
-            note.clone()
-        } else {
-            status_text(app)
-        }
-    } else {
-        status_text(app)
-    };
+    let text = status_line(app);
     c.text(
         &text,
         Rect::new(right.r() - 260.0, s.y, 260.0, s.h),
@@ -1174,6 +1226,14 @@ fn status(app: &App, c: &mut Canvas, t: &Theme) {
         t.ink3,
         Align::End,
     );
+}
+
+/// A note for three seconds after it is set, the item count otherwise.
+fn status_line(app: &App) -> String {
+    match &app.status_note {
+        Some((note, at)) if at.elapsed().as_secs_f32() < 3.0 => note.clone(),
+        _ => status_text(app),
+    }
 }
 
 pub fn status_text(app: &App) -> String {

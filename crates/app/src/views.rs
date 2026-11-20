@@ -129,6 +129,7 @@ fn set_active(app: &mut App, p: Pane) {
     let t = app.tab_mut();
     t.loc = Loc::Folder(p.dir);
     t.entries = p.entries;
+    t.groups.clear();
     t.sel = p.sel;
     t.scroll = p.scroll;
     t.icon_idx = p.icon_idx;

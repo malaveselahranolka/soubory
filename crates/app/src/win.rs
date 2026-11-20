@@ -531,6 +531,13 @@ fn dev_flags(app: &mut App) {
         };
         app.set_view(view);
     }
+    if let Some(g) = val("--dev-group") {
+        app.set_group(crate::groups::GroupKey::from_pref(&g));
+    }
+    if let Some(y) = val("--dev-scroll").and_then(|v| v.parse::<f32>().ok()) {
+        app.tab_mut().scroll = y;
+        app.clamp_scroll();
+    }
     if let Some(n) = val("--dev-select").and_then(|v| v.parse::<usize>().ok()) {
         if n < app.tab().entries.len() {
             app.tab_mut().sel.select_only(n);
@@ -640,6 +647,36 @@ fn dev_keys(app: &mut App, script: &str, out: Option<String>) {
             for e in t.entries.iter().filter(|e| e.origin.as_deref().unwrap_or("").contains("scratchpad")) {
                 log += &format!("  {} | from {} | deleted>0={} | shell={}\n", e.name, e.origin.clone().unwrap_or_default(), e.modified > 0, e.shell.is_some());
             }
+        } else if step == "groups" {
+            // Labels and sizes, then a hit-test round trip over the real window geometry.
+            let gs: Vec<String> = app.shown_groups().iter().map(|g| format!("{}:{}+{}", g.label, g.start, g.len)).collect();
+            log += &format!("groups [{}] scroll={}
+", gs.join(" | "), app.tab().scroll);
+            let b = app.lay.body;
+            let pinned = app.pinned_header().map(|(_, r)| r);
+            let (mut ok, mut bad) = (0, Vec::new());
+            for i in app.visible_items() {
+                let r = app.item_rect(i);
+                let (x, y) = if app.tab().view == crate::app::View::Icons {
+                    let (icon, _) = crate::paint::tile_parts(app, i);
+                    (icon.cx(), icon.cy())
+                } else {
+                    (r.x + 40.0, r.cy())
+                };
+                if y < b.y || y > b.b() || pinned.is_some_and(|p| p.contains(x, y)) {
+                    continue;
+                }
+                if app.hit(x, y) == crate::app::Hit::Row(i) { ok += 1 } else { bad.push(i) }
+            }
+            for g in 0..app.shown_groups().len() {
+                let r = app.group_header_rect(g);
+                let (x, y) = (r.x + 30.0, r.cy());
+                if y > b.y && y < b.b() && !pinned.is_some_and(|p| p.contains(x, y)) && app.hit(x, y) != crate::app::Hit::Group(g) {
+                    bad.push(10_000 + g);
+                }
+            }
+            log += &format!("hit ok={ok} bad={bad:?} pinned={:?}
+", app.pinned_header().map(|(g, r)| (g, r.y)));
         } else if step == "procref" {
             // What a shell thread with CTF_PROCESS_REF sees.
             let before = OPS.load(std::sync::atomic::Ordering::SeqCst);

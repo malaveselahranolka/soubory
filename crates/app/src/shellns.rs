@@ -267,6 +267,7 @@ fn finish(app: &mut App, listed: Listed) {
             t.error = Some(e);
         }
     }
+    crate::groups::apply(t, folders_first);
     t.icon_idx = vec![i32::MIN; t.entries.len()];
     t.sel = crate::sel::Selection::new(t.entries.len());
     let again: Vec<usize> = t.entries.iter().enumerate().filter(|(_, e)| keep.contains(&e.name)).map(|(i, _)| i).collect();

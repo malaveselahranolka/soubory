@@ -287,6 +287,7 @@ fn set_entries(app: &mut App, mut entries: Vec<Entry>) {
         .filter_map(|i| t.entries.get(i).and_then(|e| e.full.clone()))
         .collect();
     t.entries = entries;
+    crate::groups::apply(t, folders_first);
     t.icon_idx = vec![i32::MIN; t.entries.len()];
     t.sel = crate::sel::Selection::new(t.entries.len());
     let again: Vec<usize> = t

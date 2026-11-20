@@ -10,6 +10,7 @@ mod droptarget;
 mod fsys;
 mod geom;
 mod gfx;
+mod groups;
 mod icons;
 mod layout;
 mod paint;

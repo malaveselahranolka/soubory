@@ -19,6 +19,9 @@ pub const BTN_H: f32 = 28.0;
 pub const SEARCH_W: f32 = 220.0;
 pub const INSET: f32 = 8.0;
 pub const COL_W: f32 = 240.0;
+/// Group headers (Group by) in the list and icon views.
+pub const GROUP_LIST_H: f32 = 32.0;
+pub const GROUP_ICONS_H: f32 = 40.0;
 
 #[derive(Clone, Debug, Default)]
 pub struct Layout {

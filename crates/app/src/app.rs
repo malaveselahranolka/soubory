@@ -3,6 +3,7 @@
 use crate::fsys::{self, Entry, SortKey};
 use crate::geom::Rect;
 use crate::gfx::Gfx;
+use crate::groups::{self, GroupKey, Spot};
 use crate::icons::Icons;
 use crate::layout::{self, Col, Layout, LayoutIn};
 use crate::sel::{History, Selection, TypeSelect};
@@ -80,6 +81,9 @@ pub struct Tab {
     pub by_rank: bool,
     /// A slow location (network, device) is still being listed.
     pub loading: bool,
+    /// Group by; `groups` partitions `entries` in the icon and list views (see groups.rs).
+    pub group: GroupKey,
+    pub groups: Vec<groups::Group>,
 }
 
 impl Tab {
@@ -101,6 +105,8 @@ impl Tab {
             col_scroll: 0.0,
             by_rank: true,
             loading: false,
+            group: GroupKey::None,
+            groups: Vec::new(),
         }
     }
     pub fn dir(&self) -> PathBuf {
@@ -165,6 +171,8 @@ pub enum Hit {
     Batch(u8),
     /// Command palette: visible row k, or elsewhere on its card.
     Palette(usize),
+    /// A group header (Group by): a click selects the group, as in Explorer.
+    Group(usize),
     PaletteCard,
 }
 
@@ -402,6 +410,7 @@ impl App {
                 t.error = Some(describe_io(&e));
             }
         }
+        groups::apply(t, folders_first);
         t.icon_idx = vec![i32::MIN; t.entries.len()];
         t.sel = Selection::new(t.entries.len());
         let mut sel_any = false;
@@ -559,9 +568,10 @@ impl App {
                 self.search_prev = Some(scope.clone().map_or_else(|| self.tab().loc.clone(), Loc::Folder));
             }
         }
-        let view = self.tab().view;
+        let (view, group) = (self.tab().view, self.tab().group);
         self.tabs.insert(self.cur + 1, Tab::new(loc, view));
         self.cur += 1;
+        self.tab_mut().group = group;
         self.reload(None);
         self.invalidate();
     }
@@ -594,9 +604,15 @@ impl App {
     }
 
     pub fn set_view(&mut self, v: View) {
+        let shows_groups = |t: &Tab| t.group != GroupKey::None && matches!(t.view, View::Icons | View::List);
+        let before = shows_groups(self.tab());
         self.tab_mut().view = v;
         self.tab_mut().scroll = 0.0;
         crate::views::reset_columns(self);
+        if before != shows_groups(self.tab()) {
+            // Columns and gallery show the plain sort order, icons and list the grouped one.
+            self.reload(None);
+        }
         self.relayout();
         crate::views::sync_columns(self);
         self.reveal_focus();
@@ -624,6 +640,25 @@ impl App {
         self.invalidate();
     }
 
+    pub fn set_group(&mut self, key: GroupKey) {
+        if self.tab().group == key {
+            return;
+        }
+        self.tab_mut().group = key;
+        if !matches!(self.tab().view, View::Icons | View::List) && key != GroupKey::None {
+            self.note("Skupiny se zobrazují v ikonách a v seznamu");
+            return;
+        }
+        self.tab_mut().scroll = 0.0;
+        if matches!(self.tab().loc, Loc::Search { .. }) {
+            crate::search::resort(self);
+        } else {
+            self.reload(None);
+        }
+        self.reveal_focus();
+        self.invalidate();
+    }
+
     pub fn toggle_hidden(&mut self) {
         self.prefs.show_hidden = !self.prefs.show_hidden;
         self.note(if self.prefs.show_hidden {
@@ -646,15 +681,87 @@ impl App {
 
     // ---- geometry of the content area ---------------------------------------------------------
 
+    /// The groups shown in this view, if any. Checked against the list so a stale partition
+    /// can never index past it.
+    pub fn shown_groups(&self) -> &[groups::Group] {
+        let t = self.tab();
+        let whole = t.groups.last().is_some_and(|g| g.start + g.len == t.entries.len());
+        if matches!(t.view, View::Icons | View::List) && whole { &t.groups } else { &[] }
+    }
+
+    /// Vertical layout of the icon or list view (rows of items under group headers).
+    pub fn geo(&self) -> groups::Geo<'_> {
+        let (groups, n) = (self.shown_groups(), self.tab().entries.len());
+        if self.tab().view == View::Icons {
+            let g = self.grid();
+            groups::Geo { groups, n, cols: g.cols, item_h: g.tile_h, header_h: layout::GROUP_ICONS_H }
+        } else {
+            groups::Geo { groups, n, cols: 1, item_h: layout::ROW_H, header_h: layout::GROUP_LIST_H }
+        }
+    }
+
+    /// Screen y of content y 0 (the first header or item).
+    fn content_y0(&self) -> f32 {
+        let pad = if self.tab().view == View::Icons { 8.0 } else { 4.0 };
+        self.lay.body.y + pad - self.tab().scroll
+    }
+
+    pub fn group_header_rect(&self, g: usize) -> Rect {
+        let geo = self.geo();
+        let b = self.lay.body;
+        Rect::new(b.x, self.content_y0() + geo.top(g), b.w, geo.header_h)
+    }
+
+    /// The header pinned to the top of the view while its group scrolls under it.
+    pub fn pinned_header(&self) -> Option<(usize, Rect)> {
+        let geo = self.geo();
+        let y0 = self.content_y0();
+        let b = self.lay.body;
+        geo.pinned(b.y - y0).map(|(g, y)| (g, Rect::new(b.x, y0 + y, b.w, geo.header_h)))
+    }
+
+    pub fn group_header_at(&self, x: f32, y: f32) -> Option<usize> {
+        if self.shown_groups().is_empty() || !self.lay.body.contains(x, y) {
+            return None;
+        }
+        if let Some((g, r)) = self.pinned_header() {
+            if r.contains(x, y) {
+                return Some(g);
+            }
+        }
+        match self.geo().at(y - self.content_y0(), 0) {
+            Spot::Header(g) => Some(g),
+            _ => None,
+        }
+    }
+
+    /// Items whose rows intersect the view, in order.
+    pub fn visible_items(&self) -> std::ops::Range<usize> {
+        let b = self.lay.body;
+        let n = self.tab().entries.len();
+        // Rows only move down with the index, so both ends are binary searches.
+        let first_true = |pred: &dyn Fn(usize) -> bool| {
+            let (mut lo, mut hi) = (0, n);
+            while lo < hi {
+                let mid = (lo + hi) / 2;
+                if pred(mid) { hi = mid } else { lo = mid + 1 }
+            }
+            lo
+        };
+        let lo = first_true(&|i| self.item_rect(i).b() > b.y);
+        let hi = first_true(&|i| self.item_rect(i).y >= b.b());
+        lo..hi.max(lo)
+    }
+
     /// Row rectangle in list view, or in the active column of column view.
     pub fn row_rect(&self, i: usize) -> Rect {
         let b = self.lay.body;
-        let y = b.y + 4.0 + i as f32 * layout::ROW_H - self.tab().scroll;
         if self.tab().view == View::Columns {
+            let y = b.y + 4.0 + i as f32 * layout::ROW_H - self.tab().scroll;
             let x = crate::views::col_x(self, self.tab().cols_left.len());
             return Rect::new(x, y, layout::COL_W, layout::ROW_H);
         }
-        Rect::new(b.x, y, b.w, layout::ROW_H)
+        Rect::new(b.x, self.content_y0() + self.geo().pos(i).0, b.w, layout::ROW_H)
     }
 
     pub fn grid(&self) -> layout::Grid {
@@ -663,19 +770,17 @@ impl App {
 
     pub fn tile_rect(&self, i: usize) -> Rect {
         let g = self.grid();
-        let (r, c) = (i / g.cols, i % g.cols);
-        Rect::new(g.x0 + c as f32 * g.tile_w, self.lay.body.y + 8.0 + r as f32 * g.tile_h - self.tab().scroll, g.tile_w, g.tile_h)
+        let (y, c) = self.geo().pos(i);
+        Rect::new(g.x0 + c as f32 * g.tile_w, self.content_y0() + y, g.tile_w, g.tile_h)
     }
 
     pub fn content_height(&self) -> f32 {
         let n = self.tab().entries.len();
         match self.tab().view {
-            View::Icons => {
-                let g = self.grid();
-                16.0 + n.div_ceil(g.cols) as f32 * g.tile_h
-            }
+            View::Icons => 16.0 + self.geo().height(),
             View::Gallery => crate::views::strip_width(self),
-            _ => n as f32 * layout::ROW_H + 8.0,
+            View::List => self.geo().height() + 8.0,
+            View::Columns => n as f32 * layout::ROW_H + 8.0,
         }
     }
 
@@ -715,9 +820,11 @@ impl App {
             }
         } else {
             let b = self.lay.body;
+            // Below the pinned group header; a group's first item brings its header along.
+            let top = b.y + if self.shown_groups().is_empty() { 0.0 } else { self.geo().header_h };
             let t = self.tab_mut();
-            if r.y < b.y {
-                t.scroll -= b.y - r.y;
+            if r.y < top {
+                t.scroll -= top - r.y;
             } else if r.b() > b.b() {
                 t.scroll += r.b() - b.b();
             }
@@ -733,19 +840,20 @@ impl App {
             return None;
         }
         let t = self.tab();
+        if self.pinned_header().is_some_and(|(_, r)| r.contains(x, y)) {
+            return None;
+        }
         match t.view {
             View::Icons => {
                 let g = self.grid();
-                let ry = y - self.lay.body.y - 8.0 + t.scroll;
-                if ry < 0.0 || x < g.x0 {
+                if x < g.x0 {
                     return None;
                 }
-                let (r, c) = ((ry / g.tile_h) as usize, ((x - g.x0) / g.tile_w) as usize);
-                if c >= g.cols {
-                    return None;
+                let c = ((x - g.x0) / g.tile_w) as usize;
+                match self.geo().at(y - self.content_y0(), c) {
+                    Spot::Item(i) => crate::paint::tile_hit(self, i, x, y).then_some(i),
+                    _ => None,
                 }
-                let i = r * g.cols + c;
-                (i < t.entries.len() && crate::paint::tile_hit(self, i, x, y)).then_some(i)
             }
             View::Gallery => (0..t.entries.len()).find(|&i| crate::views::strip_tile(self, i).contains(x, y)),
             View::Columns => {
@@ -757,11 +865,10 @@ impl App {
                 let i = (ry / layout::ROW_H).floor();
                 (i >= 0.0 && (i as usize) < t.entries.len()).then_some(i as usize)
             }
-            View::List => {
-                let ry = y - self.lay.body.y - 4.0 + t.scroll;
-                let i = (ry / layout::ROW_H).floor();
-                (i >= 0.0 && (i as usize) < t.entries.len()).then_some(i as usize)
-            }
+            View::List => match self.geo().at(y - self.content_y0(), 0) {
+                Spot::Item(i) => Some(i),
+                _ => None,
+            },
         }
     }
 
@@ -855,6 +962,9 @@ impl App {
             return crate::views::columns_hit(self, x, y);
         }
         if l.body.contains(x, y) {
+            if let Some(g) = self.group_header_at(x, y) {
+                return Hit::Group(g);
+            }
             return self.item_at(x, y).map(Hit::Row).unwrap_or(Hit::Empty);
         }
         Hit::None
@@ -1000,6 +1110,19 @@ impl App {
                     keep,
                 };
             }
+            Hit::Group(g) => {
+                // Explorer: a header click selects its group (Ctrl adds it).
+                self.focus = Focus::Content;
+                if let Some(gr) = self.shown_groups().get(g).cloned() {
+                    let t = self.tab_mut();
+                    if !ctrl {
+                        t.sel.clear();
+                    }
+                    t.sel.anchor = Some(gr.start);
+                    t.sel.extend_to(gr.start + gr.len - 1, true);
+                    t.sel.focus = Some(gr.start);
+                }
+            }
             Hit::ColRow(k, r) => crate::views::column_click(self, k, Some(r)),
             Hit::ColEmpty(k) => crate::views::column_click(self, k, None),
             Hit::IconSlider => {
@@ -1126,7 +1249,7 @@ impl App {
                 self.invalidate();
                 crate::shell::item_menu(self, screen);
             }
-            Hit::Empty => {
+            Hit::Empty | Hit::Group(_) => {
                 self.tab_mut().sel.clear();
                 self.invalidate();
                 crate::shell::background_menu(self, screen);
@@ -1210,8 +1333,18 @@ impl App {
             (VK_RETURN, false, false, true) | (VK_I, true, false, false) => {
                 crate::shell::properties(self)
             }
-            (VK_UP, _, _, false) => mv(self, -cols),
-            (VK_DOWN, _, _, false) => mv(self, cols),
+            (VK_UP, _, _, false) | (VK_DOWN, _, _, false) => {
+                let down = vk == VK_DOWN;
+                // A grouped grid starts each group on a new row: keep the column across headers.
+                let d = match self.tab().sel.focus {
+                    Some(f) if view == View::Icons && !self.shown_groups().is_empty() => {
+                        self.geo().vertical(f, down) as isize - f as isize
+                    }
+                    _ if down => cols,
+                    _ => -cols,
+                };
+                mv(self, d)
+            }
             (VK_LEFT, _, _, false) if cols > 1 || view == View::Gallery => mv(self, -1),
             (VK_RIGHT, _, _, false) if cols > 1 || view == View::Gallery => mv(self, 1),
             (VK_LEFT, false, false, false) if view == View::Columns => {

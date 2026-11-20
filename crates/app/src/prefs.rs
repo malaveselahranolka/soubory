@@ -59,6 +59,12 @@ pub fn load(app: &mut App) {
                     t.view = view;
                 }
             }
+            "group" => {
+                let g = crate::groups::GroupKey::from_pref(v);
+                for t in &mut app.tabs {
+                    t.group = g;
+                }
+            }
             "window" => {
                 let n: Vec<i32> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
                 if let [l, t, r, b, max] = n[..] {
@@ -126,13 +132,14 @@ pub fn save(app: &App) {
         View::Gallery => "gallery",
     };
     let mut s = format!(
-        "show_hidden={}\nfolders_first={}\nicon_size={}\nsidebar_w={}\nsidebar={}\npreview={}\nview={view}\n",
+        "show_hidden={}\nfolders_first={}\nicon_size={}\nsidebar_w={}\nsidebar={}\npreview={}\nview={view}\ngroup={}\n",
         app.prefs.show_hidden as u8,
         app.prefs.folders_first as u8,
         app.prefs.icon_size,
         app.sidebar_w,
         app.sidebar_on as u8,
-        app.preview_on as u8
+        app.preview_on as u8,
+        app.tab().group.pref()
     );
     if let Some(([l, t, r, b], max)) = placement(app).or(app.prefs.window) {
         s.push_str(&format!("window={l},{t},{r},{b},{}\n", max as u8));

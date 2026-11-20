@@ -66,6 +66,7 @@ pub(crate) const C_MAP_DRIVE: u32 = OWN + 57;
 pub(crate) const C_UNMAP_DRIVE: u32 = OWN + 58;
 pub(crate) const C_SAVE_SEARCH: u32 = OWN + 59;
 pub(crate) const C_REMOVE_SEARCH: u32 = OWN + 60;
+pub(crate) const C_GROUP0: u32 = OWN + 61; // +0..6, groups::KEYS order
 
 thread_local! {
     /// Context menus that are being tracked; their owner-draw/init messages are forwarded.
@@ -632,6 +633,13 @@ fn view_items(app: &App, m: HMENU) {
         app.prefs.folders_first,
         true,
     );
+    let g = submenu(m, "Seskupit podle");
+    for (k, (key, name, ..)) in crate::groups::KEYS.iter().enumerate() {
+        if k == 1 {
+            sep(g);
+        }
+        append(g, C_GROUP0 + k as u32, name, t.group == *key, true);
+    }
 }
 
 /// Toolbar "⋯" menu.
@@ -751,7 +759,7 @@ pub(crate) mod cmd {
         C_GOTO as GOTO, C_HIDDEN as HIDDEN, C_MAP_DRIVE as MAP_DRIVE, C_NEW_FOLDER as NEW_FOLDER, C_NEW_TAB as NEW_TAB,
         C_NEW_WINDOW as NEW_WINDOW, C_PREVIEW as PREVIEW, C_PROPS as PROPS, C_REFRESH as REFRESH, C_SAVE_SEARCH as SAVE_SEARCH,
         C_SELECT_ALL as SELECT_ALL, C_SIDEBAR as SIDEBAR, C_SORT0 as SORT0, C_TERMINAL as TERMINAL, C_UNMAP_DRIVE as UNMAP_DRIVE,
-        C_VIEW0 as VIEW0,
+        C_VIEW0 as VIEW0, C_GROUP0 as GROUP0,
     };
 }
 
@@ -810,6 +818,9 @@ fn own_command(app: &mut App, cmd: u32) {
         c if (C_VIEW0..C_VIEW0 + 4).contains(&c) => app.set_view(
             [View::Icons, View::List, View::Columns, View::Gallery][(c - C_VIEW0) as usize],
         ),
+        c if (C_GROUP0..C_GROUP0 + crate::groups::KEYS.len() as u32).contains(&c) => {
+            app.set_group(crate::groups::KEYS[(c - C_GROUP0) as usize].0);
+        }
         c if (C_SORT0..C_SORT0 + 5).contains(&c) => {
             let key = [
                 fsys::SortKey::Name,
@@ -1395,7 +1406,7 @@ pub fn open_terminal(app: &mut App) {
 /// Drag the selection out (to Explorer, a browser, the desktop…) with the shell's own data object.
 /// A tag location lists what carries the tag, so it reloads; elsewhere only the dots change.
 pub fn tags_changed(app: &mut App) {
-    if matches!(app.tab().loc, Loc::Tag(_)) {
+    if matches!(app.tab().loc, Loc::Tag(_)) || !app.shown_groups().is_empty() && app.tab().group == crate::groups::GroupKey::Tags {
         app.reload(None);
     }
     app.invalidate();

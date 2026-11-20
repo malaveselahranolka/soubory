@@ -335,7 +335,7 @@ pub fn format_size(bytes: u64) -> String {
     format!("{bytes} B")
 }
 
-fn local_time(t: u64) -> Option<SYSTEMTIME> {
+pub fn local_time(t: u64) -> Option<SYSTEMTIME> {
     unsafe {
         let ft = FILETIME {
             dwLowDateTime: t as u32,
