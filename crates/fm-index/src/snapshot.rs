@@ -464,6 +464,7 @@ impl Index {
             fid_buckets: Vec::new(),
             fid_occupied: 0,
             fid_live: 0,
+            fid_dups: HashMap::new(),
             roots: Vec::new(),
             exts,
             ext_map,

@@ -9,7 +9,7 @@ pub(crate) fn next_instance_id() -> u64 {
     NEXT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-use fm_fs::attrs::{DIRECTORY, HIDDEN, SYSTEM};
+use fm_fs::attrs::{DIRECTORY, HIDDEN};
 use fm_fs::fold_into;
 
 /// Compact 32-bit identifier for an indexed file or directory entry.
@@ -72,6 +72,8 @@ pub struct Index {
     pub(crate) fid_buckets: Vec<EntryId>,
     pub(crate) fid_occupied: usize,
     pub(crate) fid_live: usize,
+    /// Multi-entry tracking only for `file_id`s shared by multiple live entries (hard links).
+    pub(crate) fid_dups: HashMap<u64, Vec<EntryId>>,
     pub(crate) roots: Vec<EntryId>,
     pub(crate) exts: Vec<String>,
     pub(crate) ext_map: HashMap<String, u16>,
@@ -113,6 +115,7 @@ impl Index {
             fid_buckets: Vec::new(),
             fid_occupied: 0,
             fid_live: 0,
+            fid_dups: HashMap::new(),
             roots: Vec::new(),
             exts: vec![String::new()],
             ext_map: HashMap::new(),
@@ -149,6 +152,7 @@ impl Index {
             fid_buckets: Vec::new(),
             fid_occupied: 0,
             fid_live: 0,
+            fid_dups: HashMap::new(),
             roots: Vec::with_capacity(4),
             exts: vec![String::new()],
             ext_map: HashMap::new(),
@@ -205,6 +209,13 @@ impl Index {
             + self.next_sibling.capacity() * std::mem::size_of::<EntryId>()
             + self.buckets.capacity() * std::mem::size_of::<EntryId>()
             + self.fid_buckets.capacity() * std::mem::size_of::<EntryId>()
+            + self.fid_dups.capacity()
+                * (std::mem::size_of::<u64>() + std::mem::size_of::<Vec<EntryId>>())
+            + self
+                .fid_dups
+                .values()
+                .map(|v| v.capacity() * std::mem::size_of::<EntryId>())
+                .sum::<usize>()
             + self.roots.capacity() * std::mem::size_of::<EntryId>()
             + exts_bytes
     }
@@ -339,7 +350,68 @@ impl Index {
         } else {
             self.unlink_child(parent, id);
         }
+        self.kill_subtree(id);
+        self.index_gen = self.index_gen.wrapping_add(1);
+    }
 
+    /// Removes every live entry `i` with `doomed[i]` (and its subtree), unlinking each affected
+    /// parent's child list once instead of once per removed child (O(siblings) each).
+    ///
+    /// Returns `true` if anything was removed.
+    pub(crate) fn remove_flagged(&mut self, doomed: &[bool]) -> bool {
+        let is_doomed = |idx: &Self, id: EntryId| {
+            (id as usize) < doomed.len() && doomed[id as usize] && idx.is_alive(id)
+        };
+        let mut tops = Vec::new();
+        let mut parents = Vec::new();
+        for (i, &d) in doomed.iter().enumerate() {
+            let id = i as EntryId;
+            if !d || !self.is_alive(id) {
+                continue;
+            }
+            let p = self.parent[i];
+            if p != NONE && is_doomed(self, p) {
+                continue; // killed with its doomed parent's subtree
+            }
+            tops.push(id);
+            if p == NONE {
+                self.roots.retain(|&r| r != id);
+            } else {
+                parents.push(p);
+            }
+        }
+        if tops.is_empty() {
+            return false;
+        }
+        parents.sort_unstable();
+        parents.dedup();
+        for p in parents {
+            let mut prev = NONE;
+            let mut cur = self.first_child[p as usize];
+            while cur != NONE {
+                let next = self.next_sibling[cur as usize];
+                if is_doomed(self, cur) {
+                    if prev == NONE {
+                        self.first_child[p as usize] = next;
+                    } else {
+                        self.next_sibling[prev as usize] = next;
+                    }
+                    self.next_sibling[cur as usize] = NONE;
+                } else {
+                    prev = cur;
+                }
+                cur = next;
+            }
+        }
+        for id in tops {
+            self.kill_subtree(id);
+        }
+        self.index_gen = self.index_gen.wrapping_add(1);
+        true
+    }
+
+    /// Frees `id` and all descendants; `id` must already be unlinked from its parent / roots.
+    fn kill_subtree(&mut self, id: EntryId) {
         let mut stack = vec![id];
         while let Some(u) = stack.pop() {
             let ui = u as usize;
@@ -379,7 +451,6 @@ impl Index {
             self.next_sibling[ui] = NONE;
             self.live_count -= 1;
         }
-        self.index_gen = self.index_gen.wrapping_add(1);
     }
 
     /// Renames `id` to `new_name` in its current parent directory.
@@ -644,12 +715,12 @@ impl Index {
         {
             return Some(eid);
         }
-        let mut child = self.first_child[parent as usize];
-        while child != NONE {
-            if self.file_id[child as usize] == fid {
-                return Some(child);
+        if let Some(dups) = self.fid_dups.get(&fid) {
+            for &eid in dups {
+                if self.is_alive(eid) && self.parent[eid as usize] == parent {
+                    return Some(eid);
+                }
             }
-            child = self.next_sibling[child as usize];
         }
         None
     }
@@ -748,6 +819,7 @@ impl Index {
             },
             fid_occupied: 0,
             fid_live: 0,
+            fid_dups: HashMap::new(),
             roots: Vec::with_capacity(self.roots.len()),
             exts: std::mem::take(&mut self.exts),
             ext_map: std::mem::take(&mut self.ext_map),
@@ -1165,6 +1237,7 @@ impl Index {
         }
         self.fid_occupied = 0;
         self.fid_live = 0;
+        self.fid_dups.clear();
 
         for i in 0..n {
             if (self.flags[i] & FLAG_ALIVE) == 0 {
@@ -1259,7 +1332,16 @@ impl Index {
                 if first_tombstone.is_none() {
                     first_tombstone = Some(slot);
                 }
-            } else if entry == id || self.file_id[entry as usize] == fid {
+            } else if entry == id {
+                return;
+            } else if self.file_id[entry as usize] == fid {
+                let dups = self.fid_dups.entry(fid).or_default();
+                if dups.is_empty() {
+                    dups.push(entry);
+                }
+                if !dups.contains(&id) {
+                    dups.push(id);
+                }
                 self.fid_buckets[slot] = id;
                 return;
             }
@@ -1274,6 +1356,21 @@ impl Index {
         if fid == 0 || self.fid_buckets.is_empty() {
             return;
         }
+        let replacement = if let Some(dups) = self.fid_dups.get_mut(&fid) {
+            if let Some(pos) = dups.iter().position(|&cur| cur == id) {
+                dups.swap_remove(pos);
+            }
+            if dups.len() <= 1 {
+                let rem = dups.first().copied();
+                self.fid_dups.remove(&fid);
+                rem
+            } else {
+                dups.first().copied()
+            }
+        } else {
+            None
+        };
+
         let len = self.fid_buckets.len();
         let hash = hash_fid(fid);
         let mut slot = fastrange(hash, len);
@@ -1283,8 +1380,12 @@ impl Index {
                 return;
             }
             if entry == id {
-                self.fid_buckets[slot] = TOMBSTONE;
-                self.fid_live = self.fid_live.saturating_sub(1);
+                if let Some(rep) = replacement {
+                    self.fid_buckets[slot] = rep;
+                } else {
+                    self.fid_buckets[slot] = TOMBSTONE;
+                    self.fid_live = self.fid_live.saturating_sub(1);
+                }
                 return;
             }
             slot += 1;
@@ -1309,6 +1410,7 @@ impl Index {
         let mut next = vec![NONE; new_cap];
         let mut occupied = 0usize;
         let mut live = 0usize;
+        self.fid_dups.clear();
 
         for (i, &flags) in self.flags.iter().enumerate() {
             if (flags & FLAG_ALIVE) == 0 {
@@ -1318,13 +1420,19 @@ impl Index {
             if fid == 0 {
                 continue;
             }
+            let id = i as EntryId;
             let hash = hash_fid(fid);
             let mut slot = fastrange(hash, new_cap);
             let mut replaced = false;
             while next[slot] != NONE {
                 let cur = next[slot];
                 if self.file_id[cur as usize] == fid {
-                    next[slot] = i as EntryId;
+                    let dups = self.fid_dups.entry(fid).or_default();
+                    if dups.is_empty() {
+                        dups.push(cur);
+                    }
+                    dups.push(id);
+                    next[slot] = id;
                     replaced = true;
                     break;
                 }
@@ -1334,7 +1442,7 @@ impl Index {
                 }
             }
             if !replaced {
-                next[slot] = i as EntryId;
+                next[slot] = id;
                 occupied += 1;
                 live += 1;
             }
@@ -1358,7 +1466,7 @@ fn hash_fid(fid: u64) -> u64 {
 
 #[inline]
 pub(crate) fn is_own_hidden(attrs: u32) -> bool {
-    (attrs & (HIDDEN | SYSTEM)) != 0
+    (attrs & HIDDEN) != 0
 }
 
 #[inline]

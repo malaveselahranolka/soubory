@@ -10,7 +10,7 @@ use rayon::prelude::*;
 
 use crate::arena::{
     EXT_OVERFLOW, EntryId, FLAG_ALIVE, FLAG_EFFECTIVE_HIDDEN, Index, NONE, eq_case_insensitive,
-    extract_ext,
+    extract_ext, is_own_hidden,
 };
 use crate::rank::{
     RankEntry, make_filter_only_rank, rank_top_limit, rank_top_limit_entries, score_entry,
@@ -598,10 +598,12 @@ impl Index {
             if !self.is_alive(seed) {
                 continue;
             }
-            if !include_hidden && (self.flags[seed as usize] & FLAG_EFFECTIVE_HIDDEN) != 0 {
-                continue;
-            }
             if include_seed {
+                // `seed` is strictly below the requested scope (e.g. a root under `C:\`),
+                // so own-hidden filtering applies to `seed` itself too.
+                if !include_hidden && is_own_hidden(self.attrs[seed as usize]) {
+                    continue;
+                }
                 out.push(seed);
             }
             let mut child = self.first_child[seed as usize];
@@ -621,7 +623,9 @@ impl Index {
             if (f & FLAG_ALIVE) == 0 {
                 continue;
             }
-            if !include_hidden && (f & FLAG_EFFECTIVE_HIDDEN) != 0 {
+            // Start hidden inheritance strictly BELOW the scope by checking own HIDDEN attrs
+            // rather than ancestor-inherited FLAG_EFFECTIVE_HIDDEN from above the scope.
+            if !include_hidden && is_own_hidden(self.attrs[ni]) {
                 continue;
             }
             out.push(node);
@@ -1098,4 +1102,120 @@ fn path_strictly_under(path: &str, scope_norm: &str) -> bool {
         .iter()
         .zip(&s_segs)
         .all(|(p, s)| eq_case_insensitive(p, s))
+}
+
+#[cfg(test)]
+mod tests {
+    use fm_fs::attrs::{ARCHIVE, DIRECTORY, HIDDEN, SYSTEM};
+
+    use super::*;
+    use crate::Meta;
+
+    #[test]
+    fn hidden_scope_inherits_only_below_scope() {
+        let mut idx = Index::new();
+        let c = idx.add_root("C:\\");
+        let hidden_dir = idx.insert(
+            c,
+            "HiddenRoot",
+            Meta {
+                attrs: DIRECTORY | HIDDEN,
+                size: 0,
+                mtime: 10,
+                file_id: 2,
+            },
+        );
+        let vis_file = idx.insert(
+            hidden_dir,
+            "visible_inside.txt",
+            Meta {
+                attrs: ARCHIVE,
+                size: 100,
+                mtime: 20,
+                file_id: 3,
+            },
+        );
+        let sub_vis = idx.insert(
+            hidden_dir,
+            "SubVisible",
+            Meta {
+                attrs: DIRECTORY | SYSTEM,
+                size: 0,
+                mtime: 10,
+                file_id: 4,
+            },
+        );
+        let deep_vis = idx.insert(
+            sub_vis,
+            "deep_visible.txt",
+            Meta {
+                attrs: ARCHIVE,
+                size: 50,
+                mtime: 20,
+                file_id: 5,
+            },
+        );
+        let nested_hidden_dir = idx.insert(
+            hidden_dir,
+            "SubHidden",
+            Meta {
+                attrs: DIRECTORY | HIDDEN,
+                size: 0,
+                mtime: 10,
+                file_id: 6,
+            },
+        );
+        idx.insert(
+            nested_hidden_dir,
+            "child_of_subhidden.txt",
+            Meta {
+                attrs: ARCHIVE,
+                size: 10,
+                mtime: 20,
+                file_id: 7,
+            },
+        );
+        idx.insert(
+            hidden_dir,
+            "own_hidden.txt",
+            Meta {
+                attrs: ARCHIVE | HIDDEN,
+                size: 10,
+                mtime: 20,
+                file_id: 8,
+            },
+        );
+
+        let tok = CancelToken::new();
+        let opts = SearchOptions {
+            include_hidden: false,
+            limit: 100,
+        };
+
+        // Global search without include_hidden still excludes everything under HiddenRoot
+        let global = idx.search(&parse_query("visible"), &opts, &tok).unwrap();
+        assert_eq!(global.total_matches, 0);
+
+        // Scoped to the hidden folder itself: visible children and visible subdirs ARE found,
+        // while own-hidden items and children of nested hidden folders BELOW scope stay hidden.
+        let scoped = idx
+            .search_scoped(&parse_query("txt"), Some("C:\\HiddenRoot"), &opts, &tok)
+            .unwrap();
+        let scoped_ids: Vec<EntryId> = scoped.iter().map(|h| h.id).collect();
+        assert!(scoped_ids.contains(&vis_file));
+        assert!(scoped_ids.contains(&deep_vis));
+        assert_eq!(scoped_ids.len(), 2);
+
+        // Scoped inside SubVisible (which is itself inside a hidden folder): deep_visible.txt found
+        let inner = idx
+            .search_scoped(
+                &parse_query("deep_visible"),
+                Some("C:\\HiddenRoot\\SubVisible"),
+                &opts,
+                &tok,
+            )
+            .unwrap();
+        assert_eq!(inner.len(), 1);
+        assert_eq!(inner[0].id, deep_vis);
+    }
 }
