@@ -176,6 +176,15 @@ pub fn key(app: &mut App, vk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTU
     true
 }
 
+/// Wheel over the card: moves the visible window, the selection stays put.
+pub fn scroll(app: &mut App, rows: isize) {
+    if let Some(p) = app.palette.as_mut() {
+        let max = p.shown.len().saturating_sub(ROWS);
+        p.top = (p.top as isize + rows).clamp(0, max as isize) as usize;
+        app.invalidate();
+    }
+}
+
 /// Runs the selected row, or visible row `row` (a click). The palette closes first, so a
 /// command that opens its own field (Go to Folder, search) gets the focus.
 pub fn run(app: &mut App, row: Option<usize>) {

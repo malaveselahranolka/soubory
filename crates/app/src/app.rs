@@ -230,6 +230,8 @@ pub struct App {
     /// Open "Rename N items" sheet.
     pub batch: Option<crate::batch::Batch>,
     pub palette: Option<crate::palette::Palette>,
+    /// The click that just ran a palette row or sheet button: its double-click half is dropped.
+    pub eat_dblclk: bool,
     /// Scope pill rects from the last frame, for hit testing.
     pub scope_rects: std::cell::RefCell<Vec<Rect>>,
     pub pressed: Hit,
@@ -283,6 +285,7 @@ impl App {
             search_prev: None,
             batch: None,
             palette: None,
+            eat_dblclk: false,
             scope_rects: std::cell::RefCell::new(Vec::new()),
             pressed: Hit::None,
             focus: Focus::Content,
@@ -337,9 +340,12 @@ impl App {
 
     /// (Re)loads the current tab's location, keeping selection by name.
     pub fn reload(&mut self, select: Option<&str>) {
+        crate::win::sync_search_field(self);
         if matches!(self.tab().loc, Loc::Search { .. }) {
             // Results come from the index (async); the current ones stay until they arrive.
             crate::search::run(self);
+            // The scope bar comes and goes with a search.
+            self.relayout();
             return;
         }
         if matches!(self.tab().loc, Loc::Shell { .. }) {
@@ -432,16 +438,15 @@ impl App {
         crate::win::set_title(self);
     }
 
-    /// A saved search: the search field shows its text, the scope bar offers its folder, and
-    /// clearing the field returns to where the user was.
+    /// A saved search. The search field shows its text (reload syncs it). A scoped one offers
+    /// its folder in the scope bar, and clearing the field goes to that folder; an unscoped one
+    /// returns to where the user was.
     pub fn open_search(&mut self, text: String, scope: Option<PathBuf>) {
-        if !matches!(self.tab().loc, Loc::Search { .. }) {
+        if !matches!(self.tab().loc, Loc::Search { .. }) || scope.is_some() {
             self.search_prev = Some(scope.clone().map_or_else(|| self.tab().loc.clone(), Loc::Folder));
         }
-        self.search_text = text.clone();
         self.tab_mut().by_rank = true;
         self.go(Loc::Search { text, scope });
-        self.relayout();
     }
 
     pub fn go(&mut self, loc: Loc) {
@@ -576,6 +581,7 @@ impl App {
     }
 
     fn after_tab_switch(&mut self) {
+        crate::win::sync_search_field(self);
         self.relayout();
         crate::win::watch_current(self);
         crate::win::set_title(self);
@@ -935,6 +941,10 @@ impl App {
             match h {
                 Hit::Palette(_) => self.pressed = h,
                 Hit::PaletteCard => crate::win::palette_field(self, true),
+                Hit::Caption(_) => {
+                    crate::palette::close(self);
+                    self.pressed = h;
+                }
                 _ => crate::palette::close(self),
             }
             return;
@@ -1046,8 +1056,14 @@ impl App {
                 Col::Kind => self.set_sort(SortKey::Kind),
                 Col::Location => {}
             },
-            Hit::Batch(code) => crate::batch::click(self, code),
-            Hit::Palette(k) => crate::palette::run(self, Some(k)),
+            Hit::Batch(code) => {
+                self.eat_dblclk = true;
+                crate::batch::click(self, code)
+            }
+            Hit::Palette(k) => {
+                self.eat_dblclk = true;
+                crate::palette::run(self, Some(k))
+            }
             Hit::Scope(k) => {
                 let folder = self.search_prev.as_ref().and_then(|l| l.folder()).map(Path::to_path_buf);
                 if let Loc::Search { scope, .. } = &mut self.tab_mut().loc {
@@ -1116,6 +1132,12 @@ impl App {
     }
 
     pub fn wheel(&mut self, x: f32, y: f32, delta: f32, ctrl: bool) {
+        if self.palette.is_some() {
+            if !matches!(crate::palette::hit(self, x, y), Hit::None) {
+                crate::palette::scroll(self, if delta > 0.0 { -3 } else { 3 });
+            }
+            return;
+        }
         if ctrl && self.tab().view == View::Icons {
             self.prefs.icon_size =
                 (self.prefs.icon_size + delta.signum() * 16.0).clamp(32.0, 256.0);
@@ -1296,6 +1318,9 @@ impl App {
 
     /// Printable character: type-to-select.
     pub fn char_typed(&mut self, ch: char) {
+        if self.palette.is_some() {
+            return;
+        }
         if ch.is_control() || (ch == ' ' && !self.tsel.active(Instant::now())) {
             return;
         }

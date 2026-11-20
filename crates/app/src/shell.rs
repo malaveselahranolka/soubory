@@ -674,9 +674,14 @@ pub fn crumb_menu(app: &mut App, k: usize) {
 fn subfolders(dir: &Path, hidden: bool) -> Vec<(String, Loc)> {
     use std::os::windows::fs::MetadataExt;
     let Ok(rd) = std::fs::read_dir(dir) else { return Vec::new() };
+    // DirEntry::metadata comes from the directory listing itself; no item is opened.
     rd.flatten()
-        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-        .filter(|e| hidden || e.metadata().is_ok_and(|m| m.file_attributes() & (FILE_ATTRIBUTE_HIDDEN.0 | FILE_ATTRIBUTE_SYSTEM.0) == 0))
+        .filter(|e| {
+            e.metadata().is_ok_and(|m| {
+                let a = m.file_attributes();
+                a & FILE_ATTRIBUTE_DIRECTORY.0 != 0 && (hidden || a & FILE_ATTRIBUTE_HIDDEN.0 == 0)
+            })
+        })
         .map(|e| (e.file_name().to_string_lossy().into_owned(), Loc::Folder(e.path())))
         .collect()
 }
@@ -844,7 +849,10 @@ pub fn sidebar_menu(app: &mut App, i: usize, pt: POINT) {
         let cmd = track(app, m, pt);
         let _ = DestroyMenu(m);
         match cmd {
-            C_OPEN => app.go(loc),
+            C_OPEN => match loc {
+                Loc::Search { text, scope } => app.open_search(text, scope),
+                other => app.go(other),
+            },
             C_NEW_TAB => app.new_tab(loc),
             C_REMOVE_FAV => {
                 if let Loc::Folder(p) = &loc {
@@ -905,7 +913,7 @@ fn sidebar_changed(app: &App) {
 /// "Uložit hledání": the current search becomes a sidebar item in every window.
 pub fn save_search(app: &mut App) {
     let Loc::Search { text, scope } = app.tab().loc.clone() else { return };
-    let item = (text.trim().to_string(), scope);
+    let item = (text.replace(['\t', '\r', '\n'], " ").trim().to_string(), scope);
     if item.0.is_empty() || app.prefs.saved.contains(&item) {
         return;
     }

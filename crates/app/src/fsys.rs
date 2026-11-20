@@ -453,7 +453,9 @@ pub fn volumes() -> Vec<Volume> {
         if kind <= 1 {
             continue;
         }
-        let (total, free) = disk_space(Path::new(&root)).unwrap_or((0, 0));
+        // shortcut: no capacity for network drives — an unreachable server would block the UI
+        // thread for many seconds; read it off-thread if This PC should show it.
+        let (total, free) = if kind == 4 { (0, 0) } else { disk_space(Path::new(&root)).unwrap_or((0, 0)) };
         if kind == 5 && total == 0 {
             continue;
         }

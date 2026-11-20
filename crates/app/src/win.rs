@@ -207,9 +207,16 @@ pub fn run(start: Loc) -> i32 {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
+        // Files copied here must stay pasteable after we are gone (Explorer never exits). First,
+        // so a paste elsewhere does not wait for the snapshot; retried while another app holds
+        // the clipboard open.
+        for _ in 0..10 {
+            if windows::Win32::System::Ole::OleFlushClipboard().is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
         crate::search::stop();
-        // Files copied here must stay pasteable after we are gone (Explorer never exits).
-        let _ = windows::Win32::System::Ole::OleFlushClipboard();
         msg.wParam.0 as i32
     }
 }
@@ -308,17 +315,34 @@ fn watch_drives(hub: HWND) {
 fn drives_changed() {
     crate::fsys::forget_volume_names();
     let roots: Vec<PathBuf> = crate::fsys::volumes().into_iter().map(|v| v.root).collect();
+    let gone = |loc: &Loc| {
+        loc.folder().and_then(|p| p.ancestors().last()).is_some_and(|root| {
+            root.to_string_lossy().len() == 3 && !roots.iter().any(|r| r.as_os_str().eq_ignore_ascii_case(root.as_os_str()))
+        })
+    };
     for_each_app(|a| {
         a.side_rows = crate::sidebar::build(&a.prefs);
-        // A tab on a drive that went away goes to "Tento počítač", like Explorer.
-        let gone = a.tab().loc.folder().and_then(|p| p.ancestors().last()).is_some_and(|root| {
-            root.to_string_lossy().len() == 3 && !roots.iter().any(|r| r.as_os_str().eq_ignore_ascii_case(root.as_os_str()))
-        });
-        if gone {
-            a.go(Loc::Computer);
-        } else if matches!(a.tab().loc, Loc::Computer) {
-            a.reload(None);
+        // Tabs on a drive that went away go to "Tento počítač", like Explorer; a rename there is
+        // cancelled first so its edit does not outlive the item.
+        let cur = a.cur;
+        for i in 0..a.tabs.len() {
+            let on_gone = gone(&a.tabs[i].loc);
+            if !on_gone && !(i == cur && matches!(a.tabs[i].loc, Loc::Computer)) {
+                continue;
+            }
+            a.cur = i;
+            if on_gone {
+                if i == cur {
+                    commit_rename(a, true);
+                }
+                a.go(Loc::Computer);
+            } else {
+                a.reload(None);
+            }
         }
+        a.cur = cur;
+        watch_current(a);
+        set_title(a);
         a.invalidate();
     });
 }
@@ -1064,9 +1088,13 @@ fn position_edits(app: &App) {
 /// Shows (and focuses) or removes the palette's text field.
 pub fn palette_field(app: &mut App, on: bool) {
     if !on {
+        // Only when the field still has the focus: not when the user clicked elsewhere.
+        let had_focus = edit_of(app.hwnd, EditKind::Palette).is_some_and(|(h, _)| unsafe { GetFocus() } == h);
         destroy_edit(app.hwnd, EditKind::Palette);
-        unsafe {
-            let _ = SetFocus(Some(app.hwnd));
+        if had_focus {
+            unsafe {
+                let _ = SetFocus(Some(app.hwnd));
+            }
         }
         return;
     }
@@ -1187,6 +1215,32 @@ fn search_changed(app: &mut App, text: String) {
     set_title(app);
     app.relayout();
     app.invalidate();
+}
+
+/// The search field shows the current tab's query: after Back/Forward, a tab switch or a saved
+/// search it would otherwise keep a stale one, and the next keystroke would search for that.
+pub fn sync_search_field(app: &mut App) {
+    let want = match &app.tab().loc {
+        Loc::Search { text, .. } => text.clone(),
+        _ => String::new(),
+    };
+    if app.search_text == want {
+        return;
+    }
+    app.search_text = want.clone();
+    if let Some((h, _)) = edit_of(app.hwnd, EditKind::Search) {
+        if want.is_empty() && unsafe { GetFocus() } != h {
+            destroy_edit(app.hwnd, EditKind::Search);
+        } else {
+            // EN_CHANGE sees the text equal to search_text and does not search again.
+            let w = wide(&want);
+            let n = want.encode_utf16().count();
+            unsafe {
+                let _ = SetWindowTextW(h, PCWSTR(w.as_ptr()));
+                SendMessageW(h, EM_SETSEL, Some(WPARAM(n)), Some(LPARAM(n as isize)));
+            }
+        }
+    }
 }
 
 pub fn go_to_folder(app: &mut App) {
@@ -1664,8 +1718,12 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                     r.bottom - r.top,
                     SWP_NOZORDER | SWP_NOACTIVATE,
                 );
-                for k in [EditKind::Search, EditKind::Rename, EditKind::Path] {
+                for k in [EditKind::Search, EditKind::Rename, EditKind::Path, EditKind::Palette] {
                     destroy_edit(app.hwnd, k);
+                }
+                // The palette keeps going: its field comes back in the new size and colours.
+                if app.palette.is_some() {
+                    palette_field(app, true);
                 }
                 LRESULT(0)
             }
@@ -1697,6 +1755,7 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                 LRESULT(0)
             }
             WM_LBUTTONDOWN => {
+                app.eat_dblclk = false;
                 let (x, y) = xy(lparam, app.scale);
                 let (ctrl, shift, _) = mods();
                 SetCapture(hwnd);
@@ -1709,6 +1768,9 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                 LRESULT(0)
             }
             WM_LBUTTONDBLCLK => {
+                if std::mem::take(&mut app.eat_dblclk) {
+                    return LRESULT(0);
+                }
                 let (x, y) = xy(lparam, app.scale);
                 let (ctrl, shift, _) = mods();
                 SetCapture(hwnd);
@@ -1879,8 +1941,12 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
             | WM_DWMCOLORIZATIONCOLORCHANGED => {
                 app.theme = crate::theme::Theme::detect();
                 setup_dwm(app);
-                for k in [EditKind::Search, EditKind::Rename, EditKind::Path] {
+                for k in [EditKind::Search, EditKind::Rename, EditKind::Path, EditKind::Palette] {
                     destroy_edit(app.hwnd, k);
+                }
+                // The palette keeps going: its field comes back in the new size and colours.
+                if app.palette.is_some() {
+                    palette_field(app, true);
                 }
                 app.invalidate();
                 DefWindowProcW(hwnd, msg, wparam, lparam)
