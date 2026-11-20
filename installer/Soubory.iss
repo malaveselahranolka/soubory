@@ -293,8 +293,9 @@ begin
   end else if DirExists(Kit) and not RunScript('uninstall-dialogkit.ps1', '-InstallDir ' + PsQuote(Kit), Err) then
     Report('DoUnkit', Err);
 
-  { Resident from now on, as after each sign-in (the Run value). }
-  Exec(Exe, '--background', ExpandConstant('{sys}'), SW_HIDE, ewNoWait, Code);
+  { Resident from now on, as after each sign-in (the Run value). Not SW_HIDE: Windows would apply
+    it to the first window this process shows later. }
+  Exec(Exe, '--background', ExpandConstant('{sys}'), SW_SHOWNORMAL, ewNoWait, Code);
 end;
 
 { --- Uninstall --- }

@@ -85,11 +85,19 @@ function Click([IntPtr]$form, [string]$pattern) {
     [void][Win]::PostMessageW($b, 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero)  # BM_CLICK
 }
 function Fm-Windows { @(Get-Windows 'FmMainWindow') }
+# Waits for this process only: Start-Process -Wait would also wait for the fm and dialogkit that
+# setup leaves running. Touching Handle first keeps ExitCode readable in Windows PowerShell.
+function Run-Wait([string]$file, [string[]]$arguments) {
+    $p = Start-Process -FilePath $file -ArgumentList $arguments -PassThru
+    $null = $p.Handle
+    $p.WaitForExit()
+    $p
+}
 function Uninstall([string]$log) {
     $cmd = Val $uninstKey 'UninstallString'
     if (-not $cmd) { throw 'no UninstallString' }
     $exe = $cmd.Trim('"')
-    $p = Start-Process -FilePath $exe -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/LOG=`"$log`"" -PassThru -Wait
+    $p = Run-Wait $exe @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/LOG=`"$log`"")
     # The uninstaller hands over to a copy in %TEMP% that deletes the original; let it finish.
     Wait-For { -not (Test-Path -LiteralPath $exe) } 60 'the uninstaller to delete itself' | Out-Null
     $p.ExitCode
@@ -109,6 +117,7 @@ if (-not $SkipWizard) {
         "=== wizard ($theme)"
         Set-AppTheme ([int]($theme -eq 'light'))
         $p = Start-Process -FilePath $Setup -ArgumentList "/LOG=`"$Out\$Name-wizard-$theme.log`"" -PassThru
+        $null = $p.Handle
         $form = Wait-For { Get-Windows 'TWizardForm' | Select-Object -First 1 } 60 'the wizard'
         Start-Sleep -Seconds 2
         [Win]::Capture($form, "$Out\$Name-$theme-1-welcome.png")
@@ -133,7 +142,7 @@ if ($WizardOnly) { "RESULT pass=$pass fail=$fails"; if ($fails) { exit 1 }; exit
 '=== silent install'
 $dir = Join-Path $env:LOCALAPPDATA 'Programs\Zkouška Souborů'
 $exe = Join-Path $dir 'fm.exe'
-$p = Start-Process -FilePath $Setup -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/TASKS="defaultfm,dialogkit"', "/DIR=`"$dir`"", "/LOG=`"$Out\$Name-silent-install.log`"" -PassThru -Wait
+$p = Run-Wait $Setup @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/TASKS="defaultfm,dialogkit"', "/DIR=`"$dir`"", "/LOG=`"$Out\$Name-silent-install.log`"")
 Check 'setup exit code 0' ($p.ExitCode -eq 0)
 Check 'fm.exe installed' (Test-Path -LiteralPath $exe)
 Check 'notices and licence installed' ((Test-Path -LiteralPath "$dir\THIRD-PARTY-NOTICES.txt") -and (Test-Path -LiteralPath "$dir\LICENSE.txt"))

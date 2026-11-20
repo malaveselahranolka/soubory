@@ -5,7 +5,6 @@ name: Instalátor
 
 on:
   workflow_dispatch:
-  pull_request:
   push:
     tags: ['v*']
 
@@ -21,6 +20,14 @@ jobs:
         shell: powershell
     steps:
       - uses: actions/checkout@v4
+
+      # Setup and the scripts refuse the elevated half of a split token (type 2); see it up front.
+      - name: Token
+        run: |
+          Add-Type -Namespace T -Name N -MemberDefinition '[DllImport("advapi32.dll")] public static extern bool GetTokenInformation(IntPtr t, int c, out int v, int n, out int r);'
+          $v = 0; $n = 0
+          [void][T.N]::GetTokenInformation([Security.Principal.WindowsIdentity]::GetCurrent().Token, 18, [ref]$v, 4, [ref]$n)
+          "Token elevation type: $v (1 default, 2 elevated, 3 limited); user $env:USERNAME"
 
       - name: Rust
         run: |
