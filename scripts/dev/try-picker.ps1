@@ -32,18 +32,22 @@ try {
 
     # Dev builds under .fm-target never hold the door; only the resident (installed or not) matters.
     function Get-Resident { @(Get-Process fm -ErrorAction SilentlyContinue | Where-Object { $_.Path -notlike '*\.fm-target*' }) }
-    $old = @(Get-Resident | Where-Object { $_.Path -ne $new })
-    if ($old) {
+    # Old: another exe, or dist\app\fm.exe started before it was rebuilt (a running one is renamed aside).
+    $newTime = (Get-Item -LiteralPath $new).LastWriteTime
+    function Get-Old { @(Get-Resident | Where-Object { $_.Path -ne $new -or $_.StartTime -lt $newTime }) }
+    function Get-Current { @(Get-Resident | Where-Object { $_.Path -eq $new -and $_.StartTime -ge $newTime }) }
+    if (Get-Old) {
         Write-Host 'Ukončuji běžící Soubory (uložení indexu může trvat i minutu)…'
         & $new --quit
         $deadline = (Get-Date).AddSeconds(90)
-        while ((Get-Resident | Where-Object { $_.Path -ne $new }) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 500 }
-        if (Get-Resident | Where-Object { $_.Path -ne $new }) { throw 'Soubory se neukončily. Ukončete je (ikona u hodin → Ukončit Soubory) a spusťte test znovu.' }
+        while ((Get-Old) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 500 }
+        if (Get-Old) { throw 'Soubory se neukončily. Ukončete je (ikona u hodin → Ukončit Soubory) a spusťte test znovu.' }
     }
-    if (-not (Get-Resident | Where-Object { $_.Path -eq $new })) {
+    Get-ChildItem -LiteralPath (Split-Path $new) -Filter 'fm-running-*.exe' | Remove-Item -Force -ErrorAction SilentlyContinue
+    if (-not (Get-Current)) {
         Start-Process -FilePath $new -ArgumentList '--background'
         $deadline = (Get-Date).AddSeconds(15)
-        while (-not (Get-Resident | Where-Object { $_.Path -eq $new }) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 250 }
+        while (-not (Get-Current) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 250 }
     }
 
     # What the test needs, checked.
@@ -51,7 +55,7 @@ try {
     $checks = [ordered]@{
         'Doplněk pro okno Otevřít je nový'       = (Test-Path -LiteralPath $installed) -and (Get-FileHash -LiteralPath $installed).Hash -eq (Get-FileHash -LiteralPath $dll).Hash
         'Okno Otevřít vede na doplněk'           = (Get-ItemProperty 'HKCU:\Software\Classes\CLSID\{DC1C5A9C-E88A-4dde-A5A1-60F82A20AEF7}\InprocServer32' -ErrorAction SilentlyContinue).'(default)' -eq $installed
-        'Běží nové Soubory (dist\app\fm.exe)'    = [bool](Get-Resident | Where-Object { $_.Path -eq $new })
+        'Běží nové Soubory (dist\app\fm.exe)'    = [bool](Get-Current)
         'Chrome je v seznamu (shim-allow.txt)'   = [bool](Get-Content -LiteralPath $allow | Where-Object { $_.Trim() -ieq 'chrome.exe' })
     }
     Write-Host ''

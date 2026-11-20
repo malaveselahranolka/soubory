@@ -731,11 +731,14 @@ pub fn open_window(loc: Loc, near: Option<HWND>, pick: Option<crate::pick::Picke
         let (mut dx, mut dy) = (96u32, 96u32);
         let _ = GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &mut dx, &mut dy);
         let s = dx as f32 / 96.0;
+        // A picker cannot be minimized, like the system dialog it replaces: its host stays
+        // disabled until it answers, and a minimized picker left the host unusable.
+        let style = if (*app_raw).pick.is_some() { WS_OVERLAPPEDWINDOW & !WS_MINIMIZEBOX } else { WS_OVERLAPPEDWINDOW };
         let hwnd = CreateWindowExW(
             WS_EX_NOREDIRECTIONBITMAP | WS_EX_APPWINDOW,
             MAIN_CLASS,
             w!("Soubory"),
-            WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+            style | WS_CLIPCHILDREN,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             (1120.0 * s) as i32,
@@ -1412,6 +1415,8 @@ pub fn close(app: &App) {
 pub fn caption(app: &mut App, c: Cap) {
     unsafe {
         match c {
+            // A picker is modal for its host (open_window): minimized, it would leave it blocked.
+            Cap::Min if app.pick.is_some() => {}
             Cap::Min => {
                 let _ = ShowWindow(app.hwnd, SW_MINIMIZE);
             }
@@ -2844,6 +2849,7 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                 if !dev_run() {
                     crate::prefs::save(app);
                 }
+                crate::pick::closing(app);
                 let _ = DestroyWindow(hwnd);
                 LRESULT(0)
             }

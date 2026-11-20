@@ -314,6 +314,15 @@ pub fn cancel(app: &mut App) {
     crate::win::close(app);
 }
 
+/// The window is about to go (its X, Alt+F4): the answer goes first, while ours is still the
+/// foreground window and may hand that to the host's. From Drop, after DestroyWindow, Windows has
+/// already activated another app and the host's window stayed behind it.
+pub fn closing(app: &mut App) {
+    if let Some(p) = app.pick.as_mut().filter(|p| p.ready) {
+        p.answer(Msg::Cancelled);
+    }
+}
+
 /// A single-select dialog keeps one item selected (Ctrl/Shift clicks, Ctrl+A, a band).
 pub fn clamp(app: &mut App) {
     if app.pick.as_ref().is_none_or(|p| p.req.multi) || app.tab().sel.count() < 2 {
