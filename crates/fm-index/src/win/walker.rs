@@ -485,6 +485,8 @@ where
     struct ScannedNode {
         name_off: u32,
         name_len: u16,
+        folded_off: u32,
+        folded_len: u16,
         meta: Meta,
     }
 
@@ -551,9 +553,9 @@ where
                 let mut scratch = S::Scratch::default();
                 // One directory's listing at a time.
                 let mut names = String::new();
+                let mut folded = String::new();
                 let mut nodes = Vec::<ScannedNode>::new();
                 let mut eids = Vec::<EntryId>::new();
-                let mut folded_buf = String::with_capacity(128);
                 let mut root_failed = false;
                 let mut failed = Vec::<WalkFolderRef>::new();
                 let mut denied = Vec::<WalkFolderRef>::new();
@@ -621,6 +623,7 @@ where
                     };
 
                     names.clear();
+                    folded.clear();
                     nodes.clear();
                     let mut local_dirs = 0usize;
                     let mut local_files = 0usize;
@@ -649,6 +652,16 @@ where
                                             return;
                                         };
                                         names.push_str(entry.name);
+                                        // Folded here, so the index lock covers only the insert.
+                                        let folded_off = folded.len();
+                                        fold_into(entry.name, &mut folded);
+                                        let Ok(folded_len) =
+                                            u16::try_from(folded.len() - folded_off)
+                                        else {
+                                            names.truncate(name_off as usize);
+                                            folded.truncate(folded_off);
+                                            return;
+                                        };
 
                                         let should_descend = is_dir
                                             && (!is_reparse
@@ -694,6 +707,8 @@ where
                                         nodes.push(ScannedNode {
                                             name_off,
                                             name_len,
+                                            folded_off: folded_off as u32,
+                                            folded_len,
                                             meta,
                                         });
                                     },
@@ -752,14 +767,9 @@ where
                         for node in &nodes {
                             let off = node.name_off as usize;
                             let name = &names[off..off + node.name_len as usize];
-                            folded_buf.clear();
-                            fold_into(name, &mut folded_buf);
-                            eids.push(idx.insert_with_folded(
-                                task.dir_id,
-                                name,
-                                &folded_buf,
-                                node.meta,
-                            ));
+                            let f_off = node.folded_off as usize;
+                            let f_name = &folded[f_off..f_off + node.folded_len as usize];
+                            eids.push(idx.insert_with_folded(task.dir_id, name, f_name, node.meta));
                         }
                         drop(idx);
                         for pt in &mut pending_tasks {
