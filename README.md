@@ -12,7 +12,7 @@ drives and Win+E. The interface is in Czech. Licensed under GPL-3.0-or-later.*
 
 ## Stažení a instalace
 
-**[Stáhnout Soubory 0.1.0-beta.1](https://github.com/malaveselahranolka/soubory/releases/download/v0.1.0-beta.1/Soubory-0.1.0-beta.1-setup.exe)**
+**[Stáhnout Soubory 0.1.0-beta.2](https://github.com/malaveselahranolka/soubory/releases/download/v0.1.0-beta.2/Soubory-0.1.0-beta.2-setup.exe)**
 (instalátor pro 64bitová Windows 10 a 11; další verze najdeš v
 [Releases](https://github.com/malaveselahranolka/soubory/releases)).
 
