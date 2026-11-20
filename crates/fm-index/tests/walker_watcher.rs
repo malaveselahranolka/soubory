@@ -2223,3 +2223,77 @@ fn regression_partial_error_rename_and_reused_old_path() {
     assert!(live_b.lookup("R:\\D\\Q3\\secret_p.txt").is_some());
     assert_eq!(live_b.by_file_id(100), live_b.lookup("R:\\D\\Q3"));
 }
+
+#[test]
+fn walker_worker_panic_fails_the_whole_walk() {
+    // Fails on 4056029: the panicked worker's output was dropped by `filter_map(join().ok())`,
+    // so the walk returned Some(index without R:\D's subtree) and the merge deleted it.
+    struct PanickingSource(MockDirSource);
+    impl DirSource for PanickingSource {
+        type Handle = MockHandle;
+        type Scratch = ();
+        fn open_dir(&self, path: &str) -> io::Result<Self::Handle> {
+            self.0.open_dir(path)
+        }
+        fn root_info(&self, dir: &Self::Handle) -> io::Result<RootInfo> {
+            self.0.root_info(dir)
+        }
+        fn read_batch(
+            &self,
+            dir: &Self::Handle,
+            restart: bool,
+            scratch: &mut Self::Scratch,
+            emit: &mut dyn FnMut(DirEntryRef<'_>),
+        ) -> io::Result<bool> {
+            assert!(dir.path != "R:\\D", "simulated walker worker panic");
+            self.0.read_batch(dir, restart, scratch, emit)
+        }
+    }
+
+    let root_info = RootInfo {
+        volume_serial: 0x7777_8888,
+        file_id: 1,
+        attrs: DIRECTORY,
+        mtime: 10,
+    };
+    let mut mock = MockDirSource::new(root_info, 16);
+    mock.nodes.insert(
+        "R:\\".to_owned(),
+        MockNodeKind::Dir(vec![
+            MockEntry {
+                name: "D".to_owned(),
+                attrs: DIRECTORY,
+                size: 0,
+                mtime: 10,
+                file_id: 2,
+                reparse_tag: 0,
+            },
+            MockEntry {
+                name: "top.txt".to_owned(),
+                attrs: ARCHIVE,
+                size: 1,
+                mtime: 10,
+                file_id: 3,
+                reparse_tag: 0,
+            },
+        ]),
+    );
+    mock.nodes.insert(
+        "R:\\D".to_owned(),
+        MockNodeKind::Dir(vec![MockEntry {
+            name: "kid.txt".to_owned(),
+            attrs: ARCHIVE,
+            size: 1,
+            mtime: 10,
+            file_id: 4,
+            reparse_tag: 0,
+        }]),
+    );
+    let cancel = AtomicBool::new(false);
+    let opts = WalkOptions {
+        threads: 2,
+        ..WalkOptions::default()
+    };
+    let res = walk_with_source_report(&PanickingSource(mock), "R:\\", opts, &cancel, |_| {});
+    assert!(res.is_none(), "a panicked worker must fail the walk");
+}

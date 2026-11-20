@@ -350,7 +350,68 @@ impl Index {
         } else {
             self.unlink_child(parent, id);
         }
+        self.kill_subtree(id);
+        self.index_gen = self.index_gen.wrapping_add(1);
+    }
 
+    /// Removes every live entry `i` with `doomed[i]` (and its subtree), unlinking each affected
+    /// parent's child list once instead of once per removed child (O(siblings) each).
+    ///
+    /// Returns `true` if anything was removed.
+    pub(crate) fn remove_flagged(&mut self, doomed: &[bool]) -> bool {
+        let is_doomed = |idx: &Self, id: EntryId| {
+            (id as usize) < doomed.len() && doomed[id as usize] && idx.is_alive(id)
+        };
+        let mut tops = Vec::new();
+        let mut parents = Vec::new();
+        for (i, &d) in doomed.iter().enumerate() {
+            let id = i as EntryId;
+            if !d || !self.is_alive(id) {
+                continue;
+            }
+            let p = self.parent[i];
+            if p != NONE && is_doomed(self, p) {
+                continue; // killed with its doomed parent's subtree
+            }
+            tops.push(id);
+            if p == NONE {
+                self.roots.retain(|&r| r != id);
+            } else {
+                parents.push(p);
+            }
+        }
+        if tops.is_empty() {
+            return false;
+        }
+        parents.sort_unstable();
+        parents.dedup();
+        for p in parents {
+            let mut prev = NONE;
+            let mut cur = self.first_child[p as usize];
+            while cur != NONE {
+                let next = self.next_sibling[cur as usize];
+                if is_doomed(self, cur) {
+                    if prev == NONE {
+                        self.first_child[p as usize] = next;
+                    } else {
+                        self.next_sibling[prev as usize] = next;
+                    }
+                    self.next_sibling[cur as usize] = NONE;
+                } else {
+                    prev = cur;
+                }
+                cur = next;
+            }
+        }
+        for id in tops {
+            self.kill_subtree(id);
+        }
+        self.index_gen = self.index_gen.wrapping_add(1);
+        true
+    }
+
+    /// Frees `id` and all descendants; `id` must already be unlinked from its parent / roots.
+    fn kill_subtree(&mut self, id: EntryId) {
         let mut stack = vec![id];
         while let Some(u) = stack.pop() {
             let ui = u as usize;
@@ -390,7 +451,6 @@ impl Index {
             self.next_sibling[ui] = NONE;
             self.live_count -= 1;
         }
-        self.index_gen = self.index_gen.wrapping_add(1);
     }
 
     /// Renames `id` to `new_name` in its current parent directory.

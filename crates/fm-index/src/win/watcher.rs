@@ -141,6 +141,9 @@ pub struct Win32WatcherFs;
 
 impl WatcherFs for Win32WatcherFs {
     fn resolve_long_leaf(&self, full_path: &str) -> Option<String> {
+        if !looks_like_short_name(leaf_of(full_path.trim_end_matches('\\'))) {
+            return None;
+        }
         let ext = to_extended_path(full_path);
         let w = wide_null(&ext);
         let mut out = vec![0u16; w.len().max(512)];
@@ -431,6 +434,22 @@ impl WatcherFs for PrefetchedBatch {
     }
 }
 
+/// `true` only for leaves shaped like a generated 8.3 short name (`LONGDI~1`, `VERYLO~1.PDF`):
+/// ASCII, base <= 8 chars ending in `~` + digits, extension <= 3 chars. Names like `~$doc.docx`
+/// never reach `GetLongPathNameW`, whose no-recall behaviour on cloud placeholders is unverified.
+pub(crate) fn looks_like_short_name(leaf: &str) -> bool {
+    if !leaf.is_ascii() || leaf.contains(' ') {
+        return false;
+    }
+    let (base, ext) = leaf.split_once('.').unwrap_or((leaf, ""));
+    if base.len() > 8 || ext.len() > 3 || ext.contains('.') {
+        return false;
+    }
+    base.rsplit_once('~').is_some_and(|(head, digits)| {
+        !head.is_empty() && !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+    })
+}
+
 #[inline]
 fn record_needs_dir_list(rec: &NotifyRecord) -> bool {
     (rec.action == NotifyAction::Added || rec.action == NotifyAction::RenamedNewName)
@@ -443,7 +462,7 @@ pub(crate) fn batch_needs_prefetch(records: &[NotifyRecord]) -> bool {
     records.iter().any(|rec| {
         record_needs_dir_list(rec)
             || ((rec.action == NotifyAction::Added || rec.action == NotifyAction::RenamedNewName)
-                && leaf_of(&rec.rel_path).contains('~'))
+                && looks_like_short_name(leaf_of(&rec.rel_path)))
     })
 }
 
@@ -457,7 +476,7 @@ pub(crate) fn collect_parent_hints(
         if rec.parent_file_id == 0 || hints.contains_key(&rec.parent_file_id) {
             continue;
         }
-        if (record_needs_dir_list(rec) || leaf_of(&rec.rel_path).contains('~'))
+        if (record_needs_dir_list(rec) || looks_like_short_name(leaf_of(&rec.rel_path)))
             && let Some(pid) = idx.by_file_id(rec.parent_file_id)
             && is_descendant_of(idx, pid, root_id)
         {
@@ -467,17 +486,26 @@ pub(crate) fn collect_parent_hints(
     hints
 }
 
+/// Lists added/moved-in directory subtrees and resolves 8.3 leaves without any index lock.
+/// Records whose index is in `skip_dir_list` (renames resolving in the index) are not listed;
+/// `stop` aborts the listing early so `Service::stop` never waits on a huge subtree.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn prefetch_batch_outside_lock(
     root_display: &str,
     records: &[NotifyRecord],
     parent_hints: &HashMap<u64, String>,
+    skip_dir_list: &HashSet<usize>,
     denied: &DeniedFilter,
     use_file_id: bool,
     fs: &dyn WatcherFs,
+    stop: &AtomicBool,
 ) -> PrefetchedBatch {
     let mut out = PrefetchedBatch::default();
 
-    for rec in records {
+    for (i, rec) in records.iter().enumerate() {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
         if rec.action != NotifyAction::Added && rec.action != NotifyAction::RenamedNewName {
             continue;
         }
@@ -485,8 +513,8 @@ pub(crate) fn prefetch_batch_outside_lock(
         if raw_leaf.is_empty() {
             continue;
         }
-        let needs_short = raw_leaf.contains('~');
-        let needs_dir = record_needs_dir_list(rec);
+        let needs_short = looks_like_short_name(raw_leaf);
+        let needs_dir = record_needs_dir_list(rec) && !skip_dir_list.contains(&i);
         if !needs_short && !needs_dir {
             continue;
         }
@@ -547,6 +575,9 @@ pub(crate) fn prefetch_batch_outside_lock(
                 let mut q = VecDeque::new();
                 q.push_back((start_full, start_rel, rec.file_id, start_depth));
                 while let Some((dir_full, dir_rel, dir_fid, depth)) = q.pop_front() {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
                     let key = fold(&normalize_display_path(&dir_full));
                     if out.dir_children.contains_key(&key) {
                         continue;
@@ -628,6 +659,7 @@ pub(crate) fn apply_records_filtered(
         &mut pending_old,
         denied,
         use_file_id,
+        false,
     );
     if let Some(orphan) = pending_old.take()
         && !denied.is_record_denied(Some((idx, root_id)), &orphan, use_file_id)
@@ -638,6 +670,70 @@ pub(crate) fn apply_records_filtered(
     changed
 }
 
+/// Replays records captured during a re-walk onto the merged fresh index.
+///
+/// Unlike the live path, a trailing unpaired `RenamedOldName` is dropped rather than applied as
+/// a removal: its `RenamedNewName` may have been lost in a gap, and the fresh walk already shows
+/// the item wherever it ended up.
+pub(crate) fn replay_records_filtered(
+    idx: &mut Index,
+    root_id: EntryId,
+    records: &[NotifyRecord],
+    fs: &dyn WatcherFs,
+    denied: &DeniedFilter,
+    use_file_id: bool,
+) -> bool {
+    let mut pending_old = None;
+    let changed = apply_records_with_pending_filtered(
+        idx,
+        root_id,
+        records,
+        fs,
+        &mut pending_old,
+        denied,
+        use_file_id,
+        true,
+    );
+    maybe_compact(idx);
+    changed
+}
+
+/// Indices of `RenamedNewName` records whose paired old name resolves in `idx` right now: those
+/// renames move the existing entry (subtree included), so their new path need not be listed.
+// shortcut: decided before the batch is applied; if an earlier record in the same batch (or a
+// merge between this read lock and the apply) makes the old name stop resolving, the rename falls
+// back to an add with no listing and the folder stays empty until the next walk. Upgrade by
+// re-listing such folders after the apply if this shows up in practice.
+pub(crate) fn renames_resolved_in_index(
+    idx: &Index,
+    root_id: EntryId,
+    records: &[NotifyRecord],
+    pending_old: Option<&NotifyRecord>,
+    denied: &DeniedFilter,
+    use_file_id: bool,
+) -> HashSet<usize> {
+    let mut out = HashSet::new();
+    let mut pending = pending_old;
+    for (i, rec) in records.iter().enumerate() {
+        match rec.action {
+            NotifyAction::RenamedOldName => pending = Some(rec),
+            NotifyAction::RenamedNewName => {
+                if let Some(old) = pending.take()
+                    && !splits_into_remove_add(old, rec, use_file_id)
+                    && !denied.is_record_denied(Some((idx, root_id)), old, use_file_id)
+                    && resolve_rename_source(idx, root_id, old, use_file_id).is_some()
+                {
+                    out.insert(i);
+                }
+            }
+            _ => pending = None,
+        }
+    }
+    out
+}
+
+/// `replay` marks records re-applied onto a merged fresh walk (see [`replay_records_filtered`]).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_records_with_pending_filtered(
     idx: &mut Index,
     root_id: EntryId,
@@ -646,6 +742,7 @@ pub(crate) fn apply_records_with_pending_filtered(
     pending_old: &mut Option<NotifyRecord>,
     denied: &DeniedFilter,
     use_file_id: bool,
+    replay: bool,
 ) -> bool {
     if !idx.is_alive(root_id) {
         *pending_old = None;
@@ -670,7 +767,8 @@ pub(crate) fn apply_records_with_pending_filtered(
                         denied.is_record_denied(Some((idx, root_id)), rec, use_file_id);
                     match (old_denied, new_denied) {
                         (false, false) => {
-                            changed |= apply_rename_pair(idx, root_id, &old, rec, fs, use_file_id);
+                            changed |=
+                                apply_rename_pair(idx, root_id, &old, rec, fs, use_file_id, replay);
                         }
                         (false, true) => {
                             changed |= apply_removed_record(idx, root_id, &old, use_file_id);
@@ -843,7 +941,7 @@ fn resolve_leaf_if_short(
     raw_leaf: &str,
     fs: &dyn WatcherFs,
 ) -> String {
-    if raw_leaf.contains('~') {
+    if looks_like_short_name(raw_leaf) {
         let full = join_child_path(&idx.path(parent_id), raw_leaf);
         if let Some(long_leaf) = fs.resolve_long_leaf(&full) {
             return long_leaf;
@@ -980,6 +1078,29 @@ fn apply_modified_record(
     true
 }
 
+#[inline]
+fn splits_into_remove_add(old: &NotifyRecord, new: &NotifyRecord, use_file_id: bool) -> bool {
+    use_file_id && old.file_id != 0 && new.file_id != 0 && old.file_id != new.file_id
+}
+
+fn resolve_rename_source(
+    idx: &Index,
+    root_id: EntryId,
+    old: &NotifyRecord,
+    use_file_id: bool,
+) -> Option<EntryId> {
+    resolve_parent_entry(idx, root_id, old.parent_file_id, &old.rel_path, use_file_id)
+        .and_then(|op| {
+            resolve_target_in_parent(idx, op, old.file_id, leaf_of(&old.rel_path), use_file_id)
+        })
+        .or_else(|| {
+            // Never use global cross-folder FileId fallback for files (hard links share FileIds).
+            (use_file_id && old.file_id != 0 && (old.attrs & DIRECTORY) != 0)
+                .then(|| idx.by_file_id(old.file_id).filter(|&id| idx.is_dir(id)))
+                .flatten()
+        })
+}
+
 fn apply_rename_pair(
     idx: &mut Index,
     root_id: EntryId,
@@ -987,35 +1108,39 @@ fn apply_rename_pair(
     new: &NotifyRecord,
     fs: &dyn WatcherFs,
     use_file_id: bool,
+    replay: bool,
 ) -> bool {
-    if use_file_id && old.file_id != 0 && new.file_id != 0 && old.file_id != new.file_id {
+    if splits_into_remove_add(old, new, use_file_id) {
         let mut changed = apply_removed_record(idx, root_id, old, use_file_id);
         changed |= apply_added_record(idx, root_id, new, fs, use_file_id);
         return changed;
     }
 
-    let old_target =
-        resolve_parent_entry(idx, root_id, old.parent_file_id, &old.rel_path, use_file_id)
-            .and_then(|op| {
-                resolve_target_in_parent(idx, op, old.file_id, leaf_of(&old.rel_path), use_file_id)
-            })
-            .or_else(|| {
-                // Never use global cross-folder FileId fallback for files (hard links share FileIds).
-                (use_file_id && old.file_id != 0 && (old.attrs & DIRECTORY) != 0)
-                    .then(|| idx.by_file_id(old.file_id).filter(|&id| idx.is_dir(id)))
-                    .flatten()
-            });
-
-    let Some(target) = old_target else {
+    let Some(target) = resolve_rename_source(idx, root_id, old, use_file_id) else {
         return apply_added_record(idx, root_id, new, fs, use_file_id);
     };
-    let Some(new_parent) =
-        resolve_parent_entry(idx, root_id, new.parent_file_id, &new.rel_path, use_file_id)
-    else {
+    if idx.parent[target as usize] == NONE {
         return false;
+    }
+    let Some(new_parent) =
+        resolve_parent_entry(idx, root_id, new.parent_file_id, &new.rel_path, use_file_id).or_else(
+            || {
+                // Destination folder known by FileId under a newer path (it was moved or renamed
+                // later, e.g. a replay onto a fresh walk that listed the final layout).
+                use_file_id
+                    .then(|| idx.by_file_id(new.parent_file_id))
+                    .flatten()
+                    .filter(|&p| idx.is_dir(p) && is_descendant_of(idx, p, root_id))
+            },
+        )
+    else {
+        // Moved into a folder the index does not know: drop it instead of leaving a ghost at
+        // the old path.
+        idx.remove(target);
+        return true;
     };
 
-    if idx.parent[target as usize] == NONE || is_ancestor_or_same(idx, target, new_parent) {
+    if is_ancestor_or_same(idx, target, new_parent) {
         return false;
     }
     let raw_new_leaf = leaf_of(&new.rel_path);
@@ -1023,7 +1148,18 @@ fn apply_rename_pair(
         return false;
     }
     let new_leaf = resolve_leaf_if_short(idx, new_parent, raw_new_leaf, fs);
-    idx.move_to(target, new_parent, &new_leaf);
+    // Live renames onto an existing folder are impossible on disk, so a live occupant is stale
+    // and gets replaced; only a replay may find the rename already applied.
+    if replay
+        && keep_same_folder_at_rename_target(idx, target, new_parent, &new_leaf, new, use_file_id)
+    {
+        return true;
+    }
+    let mut changed = false;
+    if idx.parent[target as usize] != new_parent || idx.display_str_unchecked(target) != new_leaf {
+        idx.move_to(target, new_parent, &new_leaf);
+        changed = true;
+    }
 
     let is_dir = (new.attrs & DIRECTORY) != 0;
     let fid = if new.file_id != 0 {
@@ -1039,9 +1175,62 @@ fn apply_rename_pair(
     };
     if idx.meta(target) != new_meta {
         idx.update_meta(target, new_meta);
+        changed = true;
+    }
+    changed
+}
+
+/// Replay idempotence: when a folder that is the same item as the renamed one (same FileId, or
+/// unknowable on path-only volumes) already sits at the new path, the rename was already applied,
+/// e.g. a replayed `Added X` + `X -> Y` onto a fresh walk that listed `Y`. Keeps that folder and
+/// its subtree, drops the stale source, and returns `true`; `move_to` would delete the occupant.
+fn keep_same_folder_at_rename_target(
+    idx: &mut Index,
+    target: EntryId,
+    new_parent: EntryId,
+    new_leaf: &str,
+    new: &NotifyRecord,
+    use_file_id: bool,
+) -> bool {
+    let mut folded = String::with_capacity(new_leaf.len());
+    fold_into(new_leaf, &mut folded);
+    let Some(occ) = idx.find_child(new_parent, folded.as_bytes(), new_leaf) else {
+        return false;
+    };
+    if occ == target || !idx.is_dir(occ) {
+        return false;
+    }
+    let rename_fid = if new.file_id != 0 {
+        new.file_id
+    } else {
+        idx.file_id(target)
+    };
+    let occ_fid = idx.file_id(occ);
+    if use_file_id && rename_fid != 0 && occ_fid != 0 && occ_fid != rename_fid {
+        return false;
+    }
+    idx.remove(target);
+    if idx.display_str_unchecked(occ) != new_leaf {
+        idx.rename(occ, new_leaf);
+    }
+    if (new.attrs & DIRECTORY) != 0 {
+        let meta = Meta {
+            attrs: new.attrs,
+            size: 0,
+            mtime: new.mtime,
+            file_id: if new.file_id != 0 {
+                new.file_id
+            } else {
+                occ_fid
+            },
+        };
+        if idx.meta(occ) != meta {
+            idx.update_meta(occ, meta);
+        }
     }
     true
 }
+
 /// Parses a `ReadDirectoryNotifyExtendedInformation` byte buffer into [`NotifyRecord`]s.
 pub(crate) fn parse_notify_buffer(buf: &[u8]) -> Vec<NotifyRecord> {
     let mut records = Vec::new();
@@ -1145,6 +1334,8 @@ pub(crate) type OnLockedCallback = Box<dyn Fn(&[NotifyRecord]) + Send + Sync>;
 pub(crate) struct WatcherBatchState {
     pub(crate) pending_batch: Vec<NotifyRecord>,
     pub(crate) pending_old: Option<NotifyRecord>,
+    /// Watcher stop flag: aborts subtree listing during a flush.
+    pub(crate) stop: Arc<AtomicBool>,
 }
 
 impl WatcherBatchState {
@@ -1196,23 +1387,37 @@ impl WatcherBatchState {
         let needs_prefetch = batch_needs_prefetch(&coalesced);
 
         let prefetched = if needs_prefetch {
-            let hints = if use_file_id {
-                let rguard = read_or_recover(index);
-                rguard
-                    .lookup(root_display)
-                    .map(|rid| collect_parent_hints(&rguard, rid, &coalesced))
-                    .unwrap_or_default()
-            } else {
-                HashMap::new()
-            };
             let denied_snap = read_or_recover(denied_filter).clone();
+            let (hints, skip) = {
+                let rguard = read_or_recover(index);
+                match rguard.lookup(root_display) {
+                    Some(rid) => (
+                        if use_file_id {
+                            collect_parent_hints(&rguard, rid, &coalesced)
+                        } else {
+                            HashMap::new()
+                        },
+                        renames_resolved_in_index(
+                            &rguard,
+                            rid,
+                            &coalesced,
+                            self.pending_old.as_ref(),
+                            &denied_snap,
+                            use_file_id,
+                        ),
+                    ),
+                    None => (HashMap::new(), HashSet::new()),
+                }
+            };
             Some(prefetch_batch_outside_lock(
                 root_display,
                 &coalesced,
                 &hints,
+                &skip,
                 &denied_snap,
                 use_file_id,
                 fs,
+                &self.stop,
             ))
         } else {
             None
@@ -1240,6 +1445,7 @@ impl WatcherBatchState {
                 &mut self.pending_old,
                 &df,
                 use_file_id,
+                false,
             );
             maybe_compact(&mut guard);
             c
@@ -1606,7 +1812,10 @@ fn watcher_loop(
 ) {
     let aligned_bytes = config.buffer_bytes.max(128).div_ceil(8) * 8;
     let fs = Win32WatcherFs;
-    let mut batch_state = WatcherBatchState::default();
+    let mut batch_state = WatcherBatchState {
+        stop: Arc::clone(&stop_flag),
+        ..Default::default()
+    };
     let mut initial_sent = false;
     let mut need_restart_rewalk = initial_dir.is_none();
     let mut backoff = Duration::from_secs(1);
@@ -1661,7 +1870,6 @@ fn watcher_loop(
                     initial_sent = true;
                     let _ = armed_tx.send(Ok(()));
                 }
-                backoff = Duration::from_secs(1);
                 if need_restart_rewalk {
                     on_restarted();
                 }
@@ -1671,7 +1879,6 @@ fn watcher_loop(
                     initial_sent = true;
                     let _ = armed_tx.send(Ok(()));
                 }
-                backoff = Duration::from_secs(1);
                 if need_restart_rewalk {
                     on_restarted();
                 } else {
@@ -1755,6 +1962,9 @@ fn watcher_loop(
 
                 match ov_res {
                     Ok(()) => {
+                        // Only a completed read proves the handle works; an arm that fails right
+                        // after succeeding must keep backing off.
+                        backoff = Duration::from_secs(1);
                         if bytes_returned == 0 {
                             batch_state.on_overflow(
                                 root_display,
@@ -2228,6 +2438,7 @@ mod tests {
                 reparse_tag: 0,
             }],
             pending_old: None,
+            ..Default::default()
         };
         let applied_changed = Arc::new(AtomicBool::new(true));
         let applied_clone = Arc::clone(&applied_changed);
@@ -2634,5 +2845,426 @@ mod tests {
             relative_under_root("Sub\\file.txt", "Sub"),
             Some("file.txt")
         );
+    }
+
+    fn rec(action: NotifyAction, rel: &str, fid: u64, pfid: u64, attrs: u32) -> NotifyRecord {
+        NotifyRecord {
+            action,
+            rel_path: rel.to_owned(),
+            file_id: fid,
+            parent_file_id: pfid,
+            attrs,
+            size: 0,
+            mtime: 1,
+            reparse_tag: 0,
+        }
+    }
+
+    fn meta(attrs: u32, fid: u64) -> Meta {
+        Meta {
+            attrs,
+            size: 0,
+            mtime: 1,
+            file_id: fid,
+        }
+    }
+
+    /// Counts disk calls; `list_dir_children_checked` returns one file per folder and, when
+    /// `stop_after_first` is set, raises the stop flag after the first listing.
+    #[derive(Default)]
+    struct CountingFs {
+        lists: std::sync::atomic::AtomicUsize,
+        long_name_calls: std::sync::atomic::AtomicUsize,
+        stop: Arc<AtomicBool>,
+        stop_after_first: bool,
+        nested_dirs: bool,
+    }
+
+    impl WatcherFs for CountingFs {
+        fn resolve_long_leaf(&self, _full_path: &str) -> Option<String> {
+            self.long_name_calls.fetch_add(1, Ordering::SeqCst);
+            None
+        }
+        fn list_dir_children(&self, _full_dir_path: &str) -> Vec<AddedChild> {
+            Vec::new()
+        }
+        fn list_dir_children_checked(&self, _full_dir_path: &str) -> io::Result<Vec<AddedChild>> {
+            self.lists.fetch_add(1, Ordering::SeqCst);
+            if self.stop_after_first {
+                self.stop.store(true, Ordering::SeqCst);
+            }
+            let mut out = vec![AddedChild {
+                name: "listed.txt".to_owned(),
+                meta: meta(ARCHIVE, 0),
+                reparse_tag: 0,
+            }];
+            if self.nested_dirs {
+                out.push(AddedChild {
+                    name: "deeper".to_owned(),
+                    meta: meta(DIRECTORY, 0),
+                    reparse_tag: 0,
+                });
+            }
+            Ok(out)
+        }
+    }
+
+    fn photos_index() -> (Index, EntryId) {
+        let mut idx = Index::new();
+        let root = idx.add_root("R:\\");
+        idx.set_file_id(root, 1);
+        let p = idx.insert(root, "Photos 2026", meta(DIRECTORY, 7));
+        for i in 0..3u64 {
+            idx.insert(p, &format!("img{i}.jpg"), meta(ARCHIVE, 100 + i));
+        }
+        (idx, root)
+    }
+
+    fn photo_children(idx: &Index) -> usize {
+        (0..3)
+            .filter(|i| {
+                idx.lookup(&format!("R:\\Photos 2026\\img{i}.jpg"))
+                    .is_some()
+            })
+            .count()
+    }
+
+    #[test]
+    fn replayed_add_then_rename_keeps_existing_target_subtree() {
+        // Fails on 4056029: the replayed `Added Album` creates a second FileId-7 folder and the
+        // rename's collision removal deletes the real `Photos 2026` with its 3 children.
+        for use_file_id in [true, false] {
+            let (mut idx, root) = photos_index();
+            let recs = [
+                rec(NotifyAction::Added, "Album", 7, 1, DIRECTORY),
+                rec(NotifyAction::RenamedOldName, "Album", 7, 1, DIRECTORY),
+                rec(NotifyAction::RenamedNewName, "Photos 2026", 7, 1, DIRECTORY),
+            ];
+            replay_records_filtered(
+                &mut idx,
+                root,
+                &recs,
+                &NoopWatcherFs,
+                &DeniedFilter::default(),
+                use_file_id,
+            );
+            assert_eq!(photo_children(&idx), 3, "use_file_id={use_file_id}");
+            assert_eq!(idx.lookup("R:\\Album"), None, "use_file_id={use_file_id}");
+            if use_file_id {
+                assert_eq!(idx.by_file_id(7), idx.lookup("R:\\Photos 2026"));
+            }
+        }
+
+        // Atomic save stays correct: a file renamed over one with a different FileId replaces it.
+        let mut idx = Index::new();
+        let root = idx.add_root("R:\\");
+        idx.set_file_id(root, 1);
+        idx.insert(root, "doc.docx", meta(ARCHIVE, 10));
+        idx.insert(root, "doc.tmp", meta(ARCHIVE, 20));
+        let recs = [
+            rec(NotifyAction::RenamedOldName, "doc.tmp", 20, 1, ARCHIVE),
+            rec(NotifyAction::RenamedNewName, "doc.docx", 20, 1, ARCHIVE),
+        ];
+        assert!(apply_records(&mut idx, root, &recs, &NoopWatcherFs));
+        assert_eq!(idx.lookup("R:\\doc.tmp"), None);
+        assert_eq!(idx.by_file_id(20), idx.lookup("R:\\doc.docx"));
+        assert_eq!(idx.by_file_id(10), None);
+
+        // A replayed cross-folder move (Removed + Added) onto a walk that already saw it is a no-op.
+        let mut idx = Index::new();
+        let root = idx.add_root("R:\\");
+        idx.set_file_id(root, 1);
+        idx.insert(root, "A", meta(DIRECTORY, 2));
+        let z = idx.insert(root, "Z", meta(DIRECTORY, 3));
+        let x = idx.insert(z, "X", meta(DIRECTORY, 7));
+        idx.insert(x, "kid.txt", meta(ARCHIVE, 8));
+        let recs = [
+            rec(NotifyAction::Removed, "A\\X", 7, 2, DIRECTORY),
+            rec(NotifyAction::Added, "Z\\X", 7, 3, DIRECTORY),
+        ];
+        replay_records_filtered(
+            &mut idx,
+            root,
+            &recs,
+            &NoopWatcherFs,
+            &DeniedFilter::default(),
+            true,
+        );
+        assert!(idx.lookup("R:\\Z\\X\\kid.txt").is_some());
+    }
+
+    #[test]
+    fn rename_into_unknown_folder_removes_the_old_entry() {
+        // Fails on 4056029: the rename returned false and left `A` as a ghost at its old path.
+        let mut idx = Index::new();
+        let root = idx.add_root("R:\\");
+        idx.set_file_id(root, 1);
+        let a = idx.insert(root, "A", meta(DIRECTORY, 7));
+        idx.insert(a, "kid.txt", meta(ARCHIVE, 8));
+        let recs = [
+            rec(NotifyAction::RenamedOldName, "A", 7, 1, DIRECTORY),
+            rec(NotifyAction::RenamedNewName, "Unknown\\A", 7, 99, DIRECTORY),
+        ];
+        assert!(apply_records(&mut idx, root, &recs, &NoopWatcherFs));
+        assert_eq!(idx.lookup("R:\\A"), None);
+        assert_eq!(idx.by_file_id(8), None);
+    }
+
+    #[test]
+    fn folder_rename_resolving_in_index_is_not_listed_from_disk() {
+        // Fails on 4056029: every RenamedNewName directory was listed recursively from disk even
+        // though the rename just moves the indexed subtree.
+        let index = Arc::new(RwLock::new(Index::new()));
+        {
+            let mut g = index.write().unwrap();
+            let root = g.add_root("R:\\");
+            g.set_file_id(root, 1);
+            let a = g.insert(root, "A", meta(DIRECTORY, 7));
+            g.insert(a, "kid.txt", meta(ARCHIVE, 8));
+        }
+        let apply_mu = Arc::new(Mutex::new(()));
+        let denied = Arc::new(RwLock::new(DeniedFilter::default()));
+        let fs = CountingFs::default();
+        let mut state = WatcherBatchState::default();
+        // Old and new halves arrive in separate flushes (pairing via pending_old).
+        state
+            .pending_batch
+            .push(rec(NotifyAction::RenamedOldName, "A", 7, 1, DIRECTORY));
+        state.flush(
+            "R:\\",
+            &index,
+            &apply_mu,
+            &denied,
+            true,
+            &fs,
+            &|_| {},
+            &|_, _| {},
+        );
+        state
+            .pending_batch
+            .push(rec(NotifyAction::RenamedNewName, "B", 7, 1, DIRECTORY));
+        state.flush(
+            "R:\\",
+            &index,
+            &apply_mu,
+            &denied,
+            true,
+            &fs,
+            &|_| {},
+            &|_, _| {},
+        );
+        assert_eq!(fs.lists.load(Ordering::SeqCst), 0);
+        let g = index.read().unwrap();
+        assert!(g.lookup("R:\\B\\kid.txt").is_some());
+        assert_eq!(g.lookup("R:\\B\\listed.txt"), None);
+
+        // An unresolvable rename (old half unknown) is still listed so the folder is not empty.
+        drop(g);
+        state
+            .pending_batch
+            .push(rec(NotifyAction::RenamedOldName, "Nope", 70, 1, DIRECTORY));
+        state
+            .pending_batch
+            .push(rec(NotifyAction::RenamedNewName, "C", 70, 1, DIRECTORY));
+        state.flush(
+            "R:\\",
+            &index,
+            &apply_mu,
+            &denied,
+            true,
+            &fs,
+            &|_| {},
+            &|_, _| {},
+        );
+        assert_eq!(fs.lists.load(Ordering::SeqCst), 1);
+        assert!(index.read().unwrap().lookup("R:\\C\\listed.txt").is_some());
+    }
+
+    #[test]
+    fn prefetch_listing_stops_when_stop_flag_is_raised() {
+        // Fails on 4056029 (no stop check): the whole 511-level chain was listed while
+        // `Service::stop` waited on the watcher's final flush.
+        let fs = CountingFs {
+            stop_after_first: true,
+            nested_dirs: true,
+            ..Default::default()
+        };
+        let recs = [rec(NotifyAction::Added, "Big", 7, 1, DIRECTORY)];
+        let _ = prefetch_batch_outside_lock(
+            "R:\\",
+            &recs,
+            &HashMap::new(),
+            &HashSet::new(),
+            &DeniedFilter::default(),
+            true,
+            &fs,
+            &fs.stop,
+        );
+        assert_eq!(fs.lists.load(Ordering::SeqCst), 1);
+
+        let fs_run = CountingFs {
+            nested_dirs: true,
+            ..Default::default()
+        };
+        let _ = prefetch_batch_outside_lock(
+            "R:\\",
+            &recs,
+            &HashMap::new(),
+            &HashSet::new(),
+            &DeniedFilter::default(),
+            true,
+            &fs_run,
+            &AtomicBool::new(false),
+        );
+        assert_eq!(
+            fs_run.lists.load(Ordering::SeqCst),
+            usize::from(MAX_WALK_DEPTH - 1)
+        );
+    }
+
+    #[test]
+    fn get_long_path_name_only_for_plausible_short_names() {
+        // Fails on 4056029: any leaf containing `~` (e.g. Office lock files `~$doc.docx`) went
+        // through GetLongPathNameW.
+        for name in [
+            "LONGDI~1",
+            "VERYLO~1.PDF",
+            "SHORTN~1.TXT",
+            "ab12f~10.x",
+            "PROGRA~1",
+        ] {
+            assert!(looks_like_short_name(name), "{name}");
+        }
+        for name in [
+            "~$doc.docx",
+            "~WRL0001.tmp",
+            "file~.txt",
+            "a~b.txt",
+            "My File~1.txt",
+            "LONGNAME~1",
+            "abc~1.text",
+            "a.b~1",
+            "~1",
+            "č~1.txt",
+        ] {
+            assert!(!looks_like_short_name(name), "{name}");
+        }
+
+        let fs = CountingFs::default();
+        let recs = [
+            rec(NotifyAction::Added, "~$doc.docx", 7, 1, ARCHIVE),
+            rec(NotifyAction::RenamedNewName, "~WRL0001.tmp", 8, 1, ARCHIVE),
+        ];
+        assert!(!batch_needs_prefetch(&recs));
+        let _ = prefetch_batch_outside_lock(
+            "R:\\",
+            &recs,
+            &HashMap::new(),
+            &HashSet::new(),
+            &DeniedFilter::default(),
+            true,
+            &fs,
+            &AtomicBool::new(false),
+        );
+        let mut idx = Index::new();
+        let root = idx.add_root("R:\\");
+        idx.set_file_id(root, 1);
+        apply_records(&mut idx, root, &recs[..1], &fs);
+        assert_eq!(fs.long_name_calls.load(Ordering::SeqCst), 0);
+        assert!(idx.lookup("R:\\~$doc.docx").is_some());
+        assert_eq!(Win32WatcherFs.resolve_long_leaf("R:\\~$doc.docx"), None);
+    }
+
+    #[test]
+    fn replayed_move_into_folder_moved_or_renamed_later_keeps_subtree() {
+        // Fails before this fix: the destination `P` no longer resolves by path (fresh lists it as
+        // `Q\\P` or `P2`), so the rename removed `A` (found by FileId) with its subtree.
+        for final_parent in ["Q\\P", "P2"] {
+            let mut idx = Index::new();
+            let root = idx.add_root("R:\\\\");
+            idx.set_file_id(root, 1);
+            let p = if final_parent == "P2" {
+                idx.insert(root, "P2", meta(DIRECTORY, 2))
+            } else {
+                let q = idx.insert(root, "Q", meta(DIRECTORY, 3));
+                idx.insert(q, "P", meta(DIRECTORY, 2))
+            };
+            let a = idx.insert(p, "A", meta(DIRECTORY, 7));
+            idx.insert(a, "kid.txt", meta(ARCHIVE, 8));
+            let recs = [
+                rec(NotifyAction::RenamedOldName, "A", 7, 1, DIRECTORY),
+                rec(NotifyAction::RenamedNewName, "P\\A", 7, 2, DIRECTORY),
+            ];
+            let changed = replay_records_filtered(
+                &mut idx,
+                root,
+                &recs,
+                &NoopWatcherFs,
+                &DeniedFilter::default(),
+                true,
+            );
+            assert!(!changed, "{final_parent}");
+            assert!(
+                idx.lookup(&format!("R:\\{final_parent}\\A\\kid.txt"))
+                    .is_some(),
+                "{final_parent}"
+            );
+        }
+
+        // Source still at its old place: it moves into the destination found by FileId.
+        let mut idx = Index::new();
+        let root = idx.add_root("R:\\\\");
+        idx.set_file_id(root, 1);
+        let q = idx.insert(root, "Q", meta(DIRECTORY, 3));
+        idx.insert(q, "P", meta(DIRECTORY, 2));
+        let a = idx.insert(root, "A", meta(DIRECTORY, 7));
+        idx.insert(a, "kid.txt", meta(ARCHIVE, 8));
+        let recs = [
+            rec(NotifyAction::RenamedOldName, "A", 7, 1, DIRECTORY),
+            rec(NotifyAction::RenamedNewName, "P\\A", 7, 2, DIRECTORY),
+        ];
+        assert!(replay_records_filtered(
+            &mut idx,
+            root,
+            &recs,
+            &NoopWatcherFs,
+            &DeniedFilter::default(),
+            true,
+        ));
+        assert!(idx.lookup("R:\\Q\\P\\A\\kid.txt").is_some());
+        assert_eq!(idx.lookup("R:\\A"), None);
+    }
+
+    #[test]
+    fn live_rename_onto_stale_folder_keeps_the_renamed_subtree() {
+        // Fails before this fix on path-only volumes: the replay-only "rename already applied"
+        // rule ran live too, kept the stale occupant and deleted the renamed folder's children.
+        for use_file_id in [false, true] {
+            let mut idx = Index::new();
+            let root = idx.add_root("R:\\\\");
+            idx.set_file_id(root, 1);
+            let d = idx.insert(root, "D", meta(DIRECTORY, 2));
+            let p = idx.insert(d, "P", meta(DIRECTORY, 10));
+            idx.insert(p, "c1.txt", meta(ARCHIVE, 11));
+            idx.insert(p, "c2.txt", meta(ARCHIVE, 12));
+            let q = idx.insert(d, "Q", meta(DIRECTORY, 0));
+            idx.insert(q, "stale.txt", meta(ARCHIVE, 13));
+            let recs = [
+                rec(NotifyAction::RenamedOldName, "D\\P", 10, 2, DIRECTORY),
+                rec(NotifyAction::RenamedNewName, "D\\Q", 10, 2, DIRECTORY),
+            ];
+            assert!(apply_records_filtered(
+                &mut idx,
+                root,
+                &recs,
+                &NoopWatcherFs,
+                &DeniedFilter::default(),
+                use_file_id,
+            ));
+            assert_eq!(idx.lookup("R:\\D\\P"), None, "{use_file_id}");
+            assert!(idx.lookup("R:\\D\\Q\\c1.txt").is_some(), "{use_file_id}");
+            assert!(idx.lookup("R:\\D\\Q\\c2.txt").is_some(), "{use_file_id}");
+            assert_eq!(idx.lookup("R:\\D\\Q\\stale.txt"), None, "{use_file_id}");
+        }
     }
 }

@@ -256,3 +256,56 @@ fn perf_2m_suite() {
         "cancel {cancel_elapsed_ms:.2} >= 20 ms"
     );
 }
+
+/// One folder with 40k existing + 40k new children (and 40k all replaced) must merge well under
+/// 200 ms in release. On 4056029 these took ~3.6 s and ~7.2 s (sibling scan per child plus a
+/// per-entry O(siblings) unlink), all under the index write lock.
+#[test]
+#[ignore]
+fn perf_merge_wide_folder() {
+    use fm_fs::attrs::DIRECTORY;
+    use fm_index::win::walker::merge_index;
+
+    let m = |attrs, fid| Meta {
+        attrs,
+        size: 1,
+        mtime: 1,
+        file_id: fid,
+    };
+    for all_replaced in [false, true] {
+        let n = 40_000u64;
+        let mut live = Index::new();
+        let r = live.add_root("R:\\");
+        live.set_file_id(r, 1);
+        let d = live.insert(r, "D", m(DIRECTORY, 2));
+        for i in 0..n {
+            live.insert(d, &format!("old_{i}.bin"), m(ARCHIVE, 10 + i));
+        }
+        let mut fresh = Index::new();
+        let fr = fresh.add_root("R:\\");
+        fresh.set_file_id(fr, 1);
+        let fd = fresh.insert(fr, "D", m(DIRECTORY, 2));
+        if !all_replaced {
+            for i in 0..n {
+                fresh.insert(fd, &format!("old_{i}.bin"), m(ARCHIVE, 10 + i));
+            }
+        }
+        for i in 0..n {
+            fresh.insert(fd, &format!("new_{i}.bin"), m(ARCHIVE, 10_000_000 + i));
+        }
+        let t0 = Instant::now();
+        assert!(merge_index(&mut live, fresh));
+        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let expected = if all_replaced { n } else { 2 * n } as usize + 2;
+        assert_eq!(live.len(), expected);
+        println!(
+            "| Merge 40k {} + 40k new (one folder) | {ms:.1} ms | < 200 ms | {} |",
+            if all_replaced { "removed" } else { "kept" },
+            if ms < 200.0 { "PASS" } else { "FAIL" }
+        );
+        assert!(
+            ms < 200.0,
+            "merge took {ms:.1} ms (all_replaced={all_replaced})"
+        );
+    }
+}

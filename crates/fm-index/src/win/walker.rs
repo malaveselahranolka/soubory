@@ -483,7 +483,7 @@ where
     let files_count = AtomicUsize::new(0);
     let next_dir_id = AtomicU32::new(1);
 
-    let worker_outputs: Vec<WorkerOutput> = std::thread::scope(|scope| {
+    let worker_outputs: Option<Vec<WorkerOutput>> = std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(threads);
         for _ in 0..threads {
             handles.push(scope.spawn(|| {
@@ -748,12 +748,18 @@ where
             }
         }
 
-        handles.into_iter().filter_map(|h| h.join().ok()).collect()
+        // Join every worker (an unjoined panicked one would re-panic the scope), then fail the
+        // whole walk if any panicked: its listings and queued folders are lost, and merging the
+        // partial result would delete those live subtrees.
+        let joined: Vec<Option<WorkerOutput>> =
+            handles.into_iter().map(|h| h.join().ok()).collect();
+        joined.into_iter().collect::<Option<Vec<_>>>()
     });
 
     if cancel.load(Ordering::Relaxed) {
         return None;
     }
+    let worker_outputs = worker_outputs?;
 
     let mut report = WalkFoldersReport::default();
     for out in &worker_outputs {
@@ -877,6 +883,46 @@ fn mark_subtree_seen(idx: &Index, root: EntryId, initial_slots: usize, seen: &mu
     }
 }
 
+// shortcut: a sibling folder deleted before the walk and missed by the watcher survives until
+// the next walk; upgrade if path-only volumes ever get a stable identity to match on.
+#[allow(clippy::too_many_arguments)]
+fn keep_unlisted_sibling_dirs(
+    live: &Index,
+    fresh: &Index,
+    live_root: EntryId,
+    fresh_root: EntryId,
+    root_disp: &str,
+    failed_rel: &str,
+    initial_slots: usize,
+    keep_alive: &mut [bool],
+) {
+    let parent_rel = failed_rel.rsplit_once('\\').map_or("", |(p, _)| p);
+    let (lp, fp) = if parent_rel.is_empty() {
+        (Some(live_root), Some(fresh_root))
+    } else {
+        let full = join_child_path(root_disp, parent_rel);
+        (live.lookup(&full), fresh.lookup(&full))
+    };
+    let (Some(lp), Some(fp)) = (lp, fp) else {
+        return;
+    };
+    let mut child = live.first_child[lp as usize];
+    while child != NONE {
+        if live.is_dir(child)
+            && fresh
+                .find_child(
+                    fp,
+                    live.folded_bytes(child),
+                    live.display_str_unchecked(child),
+                )
+                .is_none()
+        {
+            mark_subtree_seen(live, child, initial_slots, keep_alive);
+        }
+        child = live.next_sibling[child as usize];
+    }
+}
+
 fn is_ancestor_or_same(idx: &Index, anc: EntryId, mut node: EntryId) -> bool {
     while node != NONE {
         if node == anc {
@@ -956,6 +1002,21 @@ pub fn merge_index_with_report(
     for fref in &report.failed {
         if let Some(le) = resolve_folder_in_index(live, live_root, &root_disp, fref, use_file_id) {
             mark_subtree_seen(live, le, initial_slots, &mut keep_alive);
+        } else if !use_file_id && !fref.rel_path.is_empty() {
+            // Path-only volume: the failed folder vanished from its listed path (typically the
+            // watcher already renamed it in live, P -> Q). Without FileIds the renamed folder
+            // cannot be identified, so keep every live sibling folder the parent listing lacks;
+            // the replayed rename/remove records settle them.
+            keep_unlisted_sibling_dirs(
+                live,
+                &fresh,
+                live_root,
+                fresh_root,
+                &root_disp,
+                &fref.rel_path,
+                initial_slots,
+                &mut keep_alive,
+            );
         }
         if !fref.rel_path.is_empty()
             && let Some(fe) =
@@ -968,6 +1029,7 @@ pub fn merge_index_with_report(
 
     let mut queue = VecDeque::new();
     let mut deferred_empty_stubs = Vec::new();
+    let mut parked = Vec::new();
     queue.push_back((live_root, fresh_root));
 
     while let Some((lp, fp)) = queue.pop_front() {
@@ -991,6 +1053,7 @@ pub fn merge_index_with_report(
                 use_file_id,
                 true,
                 &mut changed,
+                &mut parked,
             ) && fresh.first_child[fc as usize] != NONE
             {
                 queue.push_back((lc, fc));
@@ -1025,16 +1088,25 @@ pub fn merge_index_with_report(
             use_file_id,
             false,
             &mut changed,
+            &mut parked,
         );
     }
 
-    for (i, &keep) in keep_alive.iter().enumerate() {
-        let id = i as EntryId;
-        if live.is_alive(id) && !keep {
-            live.remove(id);
-            changed = true;
+    // A parked sibling still carrying its park name was never claimed by any fresh entry: it is
+    // the stale occupant of a name now held by a different FileId, so drop it with its subtree.
+    for p in parked {
+        if live.is_alive(p) && live.display_str_unchecked(p) == park_name(live, p) {
+            if (p as usize) < initial_slots {
+                keep_alive[p as usize] = false;
+            } else {
+                live.remove(p);
+                changed = true;
+            }
         }
     }
+
+    let doomed: Vec<bool> = keep_alive.iter().map(|&keep| !keep).collect();
+    changed |= live.remove_flagged(&doomed);
 
     if live.parent.len() > 1024
         && live.len().saturating_mul(4) < live.parent.len().saturating_mul(3)
@@ -1057,6 +1129,7 @@ fn merge_fresh_entry(
     use_file_id: bool,
     insert_if_missing: bool,
     changed: &mut bool,
+    parked: &mut Vec<EntryId>,
 ) -> Option<EntryId> {
     let f_name = fresh.display_str_unchecked(fc);
     let f_folded = fresh.folded_str(fc);
@@ -1096,7 +1169,7 @@ fn merge_fresh_entry(
                     keep_alive,
                 )
             {
-                park_colliding_sibling(live, blocker);
+                park_colliding_sibling(live, blocker, parked);
             }
             live.move_to(lc, lp, f_name);
             *changed = true;
@@ -1114,7 +1187,7 @@ fn merge_fresh_entry(
                     keep_alive,
                 )
             {
-                park_colliding_sibling(live, blocker);
+                park_colliding_sibling(live, blocker, parked);
             }
             live.rename(lc, f_name);
             *changed = true;
@@ -1143,7 +1216,7 @@ fn merge_fresh_entry(
                 keep_alive,
             )
         {
-            park_colliding_sibling(live, blocker);
+            park_colliding_sibling(live, blocker, parked);
             let new_id = live.insert_with_folded(lp, f_name, f_folded, f_meta);
             *changed = true;
             return Some(new_id);
@@ -1153,6 +1226,12 @@ fn merge_fresh_entry(
         }
     }
     let new_id = live.insert_with_folded(lp, f_name, f_folded, f_meta);
+    // A same-name blocker (e.g. a folder recreated with a new FileId) is updated in place and
+    // keeps its old id: claim it, or the final sweep deletes it with the fresh children under it.
+    if (new_id as usize) < initial_slots {
+        keep_alive[new_id as usize] = true;
+        matched[new_id as usize] = true;
+    }
     *changed = true;
     Some(new_id)
 }
@@ -1177,12 +1256,17 @@ fn should_preserve_colliding(
     fresh.by_file_id(b_fid).is_some()
 }
 
-fn park_colliding_sibling(live: &mut Index, blocker: EntryId) {
-    let tmp = format!(
+fn park_name(live: &Index, blocker: EntryId) -> String {
+    format!(
         "__fm_merge_park_{blocker}_{}",
         live.file_id[blocker as usize]
-    );
+    )
+}
+
+fn park_colliding_sibling(live: &mut Index, blocker: EntryId, parked: &mut Vec<EntryId>) {
+    let tmp = park_name(live, blocker);
     live.rename(blocker, &tmp);
+    parked.push(blocker);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1212,10 +1296,18 @@ fn find_merge_target(
             }
         }
 
-        let mut child = live.first_child[lp as usize];
-        while child != NONE {
-            if ((child as usize) >= initial_slots || !matched[child as usize])
+        // Candidates come from the FileId index (plus hard-link dups), never a sibling scan:
+        // scanning made a 40k-child folder merge quadratic under the index write lock.
+        let dups = live.fid_dups.get(&f_fid).map_or(&[][..], Vec::as_slice);
+        for child in live
+            .by_file_id(f_fid)
+            .into_iter()
+            .chain(dups.iter().copied())
+        {
+            if live.is_alive(child)
                 && live.file_id[child as usize] == f_fid
+                && live.parent[child as usize] == lp
+                && ((child as usize) >= initial_slots || !matched[child as usize])
                 && fresh
                     .find_child(
                         fp,
@@ -1226,7 +1318,6 @@ fn find_merge_target(
             {
                 return Some(child);
             }
-            child = live.next_sibling[child as usize];
         }
 
         // 2. Directories never have hard links: match across parents by FileId even if old path
@@ -1395,5 +1486,116 @@ mod tests {
         assert!(!merge_index(&mut live, Index::new()));
         assert_eq!(live.len(), live_len);
         assert_eq!(live.lookup("C:\\Docs\\keep.txt"), Some(keep_id));
+    }
+
+    #[test]
+    fn merge_keeps_folder_recreated_with_same_name_and_new_file_id() {
+        // Fails on 4056029 and before this fix: `rm -rf dist && mkdir dist` (old FileId gone).
+        // The in-place update of `dist` kept its old id, never marked alive, so the final sweep
+        // deleted `dist` together with the fresh `new.js` inserted under it.
+        let m = |attrs, fid| Meta {
+            attrs,
+            size: 1,
+            mtime: 1,
+            file_id: fid,
+        };
+        for use_file_id in [true, false] {
+            let mut live = Index::new();
+            let r = live.add_root("R:\\");
+            live.set_file_id(r, 1);
+            let d = live.insert(r, "dist", m(DIRECTORY, 10));
+            live.insert(d, "old.js", m(ARCHIVE, 11));
+            let mut fresh = Index::new();
+            let fr = fresh.add_root("R:\\");
+            fresh.set_file_id(fr, 1);
+            let fd = fresh.insert(fr, "dist", m(DIRECTORY, 20));
+            fresh.insert(fd, "new.js", m(ARCHIVE, 21));
+            merge_index_with_report(&mut live, fresh, &WalkFoldersReport::default(), use_file_id);
+            assert!(live.lookup("R:\\dist\\new.js").is_some(), "{use_file_id}");
+            assert_eq!(live.lookup("R:\\dist\\old.js"), None, "{use_file_id}");
+            assert_eq!(live.file_id(live.lookup("R:\\dist").unwrap()), 20);
+            assert_eq!(live.len(), 3, "{use_file_id}");
+        }
+    }
+
+    #[test]
+    fn merge_drops_unclaimed_parked_sibling() {
+        // Fails on 4056029: inside a partially listed (failed) folder, the replaced `Sub`
+        // (FileId 5) stayed searchable as `__fm_merge_park_2_5` with its stale subtree.
+        let m = |attrs, fid| Meta {
+            attrs,
+            size: 1,
+            mtime: 1,
+            file_id: fid,
+        };
+        let mut live = Index::new();
+        let r = live.add_root("R:\\");
+        live.set_file_id(r, 1);
+        let f = live.insert(r, "F", m(DIRECTORY, 2));
+        let sub = live.insert(f, "Sub", m(DIRECTORY, 5));
+        live.insert(sub, "old.txt", m(ARCHIVE, 50));
+        let mut fresh = Index::new();
+        let fr = fresh.add_root("R:\\");
+        fresh.set_file_id(fr, 1);
+        let ff = fresh.insert(fr, "F", m(DIRECTORY, 2));
+        fresh.insert(ff, "Sub", m(DIRECTORY, 6));
+        let report = WalkFoldersReport {
+            root_failed: false,
+            failed: vec![WalkFolderRef {
+                file_id: 2,
+                rel_path: "F".into(),
+            }],
+            denied: Vec::new(),
+        };
+        merge_index_with_report(&mut live, fresh, &report, true);
+        let f = live.lookup("R:\\F").unwrap();
+        let names: Vec<&str> = live
+            .iter_ids()
+            .filter(|&id| live.parent(id) == Some(f))
+            .map(|id| live.name(id))
+            .collect();
+        assert_eq!(names, ["Sub"]);
+        assert_eq!(live.by_file_id(6), live.lookup("R:\\F\\Sub"));
+        assert_eq!(live.by_file_id(50), None);
+        assert_eq!(live.len(), 3);
+    }
+
+    #[test]
+    fn merge_bulk_removal_keeps_sibling_lists_consistent() {
+        let m = |attrs, fid| Meta {
+            attrs,
+            size: 1,
+            mtime: 1,
+            file_id: fid,
+        };
+        let mut live = Index::new();
+        let r = live.add_root("R:\\");
+        live.set_file_id(r, 1);
+        let d = live.insert(r, "D", m(DIRECTORY, 2));
+        for i in 0..50u64 {
+            let c = live.insert(d, &format!("c{i}"), m(DIRECTORY, 100 + i));
+            live.insert(c, "inner.txt", m(ARCHIVE, 1000 + i));
+        }
+        let mut fresh = Index::new();
+        let fr = fresh.add_root("R:\\");
+        fresh.set_file_id(fr, 1);
+        let fd = fresh.insert(fr, "D", m(DIRECTORY, 2));
+        for i in (0..50u64).filter(|i| i % 3 == 0) {
+            let c = fresh.insert(fd, &format!("c{i}"), m(DIRECTORY, 100 + i));
+            fresh.insert(c, "inner.txt", m(ARCHIVE, 1000 + i));
+        }
+        assert!(merge_index(&mut live, fresh));
+        let d = live.lookup("R:\\D").unwrap();
+        let mut seen = 0;
+        let mut c = live.first_child[d as usize];
+        while c != NONE {
+            assert!(live.is_alive(c));
+            seen += 1;
+            c = live.next_sibling[c as usize];
+        }
+        assert_eq!(seen, 17);
+        assert_eq!(live.len(), 2 + 17 * 2);
+        assert!(live.lookup("R:\\D\\c3\\inner.txt").is_some());
+        assert_eq!(live.lookup("R:\\D\\c4"), None);
     }
 }
