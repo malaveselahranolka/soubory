@@ -79,6 +79,16 @@ pub fn toggle(paths: &[PathBuf], i: usize) {
     });
 }
 
+/// Adds tag `i` to all paths (dropping items onto a tag in the sidebar).
+pub fn add(paths: &[PathBuf], i: usize) {
+    with(|m| {
+        for p in paths {
+            m.entry(key(p)).or_insert((0, p.clone())).0 |= 1 << i;
+        }
+        save(m);
+    });
+}
+
 pub fn clear(paths: &[PathBuf]) {
     with(|m| {
         for p in paths {

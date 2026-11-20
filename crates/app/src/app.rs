@@ -198,6 +198,8 @@ pub struct App {
     pub sidebar_on: bool,
     pub preview_on: bool,
     pub hover: Hit,
+    /// Drop target under a drag: the rect, and whether it is the whole folder view.
+    pub drop_hl: Option<(Rect, bool)>,
     pub pressed: Hit,
     pub focus: Focus,
     pub active: bool,
@@ -243,6 +245,7 @@ impl App {
             sidebar_on: true,
             preview_on: false,
             hover: Hit::None,
+            drop_hl: None,
             pressed: Hit::None,
             focus: Focus::Content,
             active: true,

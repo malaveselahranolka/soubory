@@ -2,7 +2,7 @@
 //! for search / rename / go-to-folder, folder watching.
 use crate::app::{App, Cap, Drag, Focus, Hit, Loc};
 use crate::fsys::wide;
-use crate::gfx::Gfx;
+
 use crate::paint;
 use std::{
     cell::RefCell,
@@ -60,7 +60,7 @@ thread_local! {
     static SEARCH_PREV: RefCell<Option<Loc>> = const { RefCell::new(None) };
 }
 
-fn app_ptr() -> *mut App {
+pub fn app_ptr() -> *mut App {
     APP.with(|a| *a.borrow())
 }
 
@@ -124,6 +124,7 @@ pub fn run(start: Loc) -> i32 {
         );
         set_title(&app);
         watch_current(&mut app);
+        crate::droptarget::register(hwnd);
         let _ = ShowWindow(hwnd, SW_SHOWDEFAULT);
         crate::search::start(&mut app);
         dev_flags(&mut app);
@@ -183,6 +184,7 @@ fn dev_flags(app: &mut App) {
     if args.iter().any(|a| a == "--dev-ql") {
         crate::quicklook::toggle(app);
     }
+    crate::droptarget::dev(app, &args);
     app.invalidate();
 }
 
@@ -1296,6 +1298,7 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                         let _ = KillTimer(Some(hwnd), TIMER_NOTE);
                         app.invalidate();
                     }
+                    crate::droptarget::TIMER => crate::droptarget::tick(app),
                     _ => crate::shell::timer(app, wparam.0),
                 }
                 LRESULT(0)
@@ -1331,6 +1334,7 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                 LRESULT(0)
             }
             WM_DESTROY => {
+                crate::droptarget::revoke(hwnd);
                 PostQuitMessage(0);
                 LRESULT(0)
             }

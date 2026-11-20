@@ -13,7 +13,7 @@ use windows::{
         Foundation::*,
         Storage::FileSystem::*,
         System::{
-            Com::{StructuredStorage::*, *},
+            Com::*,
             DataExchange::*,
             Memory::*,
             Ole::*,
@@ -1154,6 +1154,18 @@ pub fn open_terminal(app: &mut App) {
 }
 
 /// Drag the selection out (to Explorer, a browser, the desktop…) with the shell's own data object.
+/// The shell's drop target for dropping onto `path` (into a folder or drive, onto an app or a .zip).
+pub fn drop_target(hwnd: HWND, path: &Path) -> Option<IDropTarget> {
+    let (folder, _owned, children) = parent_and_children(&[path.to_path_buf()])?;
+    unsafe { folder.GetUIObjectOf::<IDropTarget>(hwnd, &children, None).ok() }
+}
+
+/// The shell's data object for `paths` (what a drag out of the window carries).
+pub fn data_object(hwnd: HWND, paths: &[PathBuf]) -> Option<IDataObject> {
+    let (folder, _owned, children) = parent_and_children(paths)?;
+    unsafe { folder.GetUIObjectOf::<IDataObject>(hwnd, &children, None).ok() }
+}
+
 pub fn drag_out(app: &mut App, i: usize) {
     if !app.tab().sel.is(i) {
         app.tab_mut().sel.select_only(i);

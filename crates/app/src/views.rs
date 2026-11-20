@@ -193,6 +193,28 @@ pub fn columns_hit(app: &App, x: f32, y: f32) -> Hit {
     Hit::Empty
 }
 
+/// The pane shown in column `k` other than the active one (left columns, or the right one).
+pub fn pane(app: &App, k: usize) -> Option<&Pane> {
+    let t = app.tab();
+    if k < t.cols_left.len() {
+        t.cols_left.get(k)
+    } else if k == t.cols_left.len() + 1 {
+        t.col_right.as_ref()
+    } else {
+        None
+    }
+}
+
+pub fn col_rect(app: &App, k: usize) -> Rect {
+    let b = app.lay.body;
+    Rect::new(col_x(app, k), b.y, COL_W, b.h)
+}
+
+pub fn col_row_rect(app: &App, k: usize, r: usize) -> Rect {
+    let scroll = pane(app, k).map(|p| p.scroll).unwrap_or(0.0);
+    Rect::new(col_x(app, k), app.lay.body.y + 4.0 + r as f32 * ROW_H - scroll, COL_W, ROW_H).inset(INSET, 1.0)
+}
+
 /// Click in a non-active column: make it active and select the row.
 pub fn column_click(app: &mut App, k: usize, row: Option<usize>) {
     let active = active_index(app);

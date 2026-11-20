@@ -87,6 +87,7 @@ pub fn paint(app: &mut App, c: &mut Canvas) {
     if let Some(p) = l.preview {
         crate::views::paint_inspector(app, c, &t, p);
     }
+    drop_highlight(app, c, &t);
     status(app, c, &t);
 }
 
@@ -261,6 +262,34 @@ pub fn sidebar_height(app: &App) -> f32 {
         .last()
         .map(|(y, h)| y + h + 12.0)
         .unwrap_or(0.0)
+}
+
+pub fn side_row_rect(app: &App, k: usize) -> Rect {
+    let (oy, h) = side_offsets(app).get(k).copied().unwrap_or((0.0, 0.0));
+    let s = app.lay.sidebar;
+    Rect::new(s.x, s.y - app.side_scroll + oy, s.w, h).inset(INSET, 1.0)
+}
+
+pub fn tab_rect(app: &App, k: usize) -> Option<Rect> {
+    app.lay.tabs.and_then(|r| tab_rects(app, r).0.get(k).copied())
+}
+
+pub fn crumb_rect(app: &App, k: usize) -> Option<Rect> {
+    crumb_layout(app).into_iter().nth(k).map(|c| c.0)
+}
+
+/// Where a drag would drop: a tinted ring around the folder, or around the whole view (Finder).
+fn drop_highlight(app: &App, c: &mut Canvas, t: &Theme) {
+    let Some((r, whole)) = app.drop_hl else { return };
+    let ring = if t.mode == Mode::HighContrast { t.focus } else { t.accent_glyph };
+    if whole {
+        c.push_clip(r);
+        c.round_stroke(r.inset(2.0, 2.0), 6.0, ring, 2.0);
+        c.pop_clip();
+    } else {
+        c.round(r, 6.0, Color { a: 0.16, ..ring });
+        c.round_stroke(r.inset(0.75, 0.75), 6.0, ring, 1.5);
+    }
 }
 
 pub fn side_row_at(app: &App, y: f32) -> Option<usize> {

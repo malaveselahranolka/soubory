@@ -214,7 +214,7 @@ fn is_image(ext: &str) -> bool {
     matches!(ext, "jpg" | "jpeg" | "jfif" | "png" | "gif" | "bmp" | "dib" | "tif" | "tiff" | "ico" | "webp" | "heic" | "heif" | "avif" | "jxr" | "wdp" | "dds")
 }
 
-fn load(app: &mut App, path: PathBuf, entry: Entry, index: (usize, usize)) {
+fn load(_app: &mut App, path: PathBuf, entry: Entry, index: (usize, usize)) {
     let ext = entry.ext().to_ascii_lowercase();
     with_ql(|ql| {
         unsafe {
