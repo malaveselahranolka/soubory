@@ -60,27 +60,44 @@ mod imp {
         Win32::{
             Foundation::*,
             Security::*,
-            System::{Com::IClassFactory, LibraryLoader::*, Registry::*, SystemInformation::{GetLocalTime, GetSystemDirectoryW}, Threading::*},
+            System::{
+                Com::IClassFactory,
+                LibraryLoader::*,
+                Registry::*,
+                SystemInformation::{GetLocalTime, GetSystemDirectoryW},
+                Threading::*,
+            },
             UI::Shell::{FileOpenDialog, FileSaveDialog},
         },
         core::*,
     };
 
     const LOG_CAP: u64 = 1 << 20;
-    type GetClassObject = unsafe extern "system" fn(*const GUID, *const GUID, *mut *mut c_void) -> HRESULT;
+    type GetClassObject =
+        unsafe extern "system" fn(*const GUID, *const GUID, *mut *mut c_void) -> HRESULT;
 
     #[link(name = "kernel32")]
     unsafe extern "system" {
-        fn RtlCaptureStackBackTrace(skip: u32, count: u32, frames: *mut *mut c_void, hash: *mut u32) -> u16;
+        fn RtlCaptureStackBackTrace(
+            skip: u32,
+            count: u32,
+            frames: *mut *mut c_void,
+            hash: *mut u32,
+        ) -> u16;
     }
 
     #[unsafe(no_mangle)]
-    pub unsafe extern "system" fn DllGetClassObject(clsid: *const GUID, iid: *const GUID, out: *mut *mut c_void) -> HRESULT {
+    pub unsafe extern "system" fn DllGetClassObject(
+        clsid: *const GUID,
+        iid: *const GUID,
+        out: *mut *mut c_void,
+    ) -> HRESULT {
         if clsid.is_null() || iid.is_null() || out.is_null() {
             return E_POINTER;
         }
         unsafe { *out = std::ptr::null_mut() };
-        let hr = std::panic::catch_unwind(|| unsafe { forward(&*clsid, &*iid, out) }).unwrap_or(E_UNEXPECTED);
+        let hr = std::panic::catch_unwind(|| unsafe { forward(&*clsid, &*iid, out) })
+            .unwrap_or(E_UNEXPECTED);
         let _ = std::panic::catch_unwind(|| unsafe { log(&*clsid, &*iid, hr) });
         hr
     }
@@ -94,19 +111,27 @@ mod imp {
     /// Calls the `DllGetClassObject` of the server HKLM registers for `clsid` (comdlg32). Never
     /// through COM: HKCR would hand the request straight back to us.
     unsafe fn forward(clsid: &GUID, iid: &GUID, out: *mut *mut c_void) -> HRESULT {
-        let Some(path) = hklm_server(clsid).or_else(system_comdlg32) else { return CLASS_E_CLASSNOTAVAILABLE };
+        let Some(path) = hklm_server(clsid).or_else(system_comdlg32) else {
+            return CLASS_E_CLASSNOTAVAILABLE;
+        };
         let w: Vec<u16> = path.as_os_str().encode_wide_z();
-        let Ok(module) = (unsafe { LoadLibraryW(PCWSTR(w.as_ptr())) }) else { return CLASS_E_CLASSNOTAVAILABLE };
+        let Ok(module) = (unsafe { LoadLibraryW(PCWSTR(w.as_ptr())) }) else {
+            return CLASS_E_CLASSNOTAVAILABLE;
+        };
         if Some(module) == own_module() {
             return CLASS_E_CLASSNOTAVAILABLE;
         }
-        let Some(f) = (unsafe { GetProcAddress(module, s!("DllGetClassObject")) }) else { return CLASS_E_CLASSNOTAVAILABLE };
+        let Some(f) = (unsafe { GetProcAddress(module, s!("DllGetClassObject")) }) else {
+            return CLASS_E_CLASSNOTAVAILABLE;
+        };
         let f: GetClassObject = unsafe { std::mem::transmute(f) };
         unsafe { f(clsid, iid, out) }
     }
 
     fn hklm_server(clsid: &GUID) -> Option<PathBuf> {
-        let key: Vec<u16> = format!("SOFTWARE\\Classes\\CLSID\\{{{clsid:?}}}\\InprocServer32\0").encode_utf16().collect();
+        let key: Vec<u16> = format!("SOFTWARE\\Classes\\CLSID\\{{{clsid:?}}}\\InprocServer32\0")
+            .encode_utf16()
+            .collect();
         let mut buf = [0u16; 520];
         let mut size = (buf.len() * 2) as u32;
         // RRF_RT_REG_SZ also accepts REG_EXPAND_SZ and expands it (%SystemRoot%).
@@ -131,14 +156,16 @@ mod imp {
     fn system_comdlg32() -> Option<PathBuf> {
         let mut buf = [0u16; 260];
         let n = unsafe { GetSystemDirectoryW(Some(&mut buf)) } as usize;
-        (n > 0 && n < buf.len()).then(|| PathBuf::from(String::from_utf16_lossy(&buf[..n])).join("comdlg32.dll"))
+        (n > 0 && n < buf.len())
+            .then(|| PathBuf::from(String::from_utf16_lossy(&buf[..n])).join("comdlg32.dll"))
     }
 
     fn own_module() -> Option<HMODULE> {
         let mut m = HMODULE::default();
         unsafe {
             GetModuleHandleExW(
-                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                    | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                 PCWSTR(own_module as *const () as *const u16),
                 &mut m,
             )
@@ -162,8 +189,17 @@ mod imp {
         }
         let exe = module_name(None).unwrap_or_default();
         let (elevated, app_container, integrity) = token_info();
-        let allow = std::fs::read_to_string(dir.join("shim-allow.txt")).map(|t| parse_allow(&t)).unwrap_or_default();
-        let r = match route(&Host { exe: &exe, elevated, app_container }, &allow) {
+        let allow = std::fs::read_to_string(dir.join("shim-allow.txt"))
+            .map(|t| parse_allow(&t))
+            .unwrap_or_default();
+        let r = match route(
+            &Host {
+                exe: &exe,
+                elevated,
+                app_container,
+            },
+            &allow,
+        ) {
             Route::Pass(why) => format!("pass ({why})"),
             Route::Picker => "picker (gate: passed through)".into(),
         };
@@ -185,7 +221,11 @@ mod imp {
         );
         let _ = std::fs::create_dir_all(&dir);
         // AppContainer hosts cannot write here; that is expected and silent.
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
             let _ = f.write_all(line.as_bytes());
         }
     }
@@ -209,16 +249,43 @@ mod imp {
             }
             let mut len = 0u32;
             let mut elev = TOKEN_ELEVATION::default();
-            let elevated = GetTokenInformation(token, TokenElevation, Some((&mut elev as *mut TOKEN_ELEVATION).cast()), size_of::<TOKEN_ELEVATION>() as u32, &mut len).is_ok()
+            let elevated = GetTokenInformation(
+                token,
+                TokenElevation,
+                Some((&mut elev as *mut TOKEN_ELEVATION).cast()),
+                size_of::<TOKEN_ELEVATION>() as u32,
+                &mut len,
+            )
+            .is_ok()
                 && elev.TokenIsElevated != 0;
             let mut ac = 0u32;
-            let app_container = GetTokenInformation(token, TokenIsAppContainer, Some((&mut ac as *mut u32).cast()), 4, &mut len).is_ok() && ac != 0;
+            let app_container = GetTokenInformation(
+                token,
+                TokenIsAppContainer,
+                Some((&mut ac as *mut u32).cast()),
+                4,
+                &mut len,
+            )
+            .is_ok()
+                && ac != 0;
             let mut buf = [0u64; 16]; // TOKEN_MANDATORY_LABEL + SID, 8-byte aligned
-            let level = if GetTokenInformation(token, TokenIntegrityLevel, Some(buf.as_mut_ptr().cast()), size_of_val(&buf) as u32, &mut len).is_ok() {
+            let level = if GetTokenInformation(
+                token,
+                TokenIntegrityLevel,
+                Some(buf.as_mut_ptr().cast()),
+                size_of_val(&buf) as u32,
+                &mut len,
+            )
+            .is_ok()
+            {
                 let label = &*(buf.as_ptr() as *const TOKEN_MANDATORY_LABEL);
                 let sid = label.Label.Sid;
                 let n = *GetSidSubAuthorityCount(sid);
-                match if n > 0 { *GetSidSubAuthority(sid, n as u32 - 1) } else { 0 } {
+                match if n > 0 {
+                    *GetSidSubAuthority(sid, n as u32 - 1)
+                } else {
+                    0
+                } {
                     0..0x1000 => "untrusted",
                     0x1000..0x2000 => "low",
                     0x2000..0x3000 => "medium",
@@ -245,14 +312,22 @@ mod imp {
     /// Modules on the call stack, innermost first, ours left out: `combase.dll<comdlg32.dll<notepad.exe`.
     fn caller_modules() -> String {
         let mut frames = [std::ptr::null_mut::<c_void>(); 32];
-        let n = unsafe { RtlCaptureStackBackTrace(1, frames.len() as u32, frames.as_mut_ptr(), std::ptr::null_mut()) } as usize;
+        let n = unsafe {
+            RtlCaptureStackBackTrace(
+                1,
+                frames.len() as u32,
+                frames.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        } as usize;
         let own = own_module();
         let mut out: Vec<String> = Vec::new();
         for &f in &frames[..n] {
             let mut m = HMODULE::default();
             let ok = unsafe {
                 GetModuleHandleExW(
-                    GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                    GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                        | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                     PCWSTR(f as *const u16),
                     &mut m,
                 )
@@ -285,7 +360,11 @@ mod tests {
     use super::*;
 
     fn host(exe: &str) -> Host<'_> {
-        Host { exe, elevated: false, app_container: false }
+        Host {
+            exe,
+            elevated: false,
+            app_container: false,
+        }
     }
 
     #[test]
@@ -293,11 +372,38 @@ mod tests {
         let allow = parse_allow("Notepad.exe  # the gate's first target\n\n  mspaint.exe\n");
         assert_eq!(allow, ["Notepad.exe", "mspaint.exe"]);
         assert_eq!(route(&host("notepad.exe"), &allow), Route::Picker);
-        assert_eq!(route(&host("chrome.exe"), &allow), Route::Pass("not allowlisted"));
-        assert_eq!(route(&host("notepad.exe"), &[]), Route::Pass("not allowlisted"));
+        assert_eq!(
+            route(&host("chrome.exe"), &allow),
+            Route::Pass("not allowlisted")
+        );
+        assert_eq!(
+            route(&host("notepad.exe"), &[]),
+            Route::Pass("not allowlisted")
+        );
         let explorer = vec!["explorer.exe".to_string()];
-        assert_eq!(route(&host("Explorer.EXE"), &explorer), Route::Pass("explorer"));
-        assert_eq!(route(&Host { elevated: true, ..host("notepad.exe") }, &allow), Route::Pass("elevated"));
-        assert_eq!(route(&Host { app_container: true, ..host("notepad.exe") }, &allow), Route::Pass("appcontainer"));
+        assert_eq!(
+            route(&host("Explorer.EXE"), &explorer),
+            Route::Pass("explorer")
+        );
+        assert_eq!(
+            route(
+                &Host {
+                    elevated: true,
+                    ..host("notepad.exe")
+                },
+                &allow
+            ),
+            Route::Pass("elevated")
+        );
+        assert_eq!(
+            route(
+                &Host {
+                    app_container: true,
+                    ..host("notepad.exe")
+                },
+                &allow
+            ),
+            Route::Pass("appcontainer")
+        );
     }
 }
