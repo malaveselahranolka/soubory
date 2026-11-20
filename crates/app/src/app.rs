@@ -177,6 +177,8 @@ pub struct Prefs {
     pub folders_first: bool,
     pub icon_size: f32,
     pub favorites: Vec<PathBuf>,
+    /// Normal (restored) window rect in workspace pixels, and whether it was maximized.
+    pub window: Option<([i32; 4], bool)>,
 }
 
 pub struct App {
@@ -226,6 +228,7 @@ impl App {
             folders_first: true,
             icon_size: 64.0,
             favorites: Vec::new(),
+            window: None,
         };
         let mut app = App {
             hwnd: HWND::default(),

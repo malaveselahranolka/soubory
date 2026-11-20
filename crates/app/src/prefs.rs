@@ -31,7 +31,8 @@ pub fn load(app: &mut App) {
     let Ok(text) = std::fs::read_to_string(file()) else {
         return;
     };
-    for line in text.lines() {
+    // Notepad and PowerShell write a BOM, which would hide the first key.
+    for line in text.trim_start_matches('\u{feff}').lines() {
         let Some((k, v)) = line.split_once('=') else {
             continue;
         };
@@ -58,6 +59,14 @@ pub fn load(app: &mut App) {
                     t.view = view;
                 }
             }
+            "window" => {
+                let n: Vec<i32> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+                if let [l, t, r, b, max] = n[..] {
+                    if r - l >= 200 && b - t >= 150 {
+                        app.prefs.window = Some(([l, t, r, b], max == 1));
+                    }
+                }
+            }
             "favorite" => {
                 let p = PathBuf::from(v);
                 if !app.prefs.favorites.contains(&p) {
@@ -66,6 +75,39 @@ pub fn load(app: &mut App) {
             }
             _ => {}
         }
+    }
+}
+
+/// The window's restored rect and maximized state, as Windows keeps them.
+fn placement(app: &App) -> Option<([i32; 4], bool)> {
+    use windows::Win32::UI::WindowsAndMessaging::{GetWindowPlacement, SW_SHOWMAXIMIZED, WINDOWPLACEMENT};
+    if app.hwnd.is_invalid() {
+        return None;
+    }
+    let mut wp = WINDOWPLACEMENT { length: std::mem::size_of::<WINDOWPLACEMENT>() as u32, ..Default::default() };
+    unsafe { GetWindowPlacement(app.hwnd, &mut wp).ok()? };
+    let r = wp.rcNormalPosition;
+    Some(([r.left, r.top, r.right, r.bottom], wp.showCmd == SW_SHOWMAXIMIZED.0 as u32))
+}
+
+/// Puts the window where it was last closed, unless that place is on no monitor any more.
+pub fn restore_window(app: &App) -> bool {
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONULL, MonitorFromRect};
+    use windows::Win32::UI::WindowsAndMessaging::{SW_HIDE, SetWindowPlacement, WINDOWPLACEMENT};
+    let Some(([l, t, r, b], _)) = app.prefs.window else { return false };
+    let rc = RECT { left: l, top: t, right: r, bottom: b };
+    unsafe {
+        if MonitorFromRect(&rc, MONITOR_DEFAULTTONULL).is_invalid() {
+            return false;
+        }
+        let wp = WINDOWPLACEMENT {
+            length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+            showCmd: SW_HIDE.0 as u32,
+            rcNormalPosition: rc,
+            ..Default::default()
+        };
+        SetWindowPlacement(app.hwnd, &wp).is_ok()
     }
 }
 
@@ -85,6 +127,9 @@ pub fn save(app: &App) {
         app.sidebar_on as u8,
         app.preview_on as u8
     );
+    if let Some(([l, t, r, b], max)) = placement(app).or(app.prefs.window) {
+        s.push_str(&format!("window={l},{t},{r},{b},{}\n", max as u8));
+    }
     for f in &app.prefs.favorites {
         s.push_str(&format!("favorite={}\n", f.display()));
     }

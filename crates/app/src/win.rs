@@ -86,6 +86,9 @@ pub fn run(start: Loc) -> i32 {
         RegisterClassExW(&wc);
 
         let mut app = Box::new(App::new(start));
+        crate::prefs::load(&mut app);
+        app.side_rows = crate::sidebar::build(&app.prefs.favorites);
+        app.reload(None);
         let app_raw: *mut App = &mut *app;
         APP.with(|a| *a.borrow_mut() = app_raw);
 
@@ -125,7 +128,9 @@ pub fn run(start: Loc) -> i32 {
         set_title(&app);
         watch_current(&mut app);
         crate::droptarget::register(hwnd);
-        let _ = ShowWindow(hwnd, SW_SHOWDEFAULT);
+        let restored = crate::prefs::restore_window(&app);
+        let maximized = restored && app.prefs.window.is_some_and(|w| w.1);
+        let _ = ShowWindow(hwnd, if maximized { SW_SHOWMAXIMIZED } else if restored { SW_SHOWNORMAL } else { SW_SHOWDEFAULT });
         crate::search::start(&mut app);
         dev_flags(&mut app);
 
@@ -186,6 +191,11 @@ fn dev_flags(app: &mut App) {
     }
     crate::droptarget::dev(app, &args);
     app.invalidate();
+}
+
+/// Dev/test runs (`--dev-*`) must not overwrite the user's saved window and view.
+fn dev_run() -> bool {
+    std::env::args().any(|a| a.starts_with("--dev-"))
 }
 
 fn folder_icon() -> HICON {
@@ -1330,6 +1340,9 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
             }
             WM_CLOSE => {
                 crate::quicklook::close();
+                if !dev_run() {
+                    crate::prefs::save(app);
+                }
                 let _ = DestroyWindow(hwnd);
                 LRESULT(0)
             }
