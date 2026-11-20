@@ -179,7 +179,7 @@ Gated (a failure blocks the milestone):
 | Query, 2M entries, 1–3 terms | p99 <50 ms | `cargo test -p fm-index --release -- --ignored perf` |
 | Snapshot load (2M entries) | ≤1 s | same |
 | First full scan of C: | ≤90 s, UI usable meanwhile | M4a → `docs/search-bench.md` |
-| fm.exe start → folder shown | ≤300 ms | `fm.exe <folder> --new-instance --dev-startup <out>` (2026-11-20, release, 290-item folder: median ~220 ms, 160–355 ms) |
+| fm.exe start → folder shown | ≤300 ms | `fm.exe <folder> --new-instance --dev-startup <out>` (2026-11-20, release, 290-item folder: median ~220 ms, 160–355 ms; after `876f499`, 4-item folder: 98–109 ms in 4 of 6 runs, 438 and 517 ms in 2 — the phase trace puts all of the excess in creating the D3D11 device on the Intel iGPU, 330–420 ms instead of ~5 ms) |
 | Folder with 100k items | first rows ≤200 ms, all ≤1.5 s | lister test + manual scroll |
 
 Reported only, in `docs/search-bench.md`: query p50 (target <15 ms), refining keystroke (<5 ms), index memory (≤100 B/entry), live update (≤1 ms/event), snapshot size (≤150 MB), overflows per day, fm.exe memory without index (≤60 MB).

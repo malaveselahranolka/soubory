@@ -11,7 +11,21 @@ public static class Shot {
   [DllImport("dwmapi.dll")] static extern int DwmGetWindowAttribute(IntPtr h, int a, out RECT r, int s);
   [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
   [DllImport("user32.dll")] static extern IntPtr SetThreadDpiAwarenessContext(IntPtr c);
-  [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr FindWindow(string c, string t);
+  delegate bool EnumProc(IntPtr h, IntPtr l);
+  [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc p, IntPtr l);
+  [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr h, System.Text.StringBuilder s, int n);
+  // Only a window of fm's own process: a class name alone could match another app's window.
+  public static IntPtr Find(int pid, string cls) {
+    IntPtr found = IntPtr.Zero;
+    EnumWindows((h, l) => {
+      uint p; GetWindowThreadProcessId(h, out p);
+      var s = new System.Text.StringBuilder(256); GetClassName(h, s, 256);
+      if (p == (uint)pid && s.ToString() == cls) { found = h; return false; }
+      return true;
+    }, IntPtr.Zero);
+    return found;
+  }
   public static void Save(IntPtr h, string path) {
     SetThreadDpiAwarenessContext(new IntPtr(-4)); // per-monitor v2: physical coordinates
     RECT r; GetWindowRect(h, out r);
@@ -25,9 +39,14 @@ public static class Shot {
 '@ -ReferencedAssemblies System.Drawing
 $exe = 'C:\Users\adame\.fm-target\debug\fm.exe'
 $p = Start-Process $exe -ArgumentList (@("`"$Path`"", "--new-instance") + $Dev) -PassThru
-for ($i = 0; $i -lt 50 -and $p.MainWindowHandle -eq 0; $i++) { Start-Sleep -Milliseconds 100; $p.Refresh() }
-Start-Sleep -Milliseconds $Wait
-$h = if ($Class) { [Shot]::FindWindow($Class, [NullString]::Value) } else { $p.MainWindowHandle }
-[Shot]::Save($h, $Out)
-if (-not $Keep) { Stop-Process -Id $p.Id }
-$Out
+try {
+  for ($i = 0; $i -lt 50 -and $p.MainWindowHandle -eq 0; $i++) { Start-Sleep -Milliseconds 100; $p.Refresh() }
+  Start-Sleep -Milliseconds $Wait
+  $h = if ($Class) { [Shot]::Find($p.Id, $Class) } else { $p.MainWindowHandle }
+  if ($h -eq [IntPtr]::Zero) { throw "No fm window to capture (class '$Class')." }
+  [Shot]::Save($h, $Out)
+  $Out
+} finally {
+  # A failed capture must not leave a test instance behind.
+  if (-not $Keep -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force }
+}
