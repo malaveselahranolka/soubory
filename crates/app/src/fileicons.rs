@@ -239,10 +239,10 @@ fn alpha(c: Color, a: f32) -> Color {
 }
 
 // The page and folder, drawn in a 96-unit box.
-const PAGE: &str = "M26 8h34l20 20v50a10 10 0 0 1-10 10H26a10 10 0 0 1-10-10V18a10 10 0 0 1 10-10z";
-const FOLD: &str = "M60 8v12a8 8 0 0 0 8 8h12z";
-const FOLDER_BACK: &str = "M10 24a6 6 0 0 1 6-6h19.5a6 6 0 0 1 4.2 1.8l6.3 6.2h34a6 6 0 0 1 6 6v6H10z";
-const FOLDER_FRONT: &str = "M8 38a6 6 0 0 1 6-6h68a6 6 0 0 1 6 6v38a6 6 0 0 1-6 6H14a6 6 0 0 1-6-6z";
+pub const PAGE: &str = "M26 8h34l20 20v50a10 10 0 0 1-10 10H26a10 10 0 0 1-10-10V18a10 10 0 0 1 10-10z";
+pub const FOLD: &str = "M60 8v12a8 8 0 0 0 8 8h12z";
+pub const FOLDER_BACK: &str = "M10 24a6 6 0 0 1 6-6h19.5a6 6 0 0 1 4.2 1.8l6.3 6.2h34a6 6 0 0 1 6 6v6H10z";
+pub const FOLDER_FRONT: &str = "M8 38a6 6 0 0 1 6-6h68a6 6 0 0 1 6 6v38a6 6 0 0 1-6 6H14a6 6 0 0 1-6-6z";
 
 /// Amber, not the accent: a blue accent would turn folders into Finder's.
 fn folder_colors(t: &Theme) -> (Color, Color) {

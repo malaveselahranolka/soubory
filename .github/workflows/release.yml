@@ -1,0 +1,106 @@
+# Builds Soubory, compiles the setup wizard (installer\Soubory.iss), installs and uninstalls it for
+# real on this clean VM (scripts\dev\test-installer.ps1) and uploads the setup, the wizard captures
+# and the logs. On a tag v<version> that passed all of it, also publishes the GitHub release.
+name: Instalátor
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  setup:
+    runs-on: windows-2025
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add i686-pc-windows-msvc
+          rustc --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Version
+        id: v
+        run: |
+          $num = (Select-String -LiteralPath Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          if ($env:GITHUB_REF_TYPE -eq 'tag') {
+            $ver = $env:GITHUB_REF_NAME.TrimStart('v')
+            if (-not $ver.StartsWith($num)) { throw "Tag $env:GITHUB_REF_NAME does not match Cargo.toml version $num" }
+          } else {
+            $ver = "$num-dev.$env:GITHUB_RUN_NUMBER"
+          }
+          "version=$ver" | Out-File -Append -Encoding ascii $env:GITHUB_OUTPUT
+          "num=$num.0" | Out-File -Append -Encoding ascii $env:GITHUB_OUTPUT
+          "Soubory $ver ($num.0)"
+
+      - name: Build
+        run: scripts\build-release.ps1
+
+      - name: Offscreen render
+        run: |
+          New-Item -ItemType Directory -Force shots | Out-Null
+          $p = Start-Process -FilePath dist\app\fm.exe -ArgumentList '--render', "$PWD\shots\render-pc.png", '--w', '1100', '--h', '700' -PassThru -Wait
+          if ($p.ExitCode -or -not (Test-Path shots\render-pc.png)) { throw "fm --render failed ($($p.ExitCode))" }
+
+      - name: Inno Setup
+        run: |
+          $iscc = (Get-Command iscc -ErrorAction SilentlyContinue).Source
+          if (-not $iscc) { $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" }
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup --version=6.7.1 -y --no-progress
+            $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          }
+          "ISCC=$iscc" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          $iscc
+
+      - name: Compile setup
+        run: |
+          $v = '${{ steps.v.outputs.version }}'; $n = '${{ steps.v.outputs.num }}'
+          & $env:ISCC /Qp "/DAppVersion=$v" "/DNumVersion=$n" installer\Soubory.iss
+          if ($LASTEXITCODE) { throw 'ISCC failed' }
+          # The same wizard in the plain modern style, only to compare the captures.
+          & $env:ISCC /Qp "/DAppVersion=$v" "/DNumVersion=$n" "/DStyle=modern dynamic" /Fplain-setup installer\Soubory.iss
+          if ($LASTEXITCODE) { throw 'ISCC failed (plain)' }
+          Get-ChildItem dist\*.exe | ForEach-Object { '{0,12:N0}  {1}' -f $_.Length, $_.Name }
+
+      - name: Install, use and uninstall
+        run: |
+          scripts\dev\test-installer.ps1 -Setup dist\plain-setup.exe -Out shots -Name plain -WizardOnly
+          if ($LASTEXITCODE) { throw 'plain wizard test failed' }
+          scripts\dev\test-installer.ps1 -Setup "dist\Soubory-${{ steps.v.outputs.version }}-setup.exe" -Out shots -Name win11
+          if ($LASTEXITCODE) { throw 'installer test failed' }
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: soubory-${{ steps.v.outputs.version }}
+          path: |
+            dist/Soubory-*-setup.exe
+            shots/
+
+      - name: Release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $v = '${{ steps.v.outputs.version }}'
+          $exe = "dist\Soubory-$v-setup.exe"
+          $hash = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLower()
+          $notes = (Get-Content -LiteralPath .github\release-notes.md -Raw -Encoding UTF8).Replace('{VERSION}', $v).Replace('{SHA256}', $hash)
+          [IO.File]::WriteAllText("$PWD\notes.md", $notes)
+          $flags = @('--verify-tag', '--title', "Soubory $v", '--notes-file', 'notes.md')
+          if ($v -match '-') { $flags += '--prerelease' }
+          gh release create $env:GITHUB_REF_NAME $exe @flags
+          if ($LASTEXITCODE) { throw 'gh release create failed' }

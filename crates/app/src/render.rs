@@ -3,6 +3,7 @@
 //! --view icons --select 0,2 --hover 3 --tabs 2 --kb --inactive --nosidebar --preview]`
 //! `fm --render out.png --glyphs E700-E7FF` draws a labelled glyph sheet.
 //! `fm --render out.png --icons [--scale 1.25]` draws fm's own icons on light, dark and high contrast.
+//! `fm --render <dir> --brand` writes the app icon frames and the setup wizard's images (`brand.rs`).
 use crate::app::{App, Focus, Hit, Loc, View};
 use crate::geom::Rect;
 use crate::gfx::{Align, Font};
@@ -36,6 +37,9 @@ pub fn cli(args: &[String]) -> i32 {
         .unwrap_or(1.0);
     if let Some(range) = arg(args, "--glyphs") {
         return glyph_sheet(&out, range, scale);
+    }
+    if args.iter().any(|a| a == "--brand") {
+        return crate::brand::cli(&out);
     }
     if args.iter().any(|a| a == "--icons") {
         return icon_sheet(&out, scale);

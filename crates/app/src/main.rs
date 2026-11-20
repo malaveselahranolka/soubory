@@ -6,6 +6,7 @@
 
 mod app;
 mod batch;
+mod brand;
 mod droptarget;
 mod fsys;
 mod geom;

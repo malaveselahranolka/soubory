@@ -421,7 +421,7 @@ pub fn run(raw: &str, cwd: &Path, background: bool, resident: bool) -> i32 {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         allow_dark_menus();
         let hinst = GetModuleHandleW(None).unwrap_or_default();
-        let icon = folder_icon();
+        let (icon, small) = app_icons();
         let wc = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
             style: CS_DBLCLKS,
@@ -430,7 +430,7 @@ pub fn run(raw: &str, cwd: &Path, background: bool, resident: bool) -> i32 {
             hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
             lpszClassName: MAIN_CLASS,
             hIcon: icon,
-            hIconSm: icon,
+            hIconSm: small,
             ..Default::default()
         };
         RegisterClassExW(&wc);
@@ -1172,6 +1172,22 @@ fn startup_probe() {
 /// Dev/test runs (`--dev-*`) must not overwrite the user's saved window and view.
 fn dev_run() -> bool {
     std::env::args().any(|a| a.starts_with("--dev-"))
+}
+
+/// fm.exe's own icon (resource 1, from assets\fm.ico) at the large and small system sizes; the
+/// stock folder icon if it is missing.
+fn app_icons() -> (HICON, HICON) {
+    unsafe {
+        let hinst = GetModuleHandleW(None).unwrap_or_default();
+        let load = |m: SYSTEM_METRICS_INDEX| {
+            let s = GetSystemMetrics(m);
+            LoadImageW(Some(hinst.into()), PCWSTR(1 as _), IMAGE_ICON, s, s, LR_DEFAULTCOLOR).map(|h| HICON(h.0)).ok()
+        };
+        match (load(SM_CXICON), load(SM_CXSMICON)) {
+            (Some(big), Some(small)) => (big, small),
+            _ => (folder_icon(), folder_icon()),
+        }
+    }
 }
 
 fn folder_icon() -> HICON {

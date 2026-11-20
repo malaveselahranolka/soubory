@@ -751,6 +751,19 @@ impl Canvas<'_> {
         }
     }
 
+    /// `path` filled with any brush (a gradient); the brush's coordinates are in `vb` units.
+    pub fn path_brush(&mut self, d: &'static str, vb: f32, r: Rect, brush: &ID2D1Brush) {
+        let Some(geo) = self.geometry(d) else { return };
+        let k = r.w / vb;
+        unsafe {
+            let mut old = Matrix3x2::identity();
+            self.dc.GetTransform(&mut old);
+            self.dc.SetTransform(&(Matrix3x2::scale(k, k) * Matrix3x2::translation(r.x, r.y) * old));
+            self.dc.FillGeometry(&geo, brush, None);
+            self.dc.SetTransform(&old);
+        }
+    }
+
     /// A Phosphor icon `px` DIPs square, centred in `r` on whole pixels.
     pub fn icon(&mut self, ico: crate::phosphor::Ico, w: crate::phosphor::Weight, r: Rect, px: f32, c: Color) {
         if c.a <= 0.0 {

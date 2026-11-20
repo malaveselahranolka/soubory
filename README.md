@@ -12,7 +12,17 @@ drives and Win+E. The interface is in Czech. Licensed under GPL-3.0-or-later.*
 
 ## Stažení a instalace
 
-Instalátor bude ke stažení v [Releases](https://github.com/malaveselahranolka/soubory/releases).
+**[Stáhnout Soubory 0.1.0-beta.1](https://github.com/malaveselahranolka/soubory/releases/download/v0.1.0-beta.1/Soubory-0.1.0-beta.1-setup.exe)**
+(instalátor pro 64bitová Windows 10 a 11; starší i novější verze najdeš v
+[Releases](https://github.com/malaveselahranolka/soubory/releases)).
+
+Stažený soubor spusť a projdi průvodce. Instaluje se jen pro tvůj účet, bez práv správce, a nabídne,
+aby se složky, disky a Win+E otevíraly v Souborech místo Průzkumníka.
+
+- Instalátor zatím není digitálně podepsaný, takže Windows SmartScreen může varovat. Klikni na
+  **Další informace** a pak **Přesto spustit**.
+- Zpět na Průzkumník souborů: odinstaluj Soubory v Nastavení › Aplikace, nebo spusť instalátor znovu
+  a volbu zruš.
 
 ## Co umí
 
@@ -34,7 +44,8 @@ cargo build --release -p fm-app
 .\target\release\fm.exe
 ```
 
-`scripts\build-release.ps1` sestaví všechny části (včetně 32bitového dialogkitu) do `dist\`.
+`scripts\build-release.ps1` sestaví všechny části (včetně 32bitového dialogkitu) do `dist\` a
+`iscc installer\Soubory.iss` z nich udělá instalátor ([Inno Setup](https://jrsoftware.org/isinfo.php) 6.7).
 Pokud máš repozitář v synchronizované složce (OneDrive), zkopíruj `.cargo\config.example.toml`
 na `.cargo\config.toml` a nastav v něm `target-dir` mimo ni.
 
