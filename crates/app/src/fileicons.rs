@@ -42,8 +42,10 @@ pub const SHELL_EXT: &[&str] = &["exe", "lnk", "ico", "url", "scr", "cpl", "msc"
 /// The icon fm draws for `e`, or None when the shell's must be used. `virtual_place`: a shell
 /// namespace other than the Recycle Bin (This PC, Network, devices), whose items are not files.
 pub fn own(e: &Entry, virtual_place: bool) -> Option<Own> {
-    // Drives keep their own icons wherever they are listed (search results, columns).
-    if virtual_place || e.full.as_deref().is_some_and(|p| p.parent().is_none()) {
+    // Drives keep their own icons wherever they are listed (search results, columns), and so do
+    // items that exist only in the shell's namespace (network computers, phones, a Recycle Bin
+    // item without its file), wherever a column carries them.
+    if virtual_place || e.full.as_deref().is_some_and(|p| p.parent().is_none()) || (e.full.is_none() && e.shell.is_some()) {
         return None;
     }
     if e.is_dir {
@@ -59,14 +61,17 @@ pub fn own(e: &Entry, virtual_place: bool) -> Option<Own> {
     Some(Own::File(category(&ext, &e.name)))
 }
 
-/// The extension, lower case: from the name, or from the full path when the name hides it
-/// (Recycle Bin items are listed by display name; their $R… file keeps the extension).
+/// The extension, lower case: from the full path when there is one, else from the name. Recycle
+/// Bin items are listed by display name, which may hide the extension ("Setup 2.1" for
+/// Setup 2.1.exe); their $R… file keeps it. Elsewhere the full path ends in the name.
 pub fn ext_of(e: &Entry) -> String {
-    let x = e.ext();
-    if !x.is_empty() || e.is_dir {
-        return x.to_ascii_lowercase();
+    if e.is_dir {
+        return String::new();
     }
-    e.full.as_deref().and_then(|p| p.extension()).map(|x| x.to_string_lossy().to_ascii_lowercase()).unwrap_or_default()
+    match e.full.as_deref() {
+        Some(p) => p.extension().map(|x| x.to_string_lossy().to_ascii_lowercase()).unwrap_or_default(),
+        None => e.ext().to_ascii_lowercase(),
+    }
 }
 
 /// `own_at`, and a read-only or system folder whose shell icon is still the plain folder (its
@@ -340,6 +345,10 @@ mod tests {
         assert_eq!(own(&dir("Ikona", FILE_ATTRIBUTE_SYSTEM.0), false), None);
         assert_eq!(own(&file("x.txt"), true), None);
         assert_eq!(own(&dir("C:", 0), true), None);
+        if let Some(crate::app::Loc::Shell { id, .. }) = crate::shellns::recycle_bin() {
+            // A network computer or phone: a shell item with no file-system path.
+            assert_eq!(own(&Entry { shell: Some(id), ..dir("PC-KUCHYNE", 0) }, false), None);
+        }
         let drive = Entry { full: Some(r"D:\".into()), ..dir("Data (D:)", 0) };
         assert_eq!(own(&drive, false), None);
     }
@@ -377,6 +386,12 @@ mod tests {
         assert_eq!(label(&bin).as_deref(), Some("PDF"));
         let prog = Entry { full: Some(r"C:\$Recycle.Bin\S-1-5-21\$RAB12CE.exe".into()), ..file("Setup") };
         assert_eq!(own(&prog, false), None);
+        // A hidden extension behind a dotted name: the $R file decides, not "1" or "11".
+        let dotted = Entry { full: Some(r"C:\$Recycle.Bin\S-1-5-21\$RAB12CF.exe".into()), ..file("Setup 2.1") };
+        assert_eq!(own(&dotted, false), None);
+        let faktura = Entry { full: Some(r"C:\$Recycle.Bin\S-1-5-21\$RAB12D0.pdf".into()), ..file("Faktura 2024.11") };
+        assert_eq!(own(&faktura, false), Some(Own::File(Cat::Pdf)));
+        assert_eq!(label(&faktura).as_deref(), Some("PDF"));
         assert_eq!(f("Makefile"), Some(Own::File(Cat::Code)));
         assert_eq!(f("LICENSE"), Some(Own::File(Cat::Text)));
         // A dotfile has no extension; its name decides.

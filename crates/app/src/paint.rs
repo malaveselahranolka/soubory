@@ -701,24 +701,13 @@ fn header(app: &App, c: &mut Canvas, t: &Theme, h: Rect) {
 /// fm's own icon for `e` in the current tab, or None where the shell's icon stays: programs,
 /// custom folders, drives, and virtual places other than the Recycle Bin.
 pub fn own_icon(app: &mut App, e: &fsys::Entry) -> Option<crate::fileicons::Own> {
-    let (virtual_place, bin) = match &app.tab().loc {
-        Loc::Computer => (true, false),
-        Loc::Shell { id, .. } => {
-            let bin = crate::shellns::is_recycle_bin(id);
-            (!bin, bin)
-        }
-        _ => (false, false),
-    };
-    // A Recycle Bin file whose type cannot be told keeps the shell's icon.
-    if bin && !e.is_dir && crate::fileicons::ext_of(e).is_empty() {
-        return None;
-    }
+    let virt = virtual_place(app);
     let dir = app.tab().dir();
-    crate::fileicons::own_in(&mut app.icons, e, &dir, virtual_place)
+    crate::fileicons::own_in(&mut app.icons, e, &dir, virt)
 }
 
 /// The current tab shows a shell place whose items keep the shell's icons (all but the bin).
-pub fn virtual_place(app: &App) -> bool {
+fn virtual_place(app: &App) -> bool {
     match &app.tab().loc {
         Loc::Computer => true,
         Loc::Shell { id, .. } => !crate::shellns::is_recycle_bin(id),
@@ -733,7 +722,7 @@ fn sel_glyph(app: &App, t: &Theme) -> Option<Color> {
     (focused || t.mode == Mode::HighContrast).then_some(t.on_accent)
 }
 
-fn ensure_icon(app: &mut App, i: usize) -> i32 {
+pub fn ensure_icon(app: &mut App, i: usize) -> i32 {
     let tab = &app.tabs[app.cur];
     if tab.icon_idx[i] != i32::MIN {
         return tab.icon_idx[i];

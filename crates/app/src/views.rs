@@ -296,8 +296,8 @@ pub fn paint_columns(app: &mut App, c: &mut Canvas, t: &Theme) {
         let r = app.row_rect(i);
         let e = app.tab().entries[i].clone();
         let dir = app.tab().dir();
-        let virt = crate::paint::virtual_place(app);
-        let idx = crate::fileicons::own_in(&mut app.icons, &e, &dir, virt).ok_or_else(|| cached_icon(app, &dir, &e, Slot::Active(i)));
+        // The current place's items, as in the other views (shell places keep the shell's icons).
+        let idx = crate::paint::own_icon(app, &e).ok_or_else(|| crate::paint::ensure_icon(app, i));
         let selected = app.tab().sel.is(i);
         if app.kb && app.tab().sel.focus == Some(i) && !selected && app.focus == Focus::Content {
             c.round_stroke(r.inset(INSET / 2.0, 1.0), 6.0, t.focus, 1.5);
@@ -336,14 +336,12 @@ pub fn paint_columns(app: &mut App, c: &mut Canvas, t: &Theme) {
 
 enum Slot {
     Left(usize, usize),
-    Active(usize),
     Right(usize),
 }
 
 fn cached_icon(app: &mut App, dir: &Path, e: &Entry, slot: Slot) -> i32 {
     let cur = match &slot {
         Slot::Left(k, i) => app.tab().cols_left[*k].icon_idx[*i],
-        Slot::Active(i) => app.tab().icon_idx[*i],
         Slot::Right(i) => app.tab().col_right.as_ref().unwrap().icon_idx[*i],
     };
     if cur != i32::MIN {
@@ -353,7 +351,6 @@ fn cached_icon(app: &mut App, dir: &Path, e: &Entry, slot: Slot) -> i32 {
     let t = app.tab_mut();
     match slot {
         Slot::Left(k, i) => t.cols_left[k].icon_idx[i] = idx,
-        Slot::Active(i) => t.icon_idx[i] = idx,
         Slot::Right(i) => t.col_right.as_mut().unwrap().icon_idx[i] = idx,
     }
     idx

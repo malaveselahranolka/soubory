@@ -24,6 +24,7 @@ use windows::{
 
 const BUDGET: usize = 96 << 20;
 const MAX_QUEUE: usize = 400;
+const MAX_MISSES: usize = 4096;
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Key {
@@ -32,6 +33,9 @@ pub struct Key {
     pub mtime: u64,
     /// The shell's icon stands in when there is no thumbnail; false where fm draws its own.
     pub icon: bool,
+    /// An online-only file: only the thumbnail cache is asked. Part of the key, so a miss is
+    /// asked again once the file is downloaded.
+    pub placeholder: bool,
 }
 
 struct Req {
@@ -119,7 +123,7 @@ pub fn bucket(px: f32) -> u32 {
 pub fn image(app: &App, c: &crate::gfx::Canvas, path: &std::path::Path, mtime: u64, attrs: u32, dip: f32, own: bool) -> Option<(ID2D1Bitmap, f32, f32, bool)> {
     if app.offscreen && app.hwnd.is_invalid() {
         // Offscreen renders load synchronously so the PNG shows the final state.
-        let key = Key { path: path.to_path_buf(), px: bucket(dip * c.scale), mtime, icon: !own };
+        let key = Key { path: path.to_path_buf(), px: bucket(dip * c.scale), mtime, icon: !own, placeholder: fm_fs::attrs::is_cloud_placeholder(attrs) };
         let img = S.with(|s| match s.borrow().slots.get(&key) {
             Some(Slot::Ready(img, _)) => Some(img.clone()),
             _ => None,
@@ -135,7 +139,7 @@ pub fn image(app: &App, c: &crate::gfx::Canvas, path: &std::path::Path, mtime: u
         let bmp = c.bitmap_from_bgra(img.w, img.h, &img.data)?;
         return Some((bmp, img.w as f32 / c.scale, img.h as f32 / c.scale, img.thumb));
     }
-    let key = Key { path: path.to_path_buf(), px: bucket(dip * c.scale), mtime, icon: !own };
+    let key = Key { path: path.to_path_buf(), px: bucket(dip * c.scale), mtime, icon: !own, placeholder: fm_fs::attrs::is_cloud_placeholder(attrs) };
     let dc = c.dc.as_raw() as usize;
     S.with(|s| {
         let mut s = s.borrow_mut();
@@ -221,7 +225,7 @@ fn evict(s: &mut State) {
 
 /// Synchronous variant for Quick Look's fallback image (cached; placeholder-safe).
 pub fn image_blocking(c: &crate::gfx::Canvas, path: &std::path::Path, e: &crate::fsys::Entry, dip: f32, own: bool) -> Option<(ID2D1Bitmap, f32, f32)> {
-    let key = Key { path: path.to_path_buf(), px: bucket(dip * c.scale), mtime: e.modified, icon: !own };
+    let key = Key { path: path.to_path_buf(), px: bucket(dip * c.scale), mtime: e.modified, icon: !own, placeholder: e.is_placeholder() };
     let (img, failed) = S.with(|s| match s.borrow().slots.get(&key) {
         Some(Slot::Ready(img, _)) => (Some(img.clone()), false),
         Some(Slot::Failed) => (None, true),
@@ -253,10 +257,16 @@ pub fn image_blocking(c: &crate::gfx::Canvas, path: &std::path::Path, e: &crate:
 
 /// Folder changed: drop failed lookups and pending markers so they are retried.
 pub fn refresh() {
-    // A file without a thumbnail that fm draws itself stays a miss: its key carries the mtime, so a
-    // changed file is asked again anyway.
-    // shortcut: a placeholder downloaded meanwhile keeps its miss (same mtime) until fm restarts.
-    S.with(|s| s.borrow_mut().slots.retain(|k, v| matches!(v, Slot::Ready(..)) || (matches!(v, Slot::Failed) && !k.icon)));
+    // A file without a thumbnail that fm draws itself stays a miss: its key carries the mtime and
+    // the online-only state, so a changed or downloaded file is asked again anyway. Misses are
+    // kept up to MAX_MISSES (each new mtime of a growing log adds one), then all asked again.
+    // shortcut: a thumbnail provider installed while fm runs is seen at the next bound or restart.
+    S.with(|s| {
+        let mut s = s.borrow_mut();
+        let misses = s.slots.iter().filter(|(k, v)| !k.icon && matches!(v, Slot::Failed)).count();
+        let keep = misses <= MAX_MISSES;
+        s.slots.retain(|k, v| matches!(v, Slot::Ready(..)) || (keep && !k.icon && matches!(v, Slot::Failed)));
+    });
 }
 
 pub fn forget_device(_app: &mut App) {
