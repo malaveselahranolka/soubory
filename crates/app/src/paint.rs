@@ -105,6 +105,9 @@ pub fn paint(app: &mut App, c: &mut Canvas) {
     if let Some(h) = l.header {
         header(app, c, &t, h);
     }
+    if let Some(s) = l.scope {
+        scope_bar(app, c, &t, s);
+    }
     if let Some(p) = l.preview {
         crate::views::paint_inspector(app, c, &t, p);
     }
@@ -283,6 +286,57 @@ pub fn sidebar_height(app: &App) -> f32 {
         .last()
         .map(|(y, h)| y + h + 12.0)
         .unwrap_or(0.0)
+}
+
+// ---- search scope bar ------------------------------------------------------------------------------
+
+/// The scope pills: "Tento počítač" and, when the search started in a folder, that folder.
+fn scope_pills(app: &App, c: Option<&Canvas>) -> Vec<(Rect, String, bool)> {
+    let Some(bar) = app.lay.scope else { return Vec::new() };
+    let Loc::Search { scope, .. } = &app.tab().loc else { return Vec::new() };
+    let mut labels = vec![("Tento počítač".to_string(), scope.is_none())];
+    if let Some(f) = app.search_prev.as_ref().and_then(|l| l.folder()) {
+        labels.push((format!("„{}“", fsys::display_name(f)), scope.as_deref() == Some(f)));
+    }
+    let mut x = bar.x + 16.0 + 52.0;
+    labels
+        .into_iter()
+        .map(|(label, on)| {
+            // Without a canvas (hit testing) use a width estimate that matches Font::Small closely.
+            let tw = c.map(|c| c.measure(&label, Font::Small)).unwrap_or(label.chars().count() as f32 * 6.6);
+            let r = Rect::new(x, bar.cy() - 12.0, (tw + 20.0).min(320.0), 24.0);
+            x = r.r() + 6.0;
+            (r, label, on)
+        })
+        .collect()
+}
+
+pub fn scope_hit(app: &App, x: f32, y: f32) -> Hit {
+    let rects = app.scope_rects.borrow();
+    rects
+        .iter()
+        .position(|r| r.contains(x, y))
+        .map(Hit::Scope)
+        .unwrap_or(Hit::Empty)
+}
+
+fn scope_bar(app: &App, c: &mut Canvas, t: &Theme, bar: Rect) {
+    c.text("Hledat:", Rect::new(bar.x + 16.0, bar.y, 52.0, bar.h), Font::Small, t.ink3, Align::Start);
+    let pills = scope_pills(app, Some(c));
+    *app.scope_rects.borrow_mut() = pills.iter().map(|p| p.0).collect();
+    for (k, (r, label, on)) in pills.iter().enumerate() {
+        if *on {
+            c.round(*r, 6.0, if t.mode == Mode::HighContrast { t.accent } else { t.pill });
+        } else if app.hover == Hit::Scope(k) {
+            c.round(*r, 6.0, t.hover);
+        }
+        let ink = if *on && t.mode == Mode::HighContrast { t.on_accent } else if *on { t.ink } else { t.ink2 };
+        c.text(label, r.inset(10.0, 0.0), Font::Small, ink, Align::Center);
+    }
+    if let Some(s) = crate::search::status() {
+        c.text(&s, Rect::new(bar.r() - 260.0, bar.y, 244.0, bar.h), Font::Caption, t.ink3, Align::End);
+    }
+    c.hline(bar.x, bar.r(), bar.b() - 0.5, t.edge);
 }
 
 pub fn side_row_rect(app: &App, k: usize) -> Rect {
@@ -556,7 +610,8 @@ fn header(app: &App, c: &mut Canvas, t: &Theme, h: Rect) {
         if app.hover == Hit::Header(col) {
             c.round(r.inset(2.0, 3.0), 5.0, t.hover);
         }
-        let sorted = match col {
+        let ranked = matches!(tab.loc, Loc::Search { .. }) && tab.by_rank;
+        let sorted = !ranked && match col {
             Col::Name => tab.sort == SortKey::Name,
             Col::Modified => tab.sort == SortKey::Modified,
             Col::Size => tab.sort == SortKey::Size,

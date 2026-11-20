@@ -38,6 +38,7 @@ name = "fm-app"
 version = "0.1.0"
 dependencies = [
  "fm-fs",
+ "fm-index",
  "windows",
  "windows-core",
  "windows-numerics",

@@ -279,6 +279,10 @@ unsafe extern "system" fn hub_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
                 crate::search::index_event(w, l);
                 Some(LRESULT(0))
             }
+            WM_TIMER => {
+                crate::search::tick(w.0);
+                Some(LRESULT(0))
+            }
             WM_COPYDATA => {
                 let cds = &*(l.0 as *const COPYDATASTRUCT);
                 if cds.dwData != COPY_OPEN {
@@ -891,6 +895,9 @@ fn search_changed(app: &mut App, text: String) {
         }
     };
     let t = app.tab_mut();
+    if !matches!(t.loc, Loc::Search { .. }) {
+        t.by_rank = true;
+    }
     t.loc = Loc::Search { text, scope };
     t.scroll = 0.0;
     crate::search::run(app);

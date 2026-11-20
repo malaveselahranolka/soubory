@@ -285,6 +285,21 @@ pub fn display_name(p: &Path) -> String {
 }
 
 /// "1,17 MB" in the user's locale (Explorer's own formatter).
+/// "820 položek", "45 tis. položek", "4,2 mil. položek".
+pub fn format_count(n: usize) -> String {
+    if n >= 1_000_000 {
+        format!("{} mil. položek", format!("{:.1}", n as f64 / 1e6).replace('.', ","))
+    } else if n >= 10_000 {
+        format!("{} tis. položek", n / 1000)
+    } else {
+        match n {
+            1 => "1 položka".into(),
+            2..=4 => format!("{n} položky"),
+            _ => format!("{n} položek"),
+        }
+    }
+}
+
 pub fn format_size(bytes: u64) -> String {
     let mut buf = [0u16; 64];
     unsafe {

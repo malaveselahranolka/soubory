@@ -70,6 +70,8 @@ pub struct Tab {
     pub col_right: Option<crate::views::Pane>,
     /// Column view: horizontal scroll.
     pub col_scroll: f32,
+    /// Search results in relevance order until a column header is clicked.
+    pub by_rank: bool,
 }
 
 impl Tab {
@@ -89,6 +91,7 @@ impl Tab {
             cols_left: Vec::new(),
             col_right: None,
             col_scroll: 0.0,
+            by_rank: true,
         }
     }
     pub fn dir(&self) -> PathBuf {
@@ -145,6 +148,8 @@ pub enum Hit {
     ColRow(usize, usize),
     /// Column view: empty space in a column.
     ColEmpty(usize),
+    /// Search scope bar: 0 = the whole computer, 1 = the folder the search started in.
+    Scope(usize),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -204,6 +209,8 @@ pub struct App {
     pub drop_hl: Option<(Rect, bool)>,
     /// Where the tab was before typing into search (Esc goes back there).
     pub search_prev: Option<Loc>,
+    /// Scope pill rects from the last frame, for hit testing.
+    pub scope_rects: std::cell::RefCell<Vec<Rect>>,
     pub pressed: Hit,
     pub focus: Focus,
     pub active: bool,
@@ -252,6 +259,7 @@ impl App {
             hover: Hit::None,
             drop_hl: None,
             search_prev: None,
+            scope_rects: std::cell::RefCell::new(Vec::new()),
             pressed: Hit::None,
             focus: Focus::Content,
             active: true,
@@ -285,6 +293,7 @@ impl App {
             h: self.h,
             sidebar: self.sidebar_on.then_some(self.sidebar_w),
             tabs: self.tabs.len() > 1,
+            scope: matches!(t.loc, Loc::Search { .. }),
             header: matches!(t.view, View::List)
                 || matches!(t.loc, Loc::Search { .. } | Loc::Recents),
             preview: (self.preview_on && self.w > 900.0).then_some(280.0),
@@ -304,6 +313,11 @@ impl App {
 
     /// (Re)loads the current tab's location, keeping selection by name.
     pub fn reload(&mut self, select: Option<&str>) {
+        if matches!(self.tab().loc, Loc::Search { .. }) {
+            // Results come from the index (async); the current ones stay until they arrive.
+            crate::search::run(self);
+            return;
+        }
         let show_hidden = self.prefs.show_hidden;
         let folders_first = self.prefs.folders_first;
         let keep: Vec<String> = {
@@ -536,7 +550,16 @@ impl App {
             t.sort = key;
             t.asc = !matches!(key, SortKey::Modified | SortKey::Created | SortKey::Size);
         }
-        self.reload(None);
+        if matches!(self.tab().loc, Loc::Search { .. }) {
+            if std::mem::replace(&mut self.tab_mut().by_rank, false) {
+                // First click leaves relevance order for this column, ascending.
+                let t = self.tab_mut();
+                t.asc = !matches!(key, SortKey::Modified | SortKey::Created | SortKey::Size);
+            }
+            crate::search::resort(self);
+        } else {
+            self.reload(None);
+        }
         self.invalidate();
     }
 
@@ -739,6 +762,11 @@ impl App {
         if let Some(tabs) = l.tabs {
             if tabs.contains(x, y) {
                 return crate::paint::tab_hit(self, x, y);
+            }
+        }
+        if let Some(s) = l.scope {
+            if s.contains(x, y) {
+                return crate::paint::scope_hit(self, x, y);
             }
         }
         if let Some(h) = l.header {
@@ -948,6 +976,14 @@ impl App {
                 Col::Kind => self.set_sort(SortKey::Kind),
                 Col::Location => {}
             },
+            Hit::Scope(k) => {
+                let folder = self.search_prev.as_ref().and_then(|l| l.folder()).map(Path::to_path_buf);
+                if let Loc::Search { scope, .. } = &mut self.tab_mut().loc {
+                    *scope = if k == 0 { None } else { folder };
+                }
+                self.tab_mut().scroll = 0.0;
+                crate::search::run(self);
+            }
             Hit::Crumb(k) => {
                 if let Some(p) = crate::paint::crumb_path(self, k) {
                     self.go(p);

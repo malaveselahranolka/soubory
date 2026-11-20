@@ -12,6 +12,7 @@ pub const ROW_H: f32 = 26.0;
 pub const HEADER_H: f32 = 28.0;
 pub const STATUS_H: f32 = 28.0;
 pub const TABS_H: f32 = 32.0;
+pub const SCOPE_H: f32 = 36.0;
 pub const CARD_RADIUS: f32 = 8.0;
 pub const BTN_W: f32 = 32.0;
 pub const BTN_H: f32 = 28.0;
@@ -35,6 +36,8 @@ pub struct Layout {
     pub side_resize: Rect,
     pub card: Rect,
     pub tabs: Option<Rect>,
+    /// Search scope bar (Finder): "Tento počítač" or the folder the search started in.
+    pub scope: Option<Rect>,
     pub header: Option<Rect>,
     pub body: Rect,
     pub status: Rect,
@@ -46,6 +49,7 @@ pub struct LayoutIn {
     pub h: f32,
     pub sidebar: Option<f32>,
     pub tabs: bool,
+    pub scope: bool,
     pub header: bool,
     pub preview: Option<f32>,
 }
@@ -103,6 +107,13 @@ pub fn compute(i: &LayoutIn) -> Layout {
         inner = inner.cut_right(pw);
         p
     });
+    let scope = if i.scope {
+        let s = inner.top(SCOPE_H);
+        inner = inner.cut_top(SCOPE_H);
+        Some(s)
+    } else {
+        None
+    };
     let header = if i.header {
         let h = inner.top(HEADER_H);
         inner = inner.cut_top(HEADER_H);
@@ -125,6 +136,7 @@ pub fn compute(i: &LayoutIn) -> Layout {
         side_resize,
         card,
         tabs,
+        scope,
         header,
         body: inner,
         status,
