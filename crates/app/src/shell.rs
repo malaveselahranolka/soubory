@@ -1535,6 +1535,7 @@ pub fn recent_items(limit: usize) -> Vec<Entry> {
                 full: Some(target),
                 shell: None,
                 origin: None,
+                sized: false,
             });
         }
     }

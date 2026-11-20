@@ -195,6 +195,7 @@ pub fn list(owner: HWND, id: &ShellId, hidden: bool) -> std::result::Result<Vec<
                 full: parsing.filter(|_| real).map(PathBuf::from),
                 shell,
                 origin: None,
+                sized: false,
             };
             if let Some(f2) = &f2 {
                 if let Some(v) = detail(f2, child, &PKEY_SIZE) {
@@ -233,6 +234,10 @@ pub fn start_list(app: &mut App) {
         finish(app, Listed { id, result: r });
         return;
     }
+    // No window yet: open_window lists again once it exists.
+    if app.hwnd.is_invalid() {
+        return;
+    }
     app.tab_mut().loading = true;
     std::thread::spawn(move || unsafe {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
@@ -259,8 +264,9 @@ fn finish(app: &mut App, listed: Listed) {
     let folders_first = app.prefs.folders_first;
     let t = app.tab_mut();
     t.loading = false;
-    let keep: Vec<String> = t.sel.indices().iter().filter_map(|&i| t.entries.get(i).map(|e| e.name.clone())).collect();
-    let focus = t.focused_name();
+    // By shell ID: display names repeat (several deleted "report.docx" in the Bin).
+    let keep: std::collections::HashSet<ShellId> = t.sel.indices().iter().filter_map(|&i| t.entries.get(i).and_then(|e| e.shell.clone())).collect();
+    let focus = t.sel.focus.and_then(|i| t.entries.get(i)).and_then(|e| e.shell.clone());
     match listed.result {
         Ok(mut v) => {
             crate::fsys::sort(&mut v, t.sort, t.asc, folders_first);
@@ -275,11 +281,11 @@ fn finish(app: &mut App, listed: Listed) {
     crate::groups::apply(t, folders_first);
     t.icon_idx = vec![i32::MIN; t.entries.len()];
     t.sel = crate::sel::Selection::new(t.entries.len());
-    let again: Vec<usize> = t.entries.iter().enumerate().filter(|(_, e)| keep.contains(&e.name)).map(|(i, _)| i).collect();
+    let again: Vec<usize> = t.entries.iter().enumerate().filter(|(_, e)| e.shell.as_ref().is_some_and(|s| keep.contains(s))).map(|(i, _)| i).collect();
     if !again.is_empty() {
         t.sel.set_many(again, &[]);
     }
-    if let Some(i) = focus.and_then(|n| t.entries.iter().position(|e| e.name == n)) {
+    if let Some(i) = focus.and_then(|f| t.entries.iter().position(|e| e.shell.as_ref() == Some(&f))) {
         t.sel.focus = Some(i);
         t.sel.anchor = Some(i);
     }

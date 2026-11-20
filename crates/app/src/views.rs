@@ -20,6 +20,7 @@ pub struct Pane {
 impl Pane {
     pub fn load(app: &App, dir: &Path) -> Pane {
         let mut entries = fsys::list_dir(dir, app.prefs.show_hidden).unwrap_or_default();
+        crate::search::known_sizes(&mut entries, dir);
         let t = app.tab();
         fsys::sort(&mut entries, t.sort, t.asc, app.prefs.folders_first);
         let n = entries.len();
@@ -135,6 +136,7 @@ fn set_active(app: &mut App, p: Pane) {
     t.icon_idx = p.icon_idx;
     crate::win::set_title(app);
     crate::win::watch_current(app);
+    crate::search::request_sizes(app);
 }
 
 /// Right arrow / click into the next column.
@@ -447,7 +449,7 @@ pub fn paint_gallery(app: &mut App, c: &mut Canvas, t: &Theme) {
 }
 
 fn kind_and_size(e: &Entry) -> String {
-    if e.is_dir && e.size == 0 { fsys::kind_name(e) } else { format!("{} – {}", fsys::kind_name(e), fsys::format_size(e.size)) }
+    if !e.size_known() { fsys::kind_name(e) } else { format!("{} – {}", fsys::kind_name(e), fsys::format_size(e.size)) }
 }
 
 /// Large image (thumbnail or icon) fitted into `r`.
@@ -505,7 +507,7 @@ pub fn preview_card(app: &mut App, c: &mut Canvas, t: &Theme, r: Rect, path: &Pa
     c.text("Informace", Rect::new(inner.x, y, inner.w, 20.0), Font::CaptionStrong, t.ink3, Align::Start);
     y += 22.0;
     let mut rows: Vec<(&str, String)> = vec![("Vytvořeno", fsys::format_date_long(e.created)), ("Změněno", fsys::format_date_long(e.modified))];
-    if !e.is_dir || e.size > 0 {
+    if e.size_known() {
         rows.push(("Velikost", format!("{} ({} bajtů)", fsys::format_size(e.size), group_digits(e.size))));
     }
     if let Some(parent) = path.parent() {
@@ -557,6 +559,7 @@ pub fn paint_inspector(app: &mut App, c: &mut Canvas, t: &Theme, r: Rect) {
                     full: Some(dir.clone()),
                     shell: None,
                     origin: None,
+                    sized: false,
                 };
                 preview_card(app, c, t, r, &dir, &e, false);
             }

@@ -31,9 +31,15 @@ pub struct Entry {
     pub shell: Option<crate::shellns::ShellId>,
     /// Recycle Bin: where the item was deleted from.
     pub origin: Option<String>,
+    /// A folder whose size the index reported (0 then means empty, not unknown).
+    pub sized: bool,
 }
 
 impl Entry {
+    /// Files always; a folder once the index has reported it (or when it carries a size).
+    pub fn size_known(&self) -> bool {
+        !self.is_dir || self.sized || self.size > 0
+    }
     pub fn ext(&self) -> &str {
         if self.is_dir {
             return "";
@@ -59,7 +65,7 @@ impl Entry {
 /// stay online-only). `None` when it no longer exists.
 pub fn entry_of(p: &Path) -> Option<Entry> {
     use windows::Win32::Storage::FileSystem::{GetFileAttributesExW, GetFileExInfoStandard, WIN32_FILE_ATTRIBUTE_DATA};
-    let w = wide(&p.to_string_lossy());
+    let w = wide_path(p);
     let mut d = WIN32_FILE_ATTRIBUTE_DATA::default();
     unsafe {
         GetFileAttributesExW(
@@ -83,6 +89,7 @@ pub fn entry_of(p: &Path) -> Option<Entry> {
         full: Some(p.to_path_buf()),
         shell: None,
         origin: None,
+        sized: false,
     })
 }
 
@@ -145,6 +152,7 @@ pub fn list_dir(dir: &Path, show_hidden: bool) -> std::io::Result<Vec<Entry>> {
                         full: None,
                         shell: None,
                         origin: None,
+                        sized: false,
                     });
                 }
             }
@@ -558,6 +566,7 @@ mod tests {
             full: None,
             shell: None,
             origin: None,
+            sized: false,
         }
     }
 

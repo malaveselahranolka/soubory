@@ -488,7 +488,7 @@ impl IRawElementProviderSimple_Impl for Node_Impl {
 /// "Dokument PDF, 48,0 kB, změněno Dnes 4:35" (what a reader adds after the name).
 fn describe(e: &crate::fsys::Entry) -> String {
     let mut parts = vec![crate::fsys::kind_name(e)];
-    if !e.is_dir || e.size > 0 {
+    if e.size_known() {
         parts.push(crate::fsys::format_size(e.size));
     }
     let date = crate::fsys::format_date(e.modified);

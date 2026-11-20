@@ -99,6 +99,8 @@ pub struct Tab {
     pub groups: Vec<groups::Group>,
     /// Bring the focus into view when the pending async list arrives (after a regroup).
     pub reveal_on_load: bool,
+    /// Folder sizes arrived under a press, drag or rename: re-sort once it ends (flush_resort).
+    pub resort_pending: bool,
 }
 
 impl Tab {
@@ -123,6 +125,7 @@ impl Tab {
             group: GroupKey::None,
             groups: Vec::new(),
             reveal_on_load: false,
+            resort_pending: false,
         }
     }
     pub fn dir(&self) -> PathBuf {
@@ -387,6 +390,8 @@ impl App {
     /// (Re)loads the current tab's location, keeping selection by name.
     pub fn reload(&mut self, select: Option<&str>) {
         crate::win::sync_search_field(self);
+        // A shell listing sets it again; any other place never waits.
+        self.tab_mut().loading = false;
         if matches!(self.tab().loc, Loc::Search { .. }) {
             // Results come from the index (async); the current ones stay until they arrive.
             crate::search::run(self);
@@ -413,6 +418,7 @@ impl App {
             .or_else(|| self.tab().focused_name());
         let t = &mut self.tabs[self.cur];
         t.error = None;
+        t.resort_pending = false;
         let res: std::io::Result<Vec<Entry>> = match &t.loc {
             Loc::Folder(p) => fsys::list_dir(p, show_hidden),
             Loc::Computer => Ok(fsys::volumes()
@@ -427,6 +433,8 @@ impl App {
                     full: Some(v.root),
                     shell: None,
                     origin: None,
+                    // A drive carries its capacity.
+                    sized: true,
                 })
                 .collect()),
             Loc::Recents => Ok(crate::shell::recent_items(200)),
@@ -438,7 +446,10 @@ impl App {
         };
         match res {
             Ok(mut v) => {
-                crate::search::known_sizes(&mut v, &t.dir());
+                // Drives carry their capacity, not an indexed size.
+                if !matches!(t.loc, Loc::Computer) {
+                    crate::search::known_sizes(&mut v, &t.dir());
+                }
                 if !matches!(t.loc, Loc::Recents) {
                     fsys::sort(&mut v, t.sort, t.asc, folders_first);
                 }
@@ -641,8 +652,13 @@ impl App {
     }
 
     fn after_tab_switch(&mut self) {
-        if self.groups_by_tags() {
+        // A tag place has no watcher, and a shell listing that finished in the background was dropped.
+        let t = self.tab();
+        if self.groups_by_tags() || t.loading || matches!(t.loc, Loc::Tag(_)) {
             self.reload(None);
+        } else {
+            crate::search::request_sizes(self);
+            self.flush_resort();
         }
         crate::win::sync_search_field(self);
         self.relayout();
@@ -1078,6 +1094,9 @@ impl App {
                     let i = *index;
                     self.drag = Drag::None;
                     crate::shell::drag_out(self, i);
+                    // The modal drag loop ate the button-up.
+                    self.pressed = Hit::None;
+                    self.flush_resort();
                 }
                 return;
             }
@@ -1230,9 +1249,24 @@ impl App {
         }
         if h != pressed {
             self.invalidate();
+        } else {
+            self.activate(h);
+        }
+        self.flush_resort();
+    }
+
+    /// Re-sorts the current tab when folder sizes arrived while a press, drag or rename held its
+    /// rows in place (the items under the pointer or the field must not move).
+    pub fn flush_resort(&mut self) {
+        let busy = !matches!(self.drag, Drag::None) || matches!(self.pressed, Hit::Row(_)) || crate::win::renaming(self);
+        if busy || !self.tab().resort_pending {
             return;
         }
-        self.activate(h);
+        let folders_first = self.prefs.folders_first;
+        let t = self.tab_mut();
+        t.resort_pending = false;
+        t.resort(folders_first);
+        self.invalidate();
     }
 
     /// What a click on `h` does (also UI Automation's Invoke).

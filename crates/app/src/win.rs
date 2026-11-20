@@ -151,6 +151,8 @@ struct Edit {
     hwnd: HWND,
     kind: EditKind,
     index: usize,
+    /// Rename: the item's path (the list can change under the field).
+    path: PathBuf,
     font: HFONT,
     brush: HBRUSH,
     bg: COLORREF,
@@ -381,6 +383,12 @@ pub fn open_window(loc: Loc, near: Option<HWND>) -> Option<HWND> {
         );
         set_title(app);
         watch_current(app);
+        // reload ran before the window existed; async replies need its handle.
+        if matches!(app.tab().loc, Loc::Search { .. } | Loc::Shell { .. }) {
+            app.reload(None);
+        } else {
+            crate::search::request_sizes(app);
+        }
         crate::win::trace("dwm_title_watch");
         crate::droptarget::register(hwnd);
         let mut near_rect = RECT::default();
@@ -1202,6 +1210,7 @@ fn create_edit(
                 hwnd,
                 kind,
                 index,
+                path: if kind == EditKind::Rename { app.tab().path_of(index) } else { PathBuf::new() },
                 font,
                 brush,
                 bg: bgc,
@@ -1345,12 +1354,40 @@ pub fn search_active(app: &App) -> bool {
 }
 
 pub fn renaming_index(app: &App) -> Option<usize> {
-    edit_of(app.hwnd, EditKind::Rename).map(|e| e.1)
+    rename_edit(app).and_then(|e| e.1)
+}
+
+/// A rename field is open in this window.
+pub fn renaming(app: &App) -> bool {
+    edit_of(app.hwnd, EditKind::Rename).is_some()
+}
+
+/// The open rename field, the row of the item it was opened on and that item's path. The row
+/// follows the item when the list changed under the field; None when the item is gone.
+fn rename_edit(app: &App) -> Option<(HWND, Option<usize>, PathBuf)> {
+    let (h, i, p) = EDITS.with(|e| {
+        e.borrow()
+            .iter()
+            .find(|x| x.owner == app.hwnd && x.kind == EditKind::Rename)
+            .map(|x| (x.hwnd, x.index, x.path.clone()))
+    })?;
+    let t = app.tab();
+    let dir = t.dir();
+    let at = |k: usize| t.entries.get(k).is_some_and(|e| e.path_in(&dir) == p);
+    let row = if at(i) { Some(i) } else { (0..t.entries.len()).find(|&k| at(k)) };
+    if let Some(r) = row.filter(|&r| r != i) {
+        EDITS.with(|e| {
+            if let Some(x) = e.borrow_mut().iter_mut().find(|x| x.hwnd == h) {
+                x.index = r;
+            }
+        });
+    }
+    Some((h, row, p))
 }
 
 /// Where the rename field sits, so paint can draw its frame around the EDIT.
 pub fn rename_rect(app: &App) -> Option<crate::geom::Rect> {
-    edit_of(app.hwnd, EditKind::Rename).map(|(_, i)| edit_rect(app, EditKind::Rename, i))
+    renaming_index(app).map(|i| edit_rect(app, EditKind::Rename, i))
 }
 
 /// Quick Look forwards navigation keys to its owner window's selection.
@@ -1560,7 +1597,7 @@ pub fn end_rename(app: &mut App) {
 }
 
 fn commit_rename(app: &mut App, cancel: bool) {
-    let Some((h, i)) = edit_of(app.hwnd, EditKind::Rename) else {
+    let Some((h, row, path)) = rename_edit(app) else {
         return;
     };
     let text = edit_text(h);
@@ -1573,9 +1610,21 @@ fn commit_rename(app: &mut App, cancel: bool) {
         }
     }
     app.invalidate();
-    if cancel || i >= app.tab().entries.len() {
-        return;
+    if !cancel {
+        match row {
+            Some(i) => apply_rename(app, i, text),
+            None if path.file_name().is_some_and(|n| *n != *text.trim_end()) => {
+                app.note("Položka mezitím zmizela, nic se nepřejmenovalo.")
+            }
+            None => {}
+        }
     }
+    // What waited for the field to close: search results, a re-sort by folder size.
+    crate::search::after_rename(app);
+    app.flush_resort();
+}
+
+fn apply_rename(app: &mut App, i: usize, text: String) {
     let old = app.tab().path_of(i);
     let old_name = app.tab().entries[i].name.clone();
     let new_name = text.trim_end().to_string();
@@ -1984,6 +2033,13 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                 app.eat_dblclk = false;
                 let (x, y) = xy(lparam, app.scale);
                 let (ctrl, shift, _) = mods();
+                // Same for a click on an item (it would select or drag whatever moved there).
+                if renaming(app) && matches!(app.hit(x, y), Hit::Row(_) | Hit::Group(_)) {
+                    end_rename(app);
+                    // Nor does a double-click begun with it.
+                    app.eat_dblclk = true;
+                    return LRESULT(0);
+                }
                 SetCapture(hwnd);
                 if !matches!(app.hit(x, y), Hit::Search)
                     && GetFocus() != Some(hwnd).unwrap_or_default()
@@ -2026,8 +2082,12 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                 LRESULT(1)
             }
             WM_RBUTTONUP => {
-                // Its commands (sort, group, view) reorder the list under the rename field.
-                end_rename(app);
+                // A click that closes a rename does only that: the commit can move the rows
+                // (a re-sort by the new name), so the menu would open on another item.
+                if renaming(app) {
+                    end_rename(app);
+                    return LRESULT(0);
+                }
                 let (x, y) = xy(lparam, app.scale);
                 let mut p = POINT {
                     x: (lparam.0 & 0xFFFF) as i16 as i32,

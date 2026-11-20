@@ -357,6 +357,7 @@ mod tests {
             full: None,
             shell: None,
             origin: None,
+            sized: false,
         }
     }
 

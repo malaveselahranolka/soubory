@@ -798,7 +798,7 @@ fn list_view(app: &mut App, c: &mut Canvas, t: &Theme) {
                 ),
                 Col::Size => {
                     // Folders: their size from the index once it has reported it.
-                    let s = if e.is_dir && e.size == 0 {
+                    let s = if !e.size_known() {
                         "—".to_string()
                     } else {
                         fsys::format_size(e.size)
@@ -1026,7 +1026,7 @@ fn tiles_view(app: &mut App, c: &mut Canvas, t: &Theme) {
         let line = |k: f32| Rect::new(name.x, name.y + 18.0 * k, name.w, 18.0);
         c.text(&fsys::kind_name(&e), line(1.0), Font::Small, with_alpha(ink2, dim), Align::Start);
         // Files show their size; folders theirs once the index has reported it.
-        if !e.is_dir || e.size > 0 {
+        if e.size_known() {
             c.text(&fsys::format_size(e.size), line(2.0), Font::Small, with_alpha(ink2, dim * 0.8), Align::Start);
         }
     }
@@ -1336,12 +1336,20 @@ pub fn status_text(app: &App) -> String {
         _ => format!("{n} položek"),
     };
     let base = if sel > 0 {
-        let bytes: u64 = tab
-            .sel
-            .indices()
+        let picked = tab.sel.indices();
+        let full = |i: usize| tab.entries[i].full.as_deref();
+        // Search and tag places list full paths: an item inside a selected folder is already
+        // counted in that folder's size.
+        let dirs: std::collections::HashSet<&std::path::Path> = if matches!(tab.loc, Loc::Search { .. } | Loc::Tag(_)) {
+            picked.iter().filter(|&&i| tab.entries[i].is_dir).filter_map(|&i| full(i)).collect()
+        } else {
+            Default::default()
+        };
+        let bytes: u64 = picked
             .iter()
             // Folders count with their indexed size; drives in "Tento počítač" carry capacity.
             .filter(|&&i| !tab.entries[i].is_dir || !matches!(tab.loc, Loc::Computer))
+            .filter(|&&i| dirs.is_empty() || !full(i).is_some_and(|p| p.ancestors().skip(1).any(|a| dirs.contains(a))))
             .map(|&i| tab.entries[i].size)
             .sum();
         if bytes > 0 {

@@ -34,11 +34,9 @@ struct State {
     sizes: HashMap<PathBuf, u64>,
     /// Per window: the running folder-size request's token.
     size_tokens: HashMap<isize, CancelToken>,
+    /// Windows whose results arrived under an open rename field (run again once it closes).
+    deferred: HashSet<isize>,
 }
-
-/// Folders sized per request; a folder with more subfolders than this is rare and they are
-/// listed first anyway.
-const MAX_SIZED: usize = 5000;
 
 struct Sizes {
     loc: Loc,
@@ -139,6 +137,7 @@ pub fn known_sizes(entries: &mut [Entry], dir: &Path) {
         for e in entries.iter_mut().filter(|e| e.is_dir) {
             if let Some(&n) = s.sizes.get(&e.path_in(dir)) {
                 e.size = n;
+                e.sized = true;
             }
         }
     });
@@ -148,11 +147,13 @@ pub fn known_sizes(entries: &mut [Entry], dir: &Path) {
 pub fn request_sizes(app: &App) {
     let Some(svc) = ST.with(|s| s.borrow().svc.clone()) else { return };
     let t = app.tab();
-    if matches!(t.loc, Loc::Computer | Loc::Shell { .. }) {
+    // No window yet (open_window asks again once it exists): the reply would have nowhere to go.
+    if matches!(t.loc, Loc::Computer | Loc::Shell { .. }) || app.hwnd.is_invalid() {
         return;
     }
     let dir = t.dir();
-    let paths: Vec<PathBuf> = t.entries.iter().filter(|e| e.is_dir && e.shell.is_none()).take(MAX_SIZED).map(|e| e.path_in(&dir)).collect();
+    // Every folder: each is one lookup and a walk of its own subtree (C:\ whole takes ~15 ms).
+    let paths: Vec<PathBuf> = t.entries.iter().filter(|e| e.is_dir && e.shell.is_none()).map(|e| e.path_in(&dir)).collect();
     if paths.is_empty() {
         return;
     }
@@ -195,7 +196,8 @@ pub fn sizes_message(app: &mut App, l: LPARAM) {
         s.sizes.extend(fresh.iter().map(|(p, n)| (p.clone(), *n)));
     });
     let folders_first = app.prefs.folders_first;
-    let renaming = crate::win::renaming_index(app).is_some();
+    let cur = app.cur;
+    let mut repaint = false;
     for k in 0..app.tabs.len() {
         let t = &mut app.tabs[k];
         if t.loc != r.loc {
@@ -205,21 +207,49 @@ pub fn sizes_message(app: &mut App, l: LPARAM) {
         let mut changed = false;
         for e in t.entries.iter_mut().filter(|e| e.is_dir) {
             if let Some(&n) = fresh.get(&e.path_in(&dir)) {
-                changed |= e.size != n;
+                changed |= e.size != n || !e.sized;
                 e.size = n;
+                e.sized = true;
             }
         }
-        // Sorted by size: the folders move to their places (not under an open rename field).
+        repaint |= changed && k == cur;
+        // Sorted by size: the folders move to their places. The shown tab waits for a press,
+        // drag or rename to end (flush_resort), so nothing moves under the pointer or the field.
         let sorted = t.sort == fsys::SortKey::Size && !matches!(t.loc, Loc::Recents) && !(matches!(t.loc, Loc::Search { .. }) && t.by_rank);
-        if changed && sorted && !(renaming && k == app.cur) {
-            t.resort(folders_first);
+        if changed && sorted {
+            if k == cur {
+                t.resort_pending = true;
+            } else {
+                t.resort(folders_first);
+            }
         }
     }
-    app.invalidate();
+    app.flush_resort();
+    if repaint {
+        app.invalidate();
+    }
 }
 
 pub fn forget(hwnd: HWND) {
-    ST.with(|s| s.borrow_mut().tokens.remove(&(hwnd.0 as isize)));
+    ST.with(|s| {
+        let mut s = s.borrow_mut();
+        let key = hwnd.0 as isize;
+        // A closed window's queries and size requests stop (closing the app waits for them).
+        if let Some((t, _)) = s.tokens.remove(&key) {
+            t.cancel();
+        }
+        if let Some(t) = s.size_tokens.remove(&key) {
+            t.cancel();
+        }
+        s.deferred.remove(&key);
+    });
+}
+
+/// The rename field closed: run a query whose results arrived while it was open.
+pub fn after_rename(app: &mut App) {
+    if ST.with(|s| s.borrow_mut().deferred.remove(&(app.hwnd.0 as isize))) {
+        run(app);
+    }
 }
 
 /// Hub message: the service came up, or an index event.
@@ -328,6 +358,10 @@ pub fn run(app: &mut App) {
         set_entries(app, Vec::new());
         return;
     }
+    // No window yet: open_window runs the query again once it exists.
+    if app.hwnd.is_invalid() {
+        return;
+    }
     let key = app.hwnd.0 as isize;
     let (token, generation) = ST.with(|s| {
         let mut s = s.borrow_mut();
@@ -345,10 +379,20 @@ pub fn run(app: &mut App) {
     let t = app.tab();
     let want_created = t.sort == fsys::SortKey::Created || t.group == crate::groups::GroupKey::Created;
     std::thread::spawn(move || {
-        if let Some(hits) = svc.search(&text, scope.as_deref(), hidden, LIMIT, &token) {
+        let found = svc.search(&text, scope.as_deref(), hidden, LIMIT, &token);
+        // Not held through the stats below: closing the app waits for every query's reference.
+        drop(svc);
+        if let Some(hits) = found {
             // Attributes only (no file is opened, placeholders stay online), at most LIMIT.
             let created = if want_created {
-                hits.iter().map(|h| fsys::entry_of(Path::new(&h.path)).map_or(0, |e| e.created)).collect()
+                let mut v = Vec::with_capacity(hits.len());
+                for h in &hits {
+                    if token.is_cancelled() {
+                        return;
+                    }
+                    v.push(fsys::entry_of(Path::new(&h.path)).map_or(0, |e| e.created));
+                }
+                v
             } else {
                 Vec::new()
             };
@@ -378,6 +422,11 @@ pub fn message(app: &mut App, _w: WPARAM, l: LPARAM) {
     if current != Some(reply.generation) || !matches!(app.tab().loc, Loc::Search { .. }) {
         return;
     }
+    // Never replace the list under an open rename field: it would name another row's file.
+    if crate::win::renaming(app) {
+        ST.with(|s| s.borrow_mut().deferred.insert(app.hwnd.0 as isize));
+        return;
+    }
     let created = reply.created;
     let entries = reply
         .hits
@@ -393,6 +442,7 @@ pub fn message(app: &mut App, _w: WPARAM, l: LPARAM) {
             full: Some(PathBuf::from(h.path)),
             shell: None,
             origin: None,
+            sized: false,
         })
         .collect();
     set_entries(app, entries);
