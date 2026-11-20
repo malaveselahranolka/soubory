@@ -451,6 +451,9 @@ fn drives_changed() {
                     commit_rename(a, true);
                 }
                 a.go(Loc::Computer);
+            } else if a.busy() {
+                // Under a press or band: flush_deferred lists it once the rows may move.
+                a.tabs[i].stale = true;
             } else {
                 a.reload(None);
             }
@@ -715,7 +718,7 @@ fn dev_keys(app: &mut App, script: &str, out: Option<String>) {
 ", app.pinned_header().map(|(g, r)| (g, r.y)));
         } else if step == "sizes" {
             let t = app.tab();
-            let v: Vec<String> = t.entries.iter().filter(|e| e.is_dir).map(|e| format!("{}={}", e.name, e.size)).collect();
+            let v: Vec<String> = t.entries.iter().filter(|e| e.is_dir).map(|e| if e.size_known() { format!("{}={}", e.name, e.size) } else { format!("{}=?", e.name) }).collect();
             log += &format!("sizes [{}] order [{}]\n", v.join(" "), t.entries.iter().map(|e| e.name.as_str()).collect::<Vec<_>>().join(" "));
         } else if step == "procref" {
             // What a shell thread with CTF_PROCESS_REF sees.
@@ -1289,11 +1292,21 @@ fn position_edits(app: &App) {
 /// After a DPI or theme change: the fields are recreated on demand with the new font and
 /// colours; the palette's comes back at once with its query.
 fn rebuild_edits(app: &mut App) {
-    // Commits like a resize would; destroying the field would drop the typed name.
-    end_rename(app);
+    // An open rename comes back with its text and selection: a system broadcast must neither
+    // commit half a name nor drop it.
+    let rename = rename_edit(app).and_then(|(h, row, _)| {
+        let (mut a, mut b) = (0u32, 0u32);
+        unsafe {
+            SendMessageW(h, EM_GETSEL, Some(WPARAM(&mut a as *mut u32 as usize)), Some(LPARAM(&mut b as *mut u32 as isize)));
+        }
+        row.map(|r| (r, edit_text(h), (a as i32, b as i32)))
+    });
     let query = edit_of(app.hwnd, EditKind::Palette).map(|(h, _)| edit_text(h));
     for k in [EditKind::Search, EditKind::Rename, EditKind::Path, EditKind::Palette] {
         destroy_edit(app.hwnd, k);
+    }
+    if let Some((row, text, sel)) = rename {
+        create_edit(app, EditKind::Rename, row, &text, sel);
     }
     if app.palette.is_some() {
         palette_field(app, true);
@@ -1649,6 +1662,9 @@ fn apply_rename(app: &mut App, i: usize, text: String) {
                 // Search and Recents patch the item in place: its sort place and group follow.
                 t.resort(folders_first);
                 app.reveal_focus();
+                if matches!(app.tab().loc, Loc::Search { .. }) {
+                    crate::search::after_rename(app);
+                }
             }
         }
         Err(msg) => app.note(&msg),
@@ -2041,6 +2057,7 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                     app.eat_dblclk = true;
                     return LRESULT(0);
                 }
+                app.down_on_row = matches!(app.hit(x, y), Hit::Row(_));
                 SetCapture(hwnd);
                 if !matches!(app.hit(x, y), Hit::Search)
                     && GetFocus() != Some(hwnd).unwrap_or_default()
@@ -2058,7 +2075,7 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                 let (ctrl, shift, _) = mods();
                 // The first click left only its item selected: another item under the pointer
                 // means the list moved in between (a re-sort, live results), so this is a click.
-                let moved = !ctrl && !shift && matches!(app.hit(x, y), Hit::Row(i) if !app.tab().sel.is(i));
+                let moved = !ctrl && !shift && matches!(app.hit(x, y), Hit::Row(i) if !app.down_on_row || !app.tab().sel.is(i));
                 SetCapture(hwnd);
                 app.mouse_down(x, y, ctrl, shift);
                 app.drag = Drag::None;
@@ -2071,7 +2088,8 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                 // Capture lost with the button still down (a dialog came up, Alt+Tab): no
                 // button-up will follow, so the press ends here. Our own release on button-up
                 // comes with the button already up.
-                if GetKeyState(VK_LBUTTON.0 as i32) < 0 && (!matches!(app.drag, Drag::None) || app.pressed != Hit::None) {
+                // A drag out releases it on purpose (drag_out ends that state itself).
+                if !matches!(app.drag, Drag::Out) && GetKeyState(VK_LBUTTON.0 as i32) < 0 && (!matches!(app.drag, Drag::None) || app.pressed != Hit::None) {
                     app.drag = Drag::None;
                     app.pressed = Hit::None;
                     app.flush_deferred();

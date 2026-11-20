@@ -669,7 +669,9 @@ fn post(hwnd: isize, a: Action) {
 
 fn in_menu() -> bool {
     let mut g = GUITHREADINFO { cbSize: std::mem::size_of::<GUITHREADINFO>() as u32, ..Default::default() };
-    unsafe { GetGUIThreadInfo(0, &mut g) }.is_ok() && g.flags.contains(GUI_INMENUMODE)
+    // fm's own UI thread (0 would ask about whichever app is in front).
+    let me = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
+    unsafe { GetGUIThreadInfo(me, &mut g) }.is_ok() && g.flags.contains(GUI_INMENUMODE)
 }
 
 /// WM_APP_UIA: a client asked for an action; the element is looked up again first.

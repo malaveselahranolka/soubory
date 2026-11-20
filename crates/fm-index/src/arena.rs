@@ -766,6 +766,13 @@ impl Index {
         (bytes, files)
     }
 
+    /// The index lists something inside directory `id`. A childless directory is empty, or was
+    /// never walked (a junction or link, access denied).
+    #[must_use]
+    pub fn has_children(&self, id: EntryId) -> bool {
+        self.is_alive(id) && self.first_child[id as usize] != NONE
+    }
+
     /// Returns `true` if `id` is a directory.
     #[inline]
     #[must_use]

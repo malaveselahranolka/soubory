@@ -268,6 +268,11 @@ fn finish(app: &mut App, listed: Listed) {
     if !same {
         return;
     }
+    // Not under a press or band (their rows would change): flush_deferred lists again.
+    if app.busy() {
+        app.tab_mut().stale = true;
+        return;
+    }
     let folders_first = app.prefs.folders_first;
     let t = app.tab_mut();
     t.loading = false;

@@ -243,6 +243,9 @@ pub enum Drag {
     Pending {
         at: (f32, f32),
     },
+    /// Dragging items out (SHDoDragDrop's modal loop): the rows must not move under a drop
+    /// back into this window.
+    Out,
     Slider,
 }
 
@@ -285,6 +288,8 @@ pub struct App {
     pub palette: Option<crate::palette::Palette>,
     /// The click that just ran a palette row or sheet button: its double-click half is dropped.
     pub eat_dblclk: bool,
+    /// The last button press was on an item row (a double-click needs both clicks there).
+    pub down_on_row: bool,
     /// Scope pill rects from the last frame, for hit testing.
     pub scope_rects: std::cell::RefCell<Vec<Rect>>,
     pub pressed: Hit,
@@ -339,6 +344,7 @@ impl App {
             batch: None,
             palette: None,
             eat_dblclk: false,
+            down_on_row: false,
             scope_rects: std::cell::RefCell::new(Vec::new()),
             pressed: Hit::None,
             focus: Focus::Content,
@@ -659,8 +665,10 @@ impl App {
         // Stale: tags changed or a shell listing landed while hidden. A search runs again: its
         // replies are per window, so one that landed meanwhile was dropped or would fill this tab
         // with another tab's results (running bumps the window's generation and drops those).
+        // A tag place has no watcher (renames, deletes and moves of tagged items), so it lists
+        // again too, as does a tab grouped by tags.
         let t = self.tab();
-        if t.stale || matches!(t.loc, Loc::Search { .. }) {
+        if t.stale || matches!(t.loc, Loc::Search { .. } | Loc::Tag(_)) || self.groups_by_tags() {
             self.reload(None);
         } else {
             crate::search::request_sizes(self);
@@ -1110,6 +1118,7 @@ impl App {
                 crate::paint::slider_set(self, x);
                 return;
             }
+            Drag::Out => return,
             Drag::None => {}
         }
         let h = self.hit(x, y);
@@ -1270,6 +1279,12 @@ impl App {
             return;
         }
         crate::search::replay(self);
+        if self.tab().stale {
+            // A listing that landed under the press (shell places, drives).
+            self.reload(None);
+            self.invalidate();
+            return;
+        }
         if !self.tab().resort_pending {
             return;
         }
@@ -1430,6 +1445,11 @@ impl App {
     // ---- keyboard -----------------------------------------------------------------------------
 
     pub fn key(&mut self, vk: VIRTUAL_KEY, ctrl: bool, shift: bool, alt: bool) -> bool {
+        // A row press may become a drag of the focused item: keys must not move the focus
+        // (Explorer swallows them too). Ctrl and Shift still pick copy or move.
+        if matches!(self.drag, Drag::Pending { .. }) {
+            return true;
+        }
         if self.palette.is_some() {
             crate::palette::key(self, vk);
             return true;
@@ -1604,7 +1624,7 @@ impl App {
 
     /// Printable character: type-to-select.
     pub fn char_typed(&mut self, ch: char) {
-        if self.palette.is_some() {
+        if self.palette.is_some() || matches!(self.drag, Drag::Pending { .. }) {
             return;
         }
         if ch.is_control() || (ch == ' ' && !self.tsel.active(Instant::now())) {

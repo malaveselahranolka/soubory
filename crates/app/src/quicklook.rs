@@ -246,10 +246,13 @@ fn load(_app: &mut App, path: PathBuf, entry: Entry, index: (usize, usize)) {
             let _ = SetWindowTextW(ql.hwnd, PCWSTR(title.as_ptr()));
         }
         ql.generation += 1;
+        // The same file again (it changed): stay where the reader was, e.g. a growing log.
+        if ql.path != path {
+            ql.scroll = 0.0;
+        }
         ql.path = path.clone();
         ql.entry = entry.clone();
         ql.index = index;
-        ql.scroll = 0.0;
         ql.bmp = None;
         ql.previewing = false;
         ql.content = if entry.is_placeholder() {

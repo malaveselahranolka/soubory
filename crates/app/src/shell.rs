@@ -1450,6 +1450,7 @@ pub fn drag_out(app: &mut App, i: usize) {
         let Ok(dobj) = folder.GetUIObjectOf::<IDataObject>(app.hwnd, &children, None) else {
             return;
         };
+        app.drag = crate::app::Drag::Out;
         let _ = windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture();
         let _ = SHDoDragDrop(
             Some(app.hwnd),
