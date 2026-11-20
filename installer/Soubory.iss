@@ -402,9 +402,13 @@ begin
   RemoveDir(D);
 end;
 
+const
+  { CLSID_FileOpenDialog's per-user override (install-shim.ps1). }
+  OpenDialogKey = 'Software\Classes\CLSID\{DC1C5A9C-E88A-4dde-A5A1-60F82A20AEF7}';
+
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
-  Err, Kit: String;
+  Err, Kit, Cmd: String;
 begin
   if CurUninstallStep = usUninstall then begin
     if not RunFm('--restore-explorer', Err) then
@@ -417,6 +421,13 @@ begin
     Kit := ExpandConstant('{app}\shim');
     if DirExists(Kit) and not RunScript('uninstall-shim.ps1', '-InstallDir ' + PsQuote(Kit), Err) then
       Log('uninstall-shim.ps1 failed: ' + Err);
+    { Even when the script could not run (blocked PowerShell) or the folder is gone: an override
+      left pointing at a DLL nobody owns any more would break every app's Open dialog. }
+    if RegQueryStringValue(HKCU, OpenDialogKey + '\InprocServer32', '', Cmd)
+      and (Pos(Lowercase(Kit + '\'), Lowercase(Cmd)) = 1) then begin
+      Log('Open dialog override removed by setup: ' + Cmd);
+      RegDeleteKeyIncludingSubkeys(HKCU, OpenDialogKey);
+    end;
   end;
   if CurUninstallStep = usPostUninstall then
     DeleteData;

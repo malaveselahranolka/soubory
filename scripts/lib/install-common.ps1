@@ -32,7 +32,8 @@ function Get-InstallDir([string]$dir) {
     $full = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($dir, [ref]$provider, [ref]$drive)
     if ($provider.Name -ne 'FileSystem') { throw "Cesta $dir není složka na disku." }
     if ($full.IndexOfAny('[]'.ToCharArray()) -ge 0) { throw "Cesta $full nesmí obsahovat [ ]." }
-    $full
+    # One spelling per folder: the RunOnce cleanup is matched by it (Clear-DelCleanup).
+    if ($full.Length -gt 3) { $full.TrimEnd('\') } else { $full }
 }
 
 function Test-Marker([string]$dir, [string]$product) {

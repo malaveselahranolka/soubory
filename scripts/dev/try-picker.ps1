@@ -20,8 +20,13 @@ try {
         if (-not (Test-Path -LiteralPath $f)) { throw "Chybí $f. Nejdřív spusťte scripts\build-release.ps1 -SkipX86." }
     }
 
-    # The shim first: it does not depend on which fm runs.
-    & (Join-Path $root 'scripts\install-shim.ps1')
+    # The shim first: it does not depend on which fm runs. Into the folder that already holds ours
+    # (the installer's {app}\shim), else the scripts' default.
+    $openKey = 'HKCU:\Software\Classes\CLSID\{DC1C5A9C-E88A-4dde-A5A1-60F82A20AEF7}\InprocServer32'
+    $shimDir = Join-Path $env:LOCALAPPDATA 'Programs\fm\shim'
+    $cur = (Get-ItemProperty $openKey -ErrorAction SilentlyContinue).'(default)'
+    if ($cur -and (Get-Content -LiteralPath (Join-Path (Split-Path $cur) '.fm-install') -TotalCount 1 -ErrorAction SilentlyContinue) -eq 'fm-dialog-shim') { $shimDir = Split-Path $cur }
+    & (Join-Path $root 'scripts\install-shim.ps1') -InstallDir $shimDir
 
     # Dev builds under .fm-target never hold the door; only the resident (installed or not) matters.
     function Get-Resident { @(Get-Process fm -ErrorAction SilentlyContinue | Where-Object { $_.Path -notlike '*\.fm-target*' }) }
@@ -44,10 +49,10 @@ try {
     }
 
     # What the test needs, checked.
-    $installed = Join-Path $env:LOCALAPPDATA 'Programs\fm\shim\fm_dialog_shim.dll'
+    $installed = Join-Path $shimDir 'fm_dialog_shim.dll'
     $checks = [ordered]@{
         'Doplněk pro okno Otevřít je nový'       = (Test-Path -LiteralPath $installed) -and (Get-FileHash -LiteralPath $installed).Hash -eq (Get-FileHash -LiteralPath $dll).Hash
-        'Okno Otevřít vede na doplněk'           = (Get-ItemProperty 'HKCU:\Software\Classes\CLSID\{DC1C5A9C-E88A-4dde-A5A1-60F82A20AEF7}\InprocServer32' -ErrorAction SilentlyContinue).'(default)' -eq $installed
+        'Okno Otevřít vede na doplněk'           = (Get-ItemProperty $openKey -ErrorAction SilentlyContinue).'(default)' -eq $installed
         'Běží nové Soubory (dist\app\fm.exe)'    = [bool](Get-Current)
     }
     Write-Host ''
