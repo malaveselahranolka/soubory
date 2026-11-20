@@ -31,7 +31,7 @@ Nothing here has been tried by hand in daily use yet; see "Not verified" at the 
 | Recycle Bin: original location, date deleted, Restore, Empty | shell namespace folder | ✅ |
 | Network | shell namespace folder (empty while network discovery is off) | 🔶 |
 | Map / disconnect network drive | More menu → Windows' own dialogs | 🔶 |
-| Open folders, drives, This PC, Recycle Bin and Network instead of Explorer; Win+E; Explorer windows other apps start with `explorer.exe` | `scripts/set-default-fm.ps1` (HKCU, undo with `restore-explorer.ps1`) and the fm-dialogkit watcher; Control Panel stays Explorer's | ✅ sandbox |
+| Open folders, drives, This PC, Recycle Bin and Network instead of Explorer; Win+E; Explorer windows other apps start with `explorer.exe` | `fm --set-default` (HKCU, undo with `fm --restore-explorer`; the scripts `set-default-fm.ps1` / `restore-explorer.ps1` do the same) and the fm-dialogkit watcher; Control Panel stays Explorer's | ✅ sandbox |
 | "Show in folder" (browsers' downloads, Office, Start's "Open file location") selects the item in fm | fm windows join the shell's window list (IShellWindows) like Explorer's; scripts see them in `Shell.Application.Windows()` (LocationURL, Navigate, Quit) | ✅ (window already open; a cold start is the user's check) |
 | Explorer's command line: a folder, a file (opens its folder, selects it), `/select,`, `/root,`, `::{CLSID}`, `shell:Name`, `file:///`, `\\server` | `target.rs`; what fm cannot show goes to Explorer | ✅ (unit tests, end-to-end runs) |
 | Open in Explorer (escape hatch) | More menu, palette | 🔶 |

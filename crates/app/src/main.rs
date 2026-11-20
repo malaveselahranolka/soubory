@@ -2,11 +2,13 @@
 //! fm — a Finder-style file manager for Windows.
 //!
 //! `fm [place]` opens a window on a folder, file or shell place in Explorer's syntax (`target.rs`). `fm --render <out.png> [options]` paints one frame offscreen
-//! (visual tests; see `render.rs`).
+//! (visual tests; see `render.rs`). `fm --set-default` / `fm --restore-explorer` make fm the
+//! default for folders for the current user and undo it (`defaultfm.rs`; the installer runs them).
 
 mod app;
 mod batch;
 mod brand;
+mod defaultfm;
 mod droptarget;
 mod fsys;
 mod geom;
@@ -42,6 +44,12 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("--render") {
         std::process::exit(render::cli(&args[1..]));
+    }
+    // Before the hub: these never join or become the resident fm.
+    match args.first().map(String::as_str) {
+        Some("--set-default") => std::process::exit(defaultfm::cli(true)),
+        Some("--restore-explorer") => std::process::exit(defaultfm::cli(false)),
+        _ => {}
     }
     if args.iter().any(|a| a == "--quit") {
         win::ask_quit();

@@ -5,12 +5,13 @@
 ;
 ; Instaluje jen pro přihlášeného uživatele (bez práv správce) do %LOCALAPPDATA%\Programs\Soubory:
 ; fm.exe, zástupce v nabídce Start, App Paths ("fm" ve Win+R), spouštění po přihlášení
-; (fm --background) a odinstalaci v Nastavení > Aplikace. Úlohy nastavují PowerShell skripty ze
-; scripts\, nainstalované do {app}\setup:
-;   defaultfm   set-default-fm.ps1 / restore-explorer.ps1 (složky, disky, Win+E … v Souborech)
-;   dialogkit   install-dialogkit.ps1 / uninstall-dialogkit.ps1 (do {app}\dialogkit)
+; (fm --background) a odinstalaci v Nastavení > Aplikace. Úlohy:
+;   defaultfm   fm.exe --set-default / --restore-explorer (složky, disky, Win+E … v Souborech),
+;               bez PowerShellu, takže ho antivirus ani zásady blokující skripty nezastaví
+;   dialogkit   PowerShell skripty ze scripts\, nainstalované do {app}\setup:
+;               install-dialogkit.ps1 / uninstall-dialogkit.ps1 (do {app}\dialogkit)
 ; Každá instalace i aktualizace nastaví přesně to, co je zaškrtnuté. Odinstalace vrátí Průzkumník
-; a pak ověří, že na tento fm.exe už nevede žádné sloveso (když PowerShell nejde spustit, smaže je sama).
+; a pak ověří, že na tento fm.exe už nevede žádné sloveso (když fm.exe nejde spustit, smaže je sama).
 
 #ifndef AppVersion
   #define AppVersion "0.0.0-dev"
@@ -102,14 +103,17 @@ Name: "dialogkit"; Description: "{cm:TaskDialogkit}"; GroupDescription: "{cm:Gro
 Source: "..\dist\app\fm.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\dist\app\THIRD-PARTY-NOTICES.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LICENSE"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreversion
-Source: "..\scripts\set-default-fm.ps1"; DestDir: "{app}\setup"; Flags: ignoreversion
-Source: "..\scripts\restore-explorer.ps1"; DestDir: "{app}\setup"; Flags: ignoreversion
 Source: "..\scripts\install-dialogkit.ps1"; DestDir: "{app}\setup"; Flags: ignoreversion
 Source: "..\scripts\uninstall-dialogkit.ps1"; DestDir: "{app}\setup"; Flags: ignoreversion
 Source: "..\scripts\lib\install-common.ps1"; DestDir: "{app}\setup\lib"; Flags: ignoreversion
 ; install-dialogkit.ps1 copies these on to {app}\dialogkit; a hook DLL still loaded in some open
 ; dialog is set aside there instead of failing the install.
 Source: "..\dist\dialogkit\*"; DestDir: "{app}\setup\dialogkit"; Excludes: "*.pdb"; Flags: ignoreversion recursesubdirs
+
+[InstallDelete]
+; 0.1.0-beta.1 installed these; fm.exe --set-default / --restore-explorer replaced them.
+Type: files; Name: "{app}\setup\set-default-fm.ps1"
+Type: files; Name: "{app}\setup\restore-explorer.ps1"
 
 [Icons]
 Name: "{autoprograms}\Soubory"; Filename: "{app}\fm.exe"; Comment: "Správce souborů"
@@ -162,20 +166,15 @@ begin
   Result := '''' + S + '''';
 end;
 
-// Runs <Name> from the setup folder in a hidden 64-bit Windows PowerShell. Err: its error message.
-function RunScript(const Name, Args: String; var Err: String): Boolean;
+// Runs Exe hidden and logs its output (read as UTF-8). Err: its first stderr line, else why it failed.
+function RunCaptured(const Exe, Params, What: String; var Err: String): Boolean;
 var
   Code, I: Integer;
   Output: TExecOutput;
-  Params: String;
 begin
   Err := '';
-  Params := '-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "[Console]::OutputEncoding = [Text.Encoding]::UTF8; try { & '
-    + PsQuote(ExpandConstant('{app}\setup\') + Name) + ' ' + Args
-    + ' } catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }"';
-  Log('PowerShell: ' + Name + ' ' + Args);
-  Result := ExecAndCaptureOutput(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), Params,
-    ExpandConstant('{sys}'), SW_HIDE, ewWaitUntilTerminated, Code, Output);
+  Log(What);
+  Result := ExecAndCaptureOutput(Exe, Params, ExpandConstant('{sys}'), SW_HIDE, ewWaitUntilTerminated, Code, Output);
   for I := 0 to GetArrayLength(Output.StdOut) - 1 do
     Log('  ' + Output.StdOut[I]);
   for I := 0 to GetArrayLength(Output.StdErr) - 1 do begin
@@ -188,9 +187,25 @@ begin
   else if Code <> 0 then begin
     Result := False;
     if Err = '' then
-      Err := Format('PowerShell skončil s kódem %d.', [Code]);
+      Err := Format('%s skončil s kódem %d.', [ExtractFileName(Exe), Code]);
   end;
   Log(Format('  exit code %d', [Code]));
+end;
+
+// Runs <Name> from the setup folder in a hidden 64-bit Windows PowerShell.
+function RunScript(const Name, Args: String; var Err: String): Boolean;
+begin
+  Result := RunCaptured(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+    '-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "[Console]::OutputEncoding = [Text.Encoding]::UTF8; try { & '
+    + PsQuote(ExpandConstant('{app}\setup\') + Name) + ' ' + Args
+    + ' } catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }"',
+    'PowerShell: ' + Name + ' ' + Args, Err);
+end;
+
+// fm.exe --set-default or --restore-explorer.
+function RunFm(const Arg: String; var Err: String): Boolean;
+begin
+  Result := RunCaptured(ExpandConstant('{app}\fm.exe'), Arg, 'fm.exe ' + Arg, Err);
 end;
 
 procedure Report(const What, Err: String);
@@ -279,7 +294,7 @@ begin
   Kit := ExpandConstant('{app}\dialogkit');
   { An install by the old scripts (%LOCALAPPDATA%\Programs\fm): its dialogkit is uninstalled and its
     folder deleted; Run, App Paths and the Start menu shortcut were just rewritten for this one,
-    and set-default-fm.ps1 below moves the verbs over. }
+    and fm --set-default below moves the verbs over. }
   if HasMarker(OldDir('dialogkit'), 'fm-dialogkit') and not RunScript('uninstall-dialogkit.ps1', '-InstallDir ' + PsQuote(OldDir('dialogkit')), Err) then
     Report('DoUnkit', Err);
   if HasMarker(OldDir('app'), 'fm') then
@@ -287,10 +302,10 @@ begin
   RemoveDir(ExpandConstant('{localappdata}\Programs\fm'));
 
   if WizardIsTaskSelected('defaultfm') then begin
-    FailedDefault := not RunScript('set-default-fm.ps1', '-Exe ' + PsQuote(Exe), Err);
+    FailedDefault := not RunFm('--set-default', Err);
     if FailedDefault then
       Report('DoDefault', Err);
-  end else if not RunScript('restore-explorer.ps1', '-Quiet', Err) then
+  end else if not RunFm('--restore-explorer', Err) then
     Report('DoRestore', Err);
 
   if WizardIsTaskSelected('dialogkit') then begin
@@ -318,7 +333,7 @@ begin
     SuppressibleMsgBox(CustomMessage('UninstBusy'), mbError, MB_OK, IDOK);
 end;
 
-{ After restore-explorer.ps1, or instead of it when PowerShell cannot run: each verb that still
+{ After fm --restore-explorer, or instead of it when fm.exe cannot run: each verb that still
   opens this fm.exe is deleted, with the "open" default it needed, and so is the Redirect value. }
 procedure RemoveLeftoverVerbs(const Exe: String);
 var
@@ -373,8 +388,8 @@ var
   Err, Kit: String;
 begin
   if CurUninstallStep = usUninstall then begin
-    if not RunScript('restore-explorer.ps1', '-Quiet', Err) then
-      Log('restore-explorer.ps1 failed: ' + Err);
+    if not RunFm('--restore-explorer', Err) then
+      Log('fm --restore-explorer failed: ' + Err);
     RemoveLeftoverVerbs(ExpandConstant('{app}\fm.exe'));
     Kit := ExpandConstant('{app}\dialogkit');
     if DirExists(Kit) and not RunScript('uninstall-dialogkit.ps1', '-InstallDir ' + PsQuote(Kit), Err) then

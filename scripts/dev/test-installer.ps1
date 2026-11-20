@@ -160,8 +160,8 @@ Check 'dialogkit Run value' ((Val 'HKCU:\Software\Microsoft\Windows\CurrentVersi
 Check 'dialogkit running' ([bool](Get-Process fm-dialogkit -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$dir\*" }))
 Check 'fm resident' ([bool](Wait-For { Get-Process fm -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $exe } } 15 'resident fm'))
 $log = Get-Content -LiteralPath "$Out\$Name-silent-install.log" -Encoding UTF8
-$log | Where-Object { $_ -match 'PowerShell|  ' } | Select-Object -First 30
-Check 'script output decoded (Czech text in the setup log)' ([bool]($log | Where-Object { $_ -match 'Složky, disky' }))
+$log | Where-Object { $_ -match 'PowerShell|fm\.exe --|  ' } | Select-Object -First 30
+Check 'fm --set-default output decoded (Czech text in the setup log)' ([bool]($log | Where-Object { $_ -match 'Složky, disky' }))
 
 $spaced = Join-Path $env:TEMP 'Složka s mezerou'
 New-Item -ItemType Directory -Force $spaced | Out-Null
