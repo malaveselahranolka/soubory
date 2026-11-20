@@ -37,7 +37,10 @@ pub fn cli(args: &[String]) -> i32 {
         return glyph_sheet(&out, range, scale);
     }
     let loc = arg(args, "--path")
-        .map(|p| Loc::Folder(PathBuf::from(p)))
+        .map(|p| match p.strip_prefix("tag:").and_then(|n| n.parse::<usize>().ok()) {
+            Some(n) => Loc::Tag(n),
+            None => Loc::Folder(PathBuf::from(p)),
+        })
         .unwrap_or(Loc::Computer);
     let mut app = App::new(loc);
     app.offscreen = true;

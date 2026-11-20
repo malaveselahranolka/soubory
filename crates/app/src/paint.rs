@@ -37,6 +37,27 @@ fn with_alpha(c: Color, a: f32) -> Color {
 }
 
 /// Opaque colour of `top` composited over `bottom`.
+/// Finder's tag dots: overlapping circles ending at `right`, each ringed in `bg` so they read as
+/// separate chips. Returns the width taken.
+pub fn tag_dots(c: &mut Canvas, mask: u8, right: f32, cy: f32, bg: Color) -> f32 {
+    const D: f32 = 10.0;
+    const STEP: f32 = 6.0;
+    let n = mask.count_ones();
+    if n == 0 {
+        return 0.0;
+    }
+    let w = D + (n - 1) as f32 * STEP;
+    let mut x = right - w + D / 2.0;
+    for (i, (hex, _)) in crate::theme::TAGS.iter().enumerate() {
+        if mask & (1 << i) != 0 {
+            c.circle(x, cy, D / 2.0 + 1.25, bg);
+            c.circle(x, cy, D / 2.0, crate::theme::rgb(*hex));
+            x += STEP;
+        }
+    }
+    w
+}
+
 pub fn over(top: Color, bottom: Color) -> Color {
     Color {
         r: top.r * top.a + bottom.r * (1.0 - top.a),
@@ -665,6 +686,22 @@ fn list_view(app: &mut App, c: &mut Canvas, t: &Theme) {
                         );
                         nr = nr.cut_right(22.0);
                     }
+                    let mask = crate::tags::mask(&app.tab().path_of(i));
+                    if mask != 0 {
+                        let bg = if selected {
+                            sel_fill
+                        } else if i % 2 == 1 {
+                            over(t.stripe, t.card)
+                        } else {
+                            t.card
+                        };
+                        // Right after the name (Finder), pulled in when the name is truncated.
+                        let w = 10.0 + 6.0 * (mask.count_ones() as f32 - 1.0);
+                        let tw = c.measure(&e.name, Font::Body);
+                        let right = (nr.x + tw + 8.0 + w).min(nr.r() - 2.0);
+                        tag_dots(c, mask, right, r.cy(), bg);
+                        nr = Rect::new(nr.x, nr.y, (right - w - 6.0 - nr.x).max(0.0), nr.h);
+                    }
                     if renaming != Some(i) {
                         c.text(&e.name, nr, Font::Body, with_alpha(ink, dim), Align::Start);
                     }
@@ -848,6 +885,16 @@ fn icon_view(app: &mut App, c: &mut Canvas, t: &Theme) {
         let tw = c.measure(&e.name, Font::Small);
         let one_line = tw <= name.w - 8.0;
         let text_r = if one_line { name.top(18.0) } else { name };
+        let mask = crate::tags::mask(&path);
+        if mask != 0 {
+            // Finder puts the dots just before the name.
+            let right = if one_line {
+                name.cx() - tw / 2.0 - 5.0
+            } else {
+                name.x + 12.0 + 6.0 * (mask.count_ones() as f32 - 1.0)
+            };
+            tag_dots(c, mask, right, name.y + 9.0, t.card);
+        }
         if selected {
             let bw = (tw + 10.0).min(name.w);
             let cap = if one_line {

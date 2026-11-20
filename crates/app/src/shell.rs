@@ -415,11 +415,11 @@ pub fn item_menu(app: &mut App, pt: POINT) {
             C_FAVORITE => toggle_favorite(app, &paths[0]),
             C_TAG_CLEAR => {
                 crate::tags::clear(&paths);
-                app.invalidate();
+                tags_changed(app);
             }
             c if (C_TAG0..C_TAG0 + 7).contains(&c) => {
                 crate::tags::toggle(&paths, (c - C_TAG0) as usize);
-                app.invalidate();
+                tags_changed(app);
             }
             c if (SHELL_FIRST..=SHELL_LAST).contains(&c) => {
                 let off = c - SHELL_FIRST;
@@ -1154,6 +1154,14 @@ pub fn open_terminal(app: &mut App) {
 }
 
 /// Drag the selection out (to Explorer, a browser, the desktop…) with the shell's own data object.
+/// A tag location lists what carries the tag, so it reloads; elsewhere only the dots change.
+pub fn tags_changed(app: &mut App) {
+    if matches!(app.tab().loc, Loc::Tag(_)) {
+        app.reload(None);
+    }
+    app.invalidate();
+}
+
 /// The shell's drop target for dropping onto `path` (into a folder or drive, onto an app or a .zip).
 pub fn drop_target(hwnd: HWND, path: &Path) -> Option<IDropTarget> {
     let (folder, _owned, children) = parent_and_children(&[path.to_path_buf()])?;

@@ -189,6 +189,7 @@ impl IDropTarget_Impl for Target_Impl {
                     let paths = hdrop_paths(d);
                     if !paths.is_empty() {
                         crate::tags::add(&paths, *i);
+                        crate::shell::tags_changed(app);
                         let name = crate::theme::TAGS[*i].0;
                         app.note(&format!("Štítek {name}: {}", count(paths.len())));
                         result = DROPEFFECT_LINK;

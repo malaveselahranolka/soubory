@@ -328,7 +328,11 @@ impl App {
                 })
                 .collect()),
             Loc::Recents => Ok(crate::shell::recent_items(200)),
-            Loc::Tag(_) | Loc::Search { .. } => Ok(Vec::new()),
+            Loc::Tag(i) => Ok(crate::tags::items_with(*i)
+                .iter()
+                .filter_map(|p| fsys::entry_of(p))
+                .collect()),
+            Loc::Search { .. } => Ok(Vec::new()),
         };
         match res {
             Ok(mut v) => {

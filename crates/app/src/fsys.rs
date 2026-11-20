@@ -51,6 +51,35 @@ impl Entry {
     }
 }
 
+/// An entry for one path from its attributes alone (never opens the file, so cloud placeholders
+/// stay online-only). `None` when it no longer exists.
+pub fn entry_of(p: &Path) -> Option<Entry> {
+    use windows::Win32::Storage::FileSystem::{GetFileAttributesExW, GetFileExInfoStandard, WIN32_FILE_ATTRIBUTE_DATA};
+    let w = wide(&p.to_string_lossy());
+    let mut d = WIN32_FILE_ATTRIBUTE_DATA::default();
+    unsafe {
+        GetFileAttributesExW(
+            windows::core::PCWSTR(w.as_ptr()),
+            GetFileExInfoStandard,
+            (&mut d as *mut WIN32_FILE_ATTRIBUTE_DATA).cast(),
+        )
+        .ok()?;
+    }
+    let ft = |f: windows::Win32::Foundation::FILETIME| ((f.dwHighDateTime as u64) << 32) | f.dwLowDateTime as u64;
+    Some(Entry {
+        name: p
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| p.to_string_lossy().into_owned()),
+        is_dir: d.dwFileAttributes & 0x10 != 0,
+        size: ((d.nFileSizeHigh as u64) << 32) | d.nFileSizeLow as u64,
+        modified: ft(d.ftLastWriteTime),
+        created: ft(d.ftCreationTime),
+        attrs: d.dwFileAttributes,
+        full: Some(p.to_path_buf()),
+    })
+}
+
 pub fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain([0]).collect()
 }

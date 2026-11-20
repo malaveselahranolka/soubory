@@ -271,7 +271,8 @@ pub fn paint_columns(app: &mut App, c: &mut Canvas, t: &Theme) {
             let selected = app.tab().cols_left[k].sel.is(i);
             let dir = app.tab().cols_left[k].dir.clone();
             let idx = cached_icon(app, &dir, &e, Slot::Left(k, i));
-            column_row(app, c, t, r, &e, idx, if selected { Some((t.sel_inactive, t.ink)) } else { None });
+            let mask = crate::tags::mask(&e.path_in(&dir));
+            column_row(app, c, t, r, &e, idx, mask, if selected { Some((t.sel_inactive, t.ink)) } else { None });
         }
         c.vline(x + COL_W, b.y, b.b(), t.edge);
     }
@@ -297,7 +298,8 @@ pub fn paint_columns(app: &mut App, c: &mut Canvas, t: &Theme) {
         if renaming == Some(i) {
             e2.name.clear();
         }
-        column_row(app, c, t, r, &e2, idx, selected.then_some((sel_fill, sel_ink)));
+        let mask = crate::tags::mask(&e.path_in(&dir));
+        column_row(app, c, t, r, &e2, idx, mask, selected.then_some((sel_fill, sel_ink)));
     }
     c.vline(x + COL_W, b.y, b.b(), t.edge);
     // Right: the selected folder's contents, or a preview of the selected file.
@@ -312,7 +314,8 @@ pub fn paint_columns(app: &mut App, c: &mut Canvas, t: &Theme) {
             let p = app.tab().col_right.as_ref().unwrap();
             let (e, dir) = (p.entries[i].clone(), p.dir.clone());
             let idx = cached_icon(app, &dir, &e, Slot::Right(i));
-            column_row(app, c, t, r, &e, idx, None);
+            let mask = crate::tags::mask(&e.path_in(&dir));
+            column_row(app, c, t, r, &e, idx, mask, None);
         }
         c.vline(rx + COL_W, b.y, b.b(), t.edge);
     } else if let Some(f) = app.tab().sel.focus.filter(|&f| app.tab().sel.count() == 1 && app.tab().sel.is(f)) {
@@ -354,18 +357,23 @@ fn visible(scroll: f32, n: usize, h: f32) -> std::ops::Range<usize> {
     first.min(last)..last
 }
 
-fn column_row(app: &mut App, c: &mut Canvas, t: &Theme, r: Rect, e: &Entry, idx: i32, sel: Option<(Color, Color)>) {
+#[allow(clippy::too_many_arguments)]
+fn column_row(app: &mut App, c: &mut Canvas, t: &Theme, r: Rect, e: &Entry, idx: i32, tags: u8, sel: Option<(Color, Color)>) {
     let cap = r.inset(INSET / 2.0, 1.0);
-    let ink = match sel {
+    let (ink, bg) = match sel {
         Some((fill, ink)) => {
             c.round(cap, 6.0, fill);
-            ink
+            (ink, fill)
         }
-        None => t.ink,
+        None => (t.ink, t.card),
     };
     let dim = if e.is_hidden() { 0.55 } else { 1.0 };
     app.icons.draw(c, idx, Rect::new(cap.x + 6.0, r.cy() - 8.0, 16.0, 16.0), dim);
-    let name_r = Rect::new(cap.x + 28.0, r.y, cap.w - 28.0 - if e.is_dir { 20.0 } else { 6.0 }, r.h);
+    let mut name_r = Rect::new(cap.x + 28.0, r.y, cap.w - 28.0 - if e.is_dir { 20.0 } else { 6.0 }, r.h);
+    if tags != 0 {
+        let w = crate::paint::tag_dots(c, tags, name_r.r() - 2.0, r.cy(), bg);
+        name_r = name_r.cut_right(w + 6.0);
+    }
     c.text(&e.name, name_r, Font::Body, Color { a: ink.a * dim, ..ink }, Align::Start);
     if e.is_dir {
         c.glyph(crate::paint::g::RIGHT, Rect::new(cap.r() - 20.0, r.y, 16.0, r.h), 8, if sel.is_some() { ink } else { t.ink3 });
