@@ -441,8 +441,7 @@ pub fn paint_gallery(app: &mut App, c: &mut Canvas, t: &Theme) {
             None => match own {
                 Some(o) => crate::fileicons::draw(c, t, o, &e, r.center(48.0, 48.0), None, 1.0),
                 None => {
-                    let dir = app.tab().dir();
-                    let idx = app.icons.index(&dir, &e);
+                    let idx = crate::paint::ensure_icon(app, i);
                     app.icons.draw(c, idx, r.center(48.0, 48.0), 1.0);
                 }
             },
@@ -480,7 +479,11 @@ fn big_preview(app: &mut App, c: &mut Canvas, t: &Theme, r: Rect, path: &Path, e
                 return;
             }
             let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
-            let idx = if e.full.is_some() && e.is_dir { app.icons.index_for_path(path) } else { app.icons.index(&dir, e) };
+            let idx = match &e.shell {
+                Some(id) if e.full.is_none() => crate::shellns::icon_index(id),
+                _ if e.full.is_some() && e.is_dir => app.icons.index_for_path(path),
+                _ => app.icons.index(&dir, e),
+            };
             app.icons.draw(c, idx, r.center(s, s), 1.0);
         }
     }

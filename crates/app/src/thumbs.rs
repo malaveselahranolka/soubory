@@ -265,7 +265,9 @@ pub fn refresh() {
         let mut s = s.borrow_mut();
         let misses = s.slots.iter().filter(|(k, v)| !k.icon && matches!(v, Slot::Failed)).count();
         let keep = misses <= MAX_MISSES;
-        s.slots.retain(|k, v| matches!(v, Slot::Ready(..)) || (keep && !k.icon && matches!(v, Slot::Failed)));
+        // An online-only file's miss only means "not in the thumbnail cache yet" (Explorer may
+        // fill it); that lookup never downloads, so it is asked again.
+        s.slots.retain(|k, v| matches!(v, Slot::Ready(..)) || (keep && !k.icon && !k.placeholder && matches!(v, Slot::Failed)));
     });
 }
 

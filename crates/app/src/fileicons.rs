@@ -80,7 +80,8 @@ pub fn ext_of(e: &Entry) -> String {
 pub fn own_in(icons: &mut crate::icons::Icons, e: &Entry, dir: &Path, virtual_place: bool) -> Option<Own> {
     let o = own_at(e, dir, virtual_place);
     let drive = e.full.as_deref().is_some_and(|p| p.parent().is_none());
-    if o.is_none() && e.is_dir && !virtual_place && !drive && icons.index(dir, e) == icons.folder_index() {
+    let shell_only = e.full.is_none() && e.shell.is_some();
+    if o.is_none() && e.is_dir && !virtual_place && !drive && !shell_only && icons.index(dir, e) == icons.folder_index() {
         return Some(Own::Folder(None));
     }
     o
@@ -347,7 +348,9 @@ mod tests {
         assert_eq!(own(&dir("C:", 0), true), None);
         if let Some(crate::app::Loc::Shell { id, .. }) = crate::shellns::recycle_bin() {
             // A network computer or phone: a shell item with no file-system path.
-            assert_eq!(own(&Entry { shell: Some(id), ..dir("PC-KUCHYNE", 0) }, false), None);
+            let pc = Entry { shell: Some(id), ..dir("PC-KUCHYNE", 0) };
+            assert_eq!(own(&pc, false), None);
+            assert_eq!(own_in(&mut crate::icons::Icons::new(), &pc, Path::new(""), false), None);
         }
         let drive = Entry { full: Some(r"D:\".into()), ..dir("Data (D:)", 0) };
         assert_eq!(own(&drive, false), None);
