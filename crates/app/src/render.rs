@@ -58,6 +58,7 @@ pub fn cli(args: &[String]) -> i32 {
             "icons" => View::Icons,
             "columns" => View::Columns,
             "gallery" => View::Gallery,
+            "tiles" => View::Tiles,
             _ => View::List,
         };
     }

@@ -191,6 +191,13 @@ pub struct Grid {
     pub x0: f32,
 }
 
+/// Tiles view: tiles at least 240 wide, stretched to fill the row, 64 high.
+pub fn tile_grid(body: &Rect) -> Grid {
+    let usable = (body.w - 2.0 * 12.0).max(1.0);
+    let cols = ((usable / 240.0).floor() as usize).max(1);
+    Grid { cols, tile_w: (usable / cols as f32).min(420.0), tile_h: 64.0, x0: body.x + 12.0 }
+}
+
 pub fn grid(body: &Rect, icon: f32) -> Grid {
     let tile_w = (icon + 52.0).max(96.0);
     let tile_h = icon + 52.0;

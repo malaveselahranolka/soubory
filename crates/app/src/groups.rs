@@ -72,10 +72,10 @@ pub struct Ctx {
 /// Groups a tab's freshly loaded entries (icon and list views only). Call it before the tab's
 /// selection and icon cache are rebuilt for the new order.
 pub fn apply(t: &mut crate::app::Tab, folders_first: bool) {
-    use crate::app::{Loc, View};
+    use crate::app::Loc;
     t.groups.clear();
     // Drives in "Tento počítač" are not grouped (all would share one kind).
-    if t.group == GroupKey::None || !matches!(t.view, View::Icons | View::List) || matches!(t.loc, Loc::Computer) {
+    if t.group == GroupKey::None || !t.view.shows_groups() || matches!(t.loc, Loc::Computer) {
         return;
     }
     let ranked = matches!(t.loc, Loc::Recents) || (matches!(t.loc, Loc::Search { .. }) && t.by_rank);

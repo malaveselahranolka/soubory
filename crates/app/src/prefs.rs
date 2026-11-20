@@ -53,6 +53,7 @@ pub fn load(app: &mut App) {
                     "icons" => View::Icons,
                     "columns" => View::Columns,
                     "gallery" => View::Gallery,
+                    "tiles" => View::Tiles,
                     _ => View::List,
                 };
                 for t in &mut app.tabs {
@@ -130,6 +131,7 @@ pub fn save(app: &App) {
         View::List => "list",
         View::Columns => "columns",
         View::Gallery => "gallery",
+        View::Tiles => "tiles",
     };
     let mut s = format!(
         "show_hidden={}\nfolders_first={}\nicon_size={}\nsidebar_w={}\nsidebar={}\npreview={}\nview={view}\ngroup={}\n",

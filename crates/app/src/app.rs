@@ -57,6 +57,19 @@ pub enum View {
     List,
     Columns,
     Gallery,
+    /// Explorer's Tiles: a 48 px icon with name, kind and size beside it, in a grid.
+    Tiles,
+}
+
+impl View {
+    /// Views laid out as a grid of tiles (icons, tiles).
+    pub fn is_grid(self) -> bool {
+        matches!(self, View::Icons | View::Tiles)
+    }
+    /// Views that show Group by headers.
+    pub fn shows_groups(self) -> bool {
+        matches!(self, View::Icons | View::List | View::Tiles)
+    }
 }
 
 pub struct Tab {
@@ -624,7 +637,7 @@ impl App {
 
     /// Grouped by tags in a view that shows the groups (tags may have changed meanwhile).
     pub fn groups_by_tags(&self) -> bool {
-        self.tab().group == GroupKey::Tags && matches!(self.tab().view, View::Icons | View::List)
+        self.tab().group == GroupKey::Tags && self.tab().view.shows_groups()
     }
 
     fn after_tab_switch(&mut self) {
@@ -640,7 +653,7 @@ impl App {
 
     pub fn set_view(&mut self, v: View) {
         crate::win::end_rename(self);
-        let shows_groups = |t: &Tab| t.group != GroupKey::None && matches!(t.view, View::Icons | View::List);
+        let shows_groups = |t: &Tab| t.group != GroupKey::None && t.view.shows_groups();
         let before = shows_groups(self.tab());
         self.tab_mut().view = v;
         self.tab_mut().scroll = 0.0;
@@ -688,7 +701,7 @@ impl App {
             return;
         }
         self.tab_mut().group = key;
-        if !matches!(self.tab().view, View::Icons | View::List) {
+        if !self.tab().view.shows_groups() {
             // Columns and gallery show no groups; the key applies when the view comes back.
             if key != GroupKey::None {
                 self.note("Skupiny se zobrazují v ikonách a v seznamu");
@@ -740,13 +753,13 @@ impl App {
     pub fn shown_groups(&self) -> &[groups::Group] {
         let t = self.tab();
         let whole = t.groups.last().is_some_and(|g| g.start + g.len == t.entries.len());
-        if matches!(t.view, View::Icons | View::List) && whole { &t.groups } else { &[] }
+        if t.view.shows_groups() && whole { &t.groups } else { &[] }
     }
 
     /// Vertical layout of the icon or list view (rows of items under group headers).
     pub fn geo(&self) -> groups::Geo<'_> {
         let (groups, n) = (self.shown_groups(), self.tab().entries.len());
-        if self.tab().view == View::Icons {
+        if self.tab().view.is_grid() {
             let g = self.grid();
             groups::Geo { groups, n, cols: g.cols, item_h: g.tile_h, header_h: layout::GROUP_ICONS_H }
         } else {
@@ -756,7 +769,7 @@ impl App {
 
     /// Screen y of content y 0 (the first header or item).
     fn content_y0(&self) -> f32 {
-        let pad = if self.tab().view == View::Icons { 8.0 } else { 4.0 };
+        let pad = if self.tab().view.is_grid() { 8.0 } else { 4.0 };
         self.lay.body.y + pad - self.tab().scroll
     }
 
@@ -819,7 +832,11 @@ impl App {
     }
 
     pub fn grid(&self) -> layout::Grid {
-        layout::grid(&self.lay.body, self.prefs.icon_size)
+        if self.tab().view == View::Tiles {
+            layout::tile_grid(&self.lay.body)
+        } else {
+            layout::grid(&self.lay.body, self.prefs.icon_size)
+        }
     }
 
     pub fn tile_rect(&self, i: usize) -> Rect {
@@ -831,7 +848,7 @@ impl App {
     pub fn content_height(&self) -> f32 {
         let n = self.tab().entries.len();
         match self.tab().view {
-            View::Icons => 16.0 + self.geo().height(),
+            View::Icons | View::Tiles => 16.0 + self.geo().height(),
             View::Gallery => crate::views::strip_width(self),
             View::List => self.geo().height() + 8.0,
             View::Columns => n as f32 * layout::ROW_H + 8.0,
@@ -854,7 +871,7 @@ impl App {
 
     pub fn item_rect(&self, i: usize) -> Rect {
         match self.tab().view {
-            View::Icons => self.tile_rect(i),
+            View::Icons | View::Tiles => self.tile_rect(i),
             View::Gallery => crate::views::strip_tile(self, i),
             _ => self.row_rect(i),
         }
@@ -898,13 +915,14 @@ impl App {
             return None;
         }
         match t.view {
-            View::Icons => {
+            View::Icons | View::Tiles => {
                 let g = self.grid();
                 if x < g.x0 {
                     return None;
                 }
                 let c = ((x - g.x0) / g.tile_w) as usize;
                 match self.geo().at(y - self.content_y0(), c) {
+                    Spot::Item(i) if t.view == View::Tiles => self.tile_rect(i).inset(4.0, 3.0).contains(x, y).then_some(i),
                     Spot::Item(i) => crate::paint::tile_hit(self, i, x, y).then_some(i),
                     _ => None,
                 }
@@ -932,7 +950,7 @@ impl App {
 
     pub fn page_rows(&self) -> isize {
         match self.tab().view {
-            View::Icons => {
+            View::Icons | View::Tiles => {
                 let g = self.grid();
                 ((self.lay.body.h / g.tile_h) as isize).max(1) * g.cols as isize
             }
@@ -1367,7 +1385,7 @@ impl App {
         self.kb = true;
         let n = self.tab().entries.len();
         let view = self.tab().view;
-        let cols = if view == View::Icons { self.grid().cols as isize } else { 1 };
+        let cols = if view.is_grid() { self.grid().cols as isize } else { 1 };
         let mv = |app: &mut App, d: isize| {
             app.tab_mut().sel.move_by(d, shift, ctrl && !shift);
             app.reveal_focus();
@@ -1391,7 +1409,7 @@ impl App {
                 let down = vk == VK_DOWN;
                 // A grouped grid starts each group on a new row: keep the column across headers.
                 let d = match self.tab().sel.focus {
-                    Some(f) if view == View::Icons && !self.shown_groups().is_empty() => {
+                    Some(f) if view.is_grid() && !self.shown_groups().is_empty() => {
                         self.geo().vertical(f, down) as isize - f as isize
                     }
                     _ if down => cols,
@@ -1480,6 +1498,7 @@ impl App {
             (VK_2, true, false, false) => self.set_view(View::List),
             (VK_3, true, false, false) => self.set_view(View::Columns),
             (VK_4, true, false, false) => self.set_view(View::Gallery),
+            (VK_5, true, false, false) => self.set_view(View::Tiles),
             (VK_OEM_PERIOD, true, true, false) => self.toggle_hidden(),
             (VK_F, true, false, false)
             | (VK_E, true, false, false)

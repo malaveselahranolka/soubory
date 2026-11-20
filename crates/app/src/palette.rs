@@ -51,6 +51,7 @@ const COMMANDS: &[(&str, &str, Act)] = &[
     ("Zobrazit jako seznam", "Ctrl+2", Act::Own(cmd::VIEW0 + 1)),
     ("Zobrazit ve sloupcích", "Ctrl+3", Act::Own(cmd::VIEW0 + 2)),
     ("Zobrazit jako galerii", "Ctrl+4", Act::Own(cmd::VIEW0 + 3)),
+    ("Zobrazit jako dlaždice", "Ctrl+5", Act::Own(cmd::VIEW0 + 4)),
     ("Řadit podle názvu", "", Act::Own(cmd::SORT0)),
     ("Řadit podle data změny", "", Act::Own(cmd::SORT0 + 1)),
     ("Řadit podle data vytvoření", "", Act::Own(cmd::SORT0 + 2)),

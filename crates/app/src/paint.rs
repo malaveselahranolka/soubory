@@ -94,6 +94,7 @@ pub fn paint(app: &mut App, c: &mut Canvas) {
         View::Columns => crate::views::paint_columns(app, c, &t),
         View::Gallery => crate::views::paint_gallery(app, c, &t),
         View::List => list_view(app, c, &t),
+        View::Tiles => tiles_view(app, c, &t),
     }
     band(app, c, &t);
     if let Some(r) = crate::win::rename_rect(app) {
@@ -164,6 +165,8 @@ fn toolbar(app: &App, c: &mut Canvas, t: &Theme) {
         View::List => 1,
         View::Columns => 2,
         View::Gallery => 3,
+        // Tiles has no segment (Finder's four); it lives in the View menu and Ctrl+5.
+        View::Tiles => usize::MAX,
     };
     for (k, (r, gl)) in l
         .views
@@ -866,7 +869,7 @@ fn group_headers(app: &App, c: &mut Canvas, t: &Theme) {
 
 fn group_header(app: &App, c: &mut Canvas, t: &Theme, r: Rect, label: &str, count: usize) {
     // Aligned with the items: the list's icon column, or the icon grid's left edge.
-    let (left, right) = if app.tab().view == View::Icons {
+    let (left, right) = if app.tab().view.is_grid() {
         let g = app.grid();
         (g.x0 + 8.0, g.x0 + g.cols as f32 * g.tile_w - 8.0)
     } else {
@@ -960,6 +963,77 @@ fn empty_state(app: &App, c: &mut Canvas, t: &Theme, b: Rect) {
         t.ink3,
         Align::Center,
     );
+}
+
+// ---- tiles view ---------------------------------------------------------------------------------------
+
+/// A tile's icon square and its name line (the rename field goes there).
+pub fn tiles_parts(app: &App, i: usize) -> (Rect, Rect) {
+    let r = app.tile_rect(i).inset(4.0, 3.0);
+    let icon = Rect::new(r.x + 8.0, r.cy() - 24.0, 48.0, 48.0);
+    let x = icon.r() + 10.0;
+    (icon, Rect::new(x, r.cy() - 27.0, (r.r() - 10.0 - x).max(0.0), 18.0))
+}
+
+fn tiles_view(app: &mut App, c: &mut Canvas, t: &Theme) {
+    let n = app.tab().entries.len();
+    if n == 0 {
+        empty_state(app, c, t, app.lay.body);
+        return;
+    }
+    let (sel_fill, sel_ink) = sel_colors(app, t);
+    let renaming = crate::win::renaming_index(app);
+    let under_pin = pin_clip(app, c);
+    for i in app.visible_items() {
+        let r = app.tile_rect(i).inset(4.0, 3.0);
+        let selected = app.tab().sel.is(i);
+        if selected {
+            c.round(r, 8.0, sel_fill);
+        } else if app.kb && app.tab().sel.focus == Some(i) && app.focus == Focus::Content {
+            c.round_stroke(r, 8.0, t.focus, 1.5);
+        }
+        let e = app.tab().entries[i].clone();
+        let dim = if e.is_hidden() { 0.55 } else { 1.0 };
+        let (icon, name) = tiles_parts(app, i);
+        let idx = ensure_icon(app, i);
+        let path = app.tab().path_of(i);
+        match crate::thumbs::image(app, c, &path, e.modified, e.attrs, icon.w) {
+            Some((bmp, w, h, is_thumb)) => {
+                let is_thumb = is_thumb && !e.is_dir;
+                let k = (icon.w / w).min(icon.h / h);
+                let k = if is_thumb { k } else { k.min(1.0).max(icon.w / w.max(h)) };
+                let dst = icon.center(w * k, h * k).snap(c.scale);
+                c.bitmap(&bmp, dst, dim);
+                if is_thumb {
+                    c.round_stroke(dst, 2.0, t.edge, 0.0);
+                }
+            }
+            None => app.icons.draw(c, idx, icon, dim),
+        }
+        let (ink, ink2) = if selected { (sel_ink, sel_ink) } else { (t.ink, t.ink2) };
+        let mut name_r = name;
+        let mask = crate::tags::mask(&path);
+        if mask != 0 {
+            let w = 10.0 + 6.0 * (mask.count_ones() as f32 - 1.0);
+            let tw = c.measure(&e.name, Font::Body);
+            let right = (name.x + tw + 8.0 + w).min(name.r() - 2.0);
+            tag_dots(c, mask, right, name.cy(), if selected { sel_fill } else { t.card });
+            name_r = Rect::new(name.x, name.y, (right - w - 6.0 - name.x).max(0.0), name.h);
+        }
+        if renaming != Some(i) {
+            c.text(&e.name, name_r, Font::Body, with_alpha(ink, dim), Align::Start);
+        }
+        let line = |k: f32| Rect::new(name.x, name.y + 18.0 * k, name.w, 18.0);
+        c.text(&fsys::kind_name(&e), line(1.0), Font::Small, with_alpha(ink2, dim), Align::Start);
+        // Files show their size; folders theirs once the index has reported it.
+        if !e.is_dir || e.size > 0 {
+            c.text(&fsys::format_size(e.size), line(2.0), Font::Small, with_alpha(ink2, dim * 0.8), Align::Start);
+        }
+    }
+    if under_pin {
+        c.pop_clip();
+    }
+    group_headers(app, c, t);
 }
 
 // ---- icon view ----------------------------------------------------------------------------------------

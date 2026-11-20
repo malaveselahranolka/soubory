@@ -51,7 +51,7 @@ pub(crate) const C_PREVIEW: u32 = OWN + 11;
 pub(crate) const C_SIDEBAR: u32 = OWN + 12;
 pub(crate) const C_GOTO: u32 = OWN + 13;
 pub(crate) const C_NEW_WINDOW: u32 = OWN + 14;
-pub(crate) const C_VIEW0: u32 = OWN + 20; // +0..3
+pub(crate) const C_VIEW0: u32 = OWN + 20; // +0..4: icons, list, columns, gallery, tiles
 pub(crate) const C_SORT0: u32 = OWN + 30; // +0..4
 pub(crate) const C_TAG0: u32 = OWN + 40; // +0..6
 pub(crate) const C_TAG_CLEAR: u32 = OWN + 47;
@@ -605,6 +605,7 @@ fn view_items(app: &App, m: HMENU) {
         ("Seznam\tCtrl+2", View::List),
         ("Sloupce\tCtrl+3", View::Columns),
         ("Galerie\tCtrl+4", View::Gallery),
+        ("Dlaždice\tCtrl+5", View::Tiles),
     ]
     .iter()
     .enumerate()
@@ -815,8 +816,8 @@ fn own_command(app: &mut App, cmd: u32) {
             app.tab_mut().sel.select_all();
             app.invalidate();
         }
-        c if (C_VIEW0..C_VIEW0 + 4).contains(&c) => app.set_view(
-            [View::Icons, View::List, View::Columns, View::Gallery][(c - C_VIEW0) as usize],
+        c if (C_VIEW0..C_VIEW0 + 5).contains(&c) => app.set_view(
+            [View::Icons, View::List, View::Columns, View::Gallery, View::Tiles][(c - C_VIEW0) as usize],
         ),
         c if (C_GROUP0..C_GROUP0 + crate::groups::KEYS.len() as u32).contains(&c) => {
             app.set_group(crate::groups::KEYS[(c - C_GROUP0) as usize].0);

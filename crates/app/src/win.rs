@@ -538,6 +538,7 @@ fn dev_flags(app: &mut App) {
             "icons" => crate::app::View::Icons,
             "columns" => crate::app::View::Columns,
             "gallery" => crate::app::View::Gallery,
+            "tiles" => crate::app::View::Tiles,
             _ => crate::app::View::List,
         };
         app.set_view(view);
@@ -682,6 +683,9 @@ fn dev_keys(app: &mut App, script: &str, out: Option<String>) {
                 let (x, y) = if app.tab().view == crate::app::View::Icons {
                     let (icon, _) = crate::paint::tile_parts(app, i);
                     (icon.cx(), icon.cy())
+                } else if app.tab().view == crate::app::View::Tiles {
+                    let (_, name) = crate::paint::tiles_parts(app, i);
+                    (name.cx(), name.cy())
                 } else {
                     (r.x + 40.0, r.cy())
                 };
@@ -1114,6 +1118,10 @@ fn edit_rect(app: &App, kind: EditKind, index: usize) -> crate::geom::Rect {
             crate::app::View::Icons => {
                 let (_, name) = paint::tile_parts(app, index);
                 Rect::new(name.x, name.y, name.w, 18.0)
+            }
+            crate::app::View::Tiles => {
+                let (_, name) = paint::tiles_parts(app, index);
+                Rect::new(name.x - 3.0, name.y, name.w + 3.0, 18.0)
             }
             _ => {
                 let r = app.row_rect(index);
