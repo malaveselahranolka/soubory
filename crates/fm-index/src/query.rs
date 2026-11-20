@@ -9,9 +9,12 @@ use memchr::memmem::Finder;
 use rayon::prelude::*;
 
 use crate::arena::{
-    EXT_OVERFLOW, EntryId, FLAG_ALIVE, FLAG_EFFECTIVE_HIDDEN, Index, NONE, extract_ext,
+    EXT_OVERFLOW, EntryId, FLAG_ALIVE, FLAG_EFFECTIVE_HIDDEN, Index, NONE, eq_case_insensitive,
+    extract_ext,
 };
-use crate::rank::{RankEntry, make_filter_only_rank, rank_top_limit, score_entry};
+use crate::rank::{
+    RankEntry, make_filter_only_rank, rank_top_limit, rank_top_limit_entries, score_entry,
+};
 
 const SCAN_CHUNK_SIZE: usize = 4096;
 
@@ -355,6 +358,13 @@ impl WorkerAcc {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ScopedHit {
+    pub(crate) id: EntryId,
+    pub(crate) tier: u8,
+    pub(crate) name_chars: u16,
+}
+
 impl Index {
     /// Searches the index using `q` and `opts`, returning `None` if cancelled via `cancel`.
     #[must_use]
@@ -371,16 +381,107 @@ impl Index {
             ));
         }
 
+        let mut ranked = self.collect_full_scan_matches(q, opts, None, cancel)?;
+        if cancel.is_cancelled() {
+            return None;
+        }
+
+        let total_matches = ranked.len();
+        let all_matches: Vec<EntryId> = ranked.iter().map(|e| e.id).collect();
+        let ids = rank_top_limit(self, &mut ranked, opts.limit);
+        if cancel.is_cancelled() {
+            return None;
+        }
+
+        Some(Results {
+            ids,
+            total_matches,
+            instance_id: self.instance_id,
+            generation: self.index_gen,
+            query: q.clone(),
+            include_hidden: opts.include_hidden,
+            all_matches,
+        })
+    }
+
+    pub(crate) fn search_scoped(
+        &self,
+        q: &Query,
+        scope: Option<&str>,
+        opts: &SearchOptions,
+        cancel: &CancelToken,
+    ) -> Option<Vec<ScopedHit>> {
+        if cancel.is_cancelled() {
+            return None;
+        }
+        if q.is_empty() || q.impossible || opts.limit == 0 {
+            return Some(Vec::new());
+        }
+
+        let mut ranked = if let Some(raw_scope) = scope {
+            let norm_scope = normalize_scope_path(raw_scope);
+            let mut all_roots_under = !self.roots.is_empty();
+            let mut seeds: Vec<(EntryId, bool)> = Vec::new();
+            for &rid in &self.roots {
+                if !self.is_alive(rid) {
+                    continue;
+                }
+                if path_strictly_under(self.display_str_unchecked(rid), &norm_scope) {
+                    seeds.push((rid, true));
+                } else {
+                    all_roots_under = false;
+                }
+            }
+            if all_roots_under && !seeds.is_empty() {
+                self.collect_full_scan_matches(q, opts, None, cancel)?
+            } else if let Some(scope_id) = self.lookup(&norm_scope) {
+                if self.roots.len() == 1 && scope_id == self.roots[0] && seeds.is_empty() {
+                    self.collect_full_scan_matches(q, opts, Some(scope_id), cancel)?
+                } else {
+                    seeds.push((scope_id, false));
+                    let sub_ids =
+                        self.collect_subtree_candidates(&seeds, opts.include_hidden, cancel)?;
+                    self.evaluate_candidate_slice(&sub_ids, false, q, opts, cancel)?
+                }
+            } else if !seeds.is_empty() {
+                let sub_ids =
+                    self.collect_subtree_candidates(&seeds, opts.include_hidden, cancel)?;
+                self.evaluate_candidate_slice(&sub_ids, false, q, opts, cancel)?
+            } else {
+                return Some(Vec::new());
+            }
+        } else {
+            self.collect_full_scan_matches(q, opts, None, cancel)?
+        };
+
+        if cancel.is_cancelled() {
+            return None;
+        }
+        let top = rank_top_limit_entries(self, &mut ranked, opts.limit);
+        if cancel.is_cancelled() {
+            return None;
+        }
+        Some(
+            top.iter()
+                .map(|r| ScopedHit {
+                    id: r.id,
+                    tier: r.tier,
+                    name_chars: r.name_chars,
+                })
+                .collect(),
+        )
+    }
+
+    fn collect_full_scan_matches(
+        &self,
+        q: &Query,
+        opts: &SearchOptions,
+        exclude_id: Option<EntryId>,
+        cancel: &CancelToken,
+    ) -> Option<Vec<RankEntry>> {
         let ext_groups = match self.prepare_ext_groups(q) {
             Some(groups) => groups,
-            None => {
-                return Some(Results::empty(
-                    self.instance_id,
-                    self.index_gen,
-                    q.clone(),
-                    opts.include_hidden,
-                ));
-            }
+            None => return Some(Vec::new()),
         };
 
         let mut ordered_terms: Vec<&str> = q.name_terms.iter().map(String::as_str).collect();
@@ -425,6 +526,9 @@ impl Index {
                 let end = (start + SCAN_CHUNK_SIZE).min(total_slots);
                 for raw_id in start..end {
                     let id = raw_id as EntryId;
+                    if exclude_id == Some(id) {
+                        continue;
+                    }
                     let flags = self.flags[raw_id];
                     if (flags & FLAG_ALIVE) == 0 {
                         continue;
@@ -479,30 +583,141 @@ impl Index {
                 Ok(a)
             });
 
-        let mut ranked = match collected {
-            Ok(acc) => acc.entries,
-            Err(()) => return None,
+        collected.ok().map(|acc| acc.entries)
+    }
+
+    fn collect_subtree_candidates(
+        &self,
+        seeds: &[(EntryId, bool)],
+        include_hidden: bool,
+        cancel: &CancelToken,
+    ) -> Option<Vec<EntryId>> {
+        let mut out = Vec::new();
+        let mut stack: Vec<EntryId> = Vec::new();
+        for &(seed, include_seed) in seeds {
+            if !self.is_alive(seed) {
+                continue;
+            }
+            if !include_hidden && (self.flags[seed as usize] & FLAG_EFFECTIVE_HIDDEN) != 0 {
+                continue;
+            }
+            if include_seed {
+                out.push(seed);
+            }
+            let mut child = self.first_child[seed as usize];
+            while child != NONE {
+                stack.push(child);
+                child = self.next_sibling[child as usize];
+            }
+        }
+        let mut steps = 0usize;
+        while let Some(node) = stack.pop() {
+            steps += 1;
+            if (steps & 0xFFF) == 0 && cancel.is_cancelled() {
+                return None;
+            }
+            let ni = node as usize;
+            let f = self.flags[ni];
+            if (f & FLAG_ALIVE) == 0 {
+                continue;
+            }
+            if !include_hidden && (f & FLAG_EFFECTIVE_HIDDEN) != 0 {
+                continue;
+            }
+            out.push(node);
+            let mut child = self.first_child[ni];
+            while child != NONE {
+                stack.push(child);
+                child = self.next_sibling[child as usize];
+            }
+        }
+        Some(out)
+    }
+
+    fn evaluate_candidate_slice(
+        &self,
+        candidates: &[EntryId],
+        filter_hidden: bool,
+        q: &Query,
+        _opts: &SearchOptions,
+        cancel: &CancelToken,
+    ) -> Option<Vec<RankEntry>> {
+        let ext_groups = match self.prepare_ext_groups(q) {
+            Some(groups) => groups,
+            None => return Some(Vec::new()),
         };
-        if cancel.is_cancelled() {
-            return None;
-        }
 
-        let total_matches = ranked.len();
-        let all_matches: Vec<EntryId> = ranked.iter().map(|e| e.id).collect();
-        let ids = rank_top_limit(self, &mut ranked, opts.limit);
-        if cancel.is_cancelled() {
-            return None;
-        }
+        let mut ordered_terms: Vec<&str> = q.name_terms.iter().map(String::as_str).collect();
+        ordered_terms.sort_by_key(|a| std::cmp::Reverse(a.len()));
+        let finders: Vec<Finder<'_>> = ordered_terms
+            .iter()
+            .map(|t| Finder::new(t.as_bytes()))
+            .collect();
+        let term_lens: Vec<usize> = ordered_terms.iter().map(|t| t.len()).collect();
+        let lazy_path_checks: Vec<PreparedPathCheck<'_>> = q
+            .path_terms
+            .iter()
+            .map(|p| {
+                if p.contains('\\') {
+                    PreparedPathCheck::WithSlash(p.as_str())
+                } else {
+                    PreparedPathCheck::NoSlash(Box::new(Finder::new(p.as_bytes())))
+                }
+            })
+            .collect();
 
-        Some(Results {
-            ids,
-            total_matches,
-            instance_id: self.instance_id,
-            generation: self.index_gen,
-            query: q.clone(),
-            include_hidden: opts.include_hidden,
-            all_matches,
-        })
+        if candidates.len() <= 2048 {
+            let mut acc = WorkerAcc::new();
+            for &id in candidates {
+                if let Some(entry) = self.eval_refine_candidate(
+                    id,
+                    filter_hidden,
+                    q,
+                    &ext_groups,
+                    &finders,
+                    &term_lens,
+                    &lazy_path_checks,
+                    &mut acc.path_buf,
+                ) {
+                    acc.entries.push(entry);
+                }
+            }
+            Some(acc.entries)
+        } else {
+            let collected = candidates
+                .par_chunks(2048)
+                .try_fold(WorkerAcc::new, |mut acc, chunk| {
+                    if cancel.is_cancelled() {
+                        return Err(());
+                    }
+                    for &id in chunk {
+                        if let Some(entry) = self.eval_refine_candidate(
+                            id,
+                            filter_hidden,
+                            q,
+                            &ext_groups,
+                            &finders,
+                            &term_lens,
+                            &lazy_path_checks,
+                            &mut acc.path_buf,
+                        ) {
+                            acc.entries.push(entry);
+                        }
+                    }
+                    Ok(acc)
+                })
+                .try_reduce(WorkerAcc::new, |mut a, mut b| {
+                    if cancel.is_cancelled() {
+                        return Err(());
+                    }
+                    if a.entries.len() < b.entries.len() {
+                        std::mem::swap(&mut a.entries, &mut b.entries);
+                    }
+                    a.entries.extend_from_slice(&b.entries);
+                    Ok(a)
+                });
+            collected.ok().map(|acc| acc.entries)
+        }
     }
 
     /// Refines `prev` when `q` narrows `prev`'s query on an unchanged index generation.
@@ -538,94 +753,9 @@ impl Index {
             return self.search(q, opts, cancel);
         }
 
-        let ext_groups = match self.prepare_ext_groups(q) {
-            Some(groups) => groups,
-            None => {
-                return Some(Results::empty(
-                    self.instance_id,
-                    self.index_gen,
-                    q.clone(),
-                    opts.include_hidden,
-                ));
-            }
-        };
-
-        let mut ordered_terms: Vec<&str> = q.name_terms.iter().map(String::as_str).collect();
-        ordered_terms.sort_by_key(|a| std::cmp::Reverse(a.len()));
-        let finders: Vec<Finder<'_>> = ordered_terms
-            .iter()
-            .map(|t| Finder::new(t.as_bytes()))
-            .collect();
-        let term_lens: Vec<usize> = ordered_terms.iter().map(|t| t.len()).collect();
-        let lazy_path_checks: Vec<PreparedPathCheck<'_>> = q
-            .path_terms
-            .iter()
-            .map(|p| {
-                if p.contains('\\') {
-                    PreparedPathCheck::WithSlash(p.as_str())
-                } else {
-                    PreparedPathCheck::NoSlash(Box::new(Finder::new(p.as_bytes())))
-                }
-            })
-            .collect();
         let filter_hidden = prev.include_hidden && !opts.include_hidden;
-
-        let mut ranked = if prev.all_matches.len() <= 2048 {
-            let mut acc = WorkerAcc::new();
-            for &id in &prev.all_matches {
-                if let Some(entry) = self.eval_refine_candidate(
-                    id,
-                    filter_hidden,
-                    q,
-                    &ext_groups,
-                    &finders,
-                    &term_lens,
-                    &lazy_path_checks,
-                    &mut acc.path_buf,
-                ) {
-                    acc.entries.push(entry);
-                }
-            }
-            acc.entries
-        } else {
-            let collected = prev
-                .all_matches
-                .par_chunks(2048)
-                .try_fold(WorkerAcc::new, |mut acc, chunk| {
-                    if cancel.is_cancelled() {
-                        return Err(());
-                    }
-                    for &id in chunk {
-                        if let Some(entry) = self.eval_refine_candidate(
-                            id,
-                            filter_hidden,
-                            q,
-                            &ext_groups,
-                            &finders,
-                            &term_lens,
-                            &lazy_path_checks,
-                            &mut acc.path_buf,
-                        ) {
-                            acc.entries.push(entry);
-                        }
-                    }
-                    Ok(acc)
-                })
-                .try_reduce(WorkerAcc::new, |mut a, mut b| {
-                    if cancel.is_cancelled() {
-                        return Err(());
-                    }
-                    if a.entries.len() < b.entries.len() {
-                        std::mem::swap(&mut a.entries, &mut b.entries);
-                    }
-                    a.entries.extend_from_slice(&b.entries);
-                    Ok(a)
-                });
-            match collected {
-                Ok(acc) => acc.entries,
-                Err(()) => return None,
-            }
-        };
+        let mut ranked =
+            self.evaluate_candidate_slice(&prev.all_matches, filter_hidden, q, opts, cancel)?;
 
         if cancel.is_cancelled() {
             return None;
@@ -927,4 +1057,45 @@ enum PrecomputedPathTerm<'a> {
         dir_full_match: Vec<bool>,
         dir_ends_left: Vec<bool>,
     },
+}
+
+fn normalize_scope_path(raw: &str) -> String {
+    let mut s = raw.replace('/', "\\");
+    if let Some(rest) = s.strip_prefix("\\\\?\\UNC\\") {
+        s = format!("\\\\{rest}");
+    } else if let Some(rest) = s.strip_prefix("\\\\?\\") {
+        s = rest.to_owned();
+    }
+    while s.len() > 1 && s.ends_with('\\') {
+        let bytes = s.as_bytes();
+        if bytes.len() == 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+            break;
+        }
+        s.pop();
+    }
+    s
+}
+
+fn path_strictly_under(path: &str, scope_norm: &str) -> bool {
+    if scope_norm.is_empty() {
+        return false;
+    }
+    if path.starts_with("\\\\") != scope_norm.starts_with("\\\\") {
+        return false;
+    }
+    if !path.starts_with("\\\\") && path.starts_with('\\') != scope_norm.starts_with('\\') {
+        return false;
+    }
+    let p_segs: Vec<&str> = path.split('\\').filter(|s| !s.is_empty()).collect();
+    let s_segs: Vec<&str> = scope_norm.split('\\').filter(|s| !s.is_empty()).collect();
+    if s_segs.is_empty() && scope_norm == "\\" {
+        return !p_segs.is_empty();
+    }
+    if p_segs.len() <= s_segs.len() {
+        return false;
+    }
+    p_segs[..s_segs.len()]
+        .iter()
+        .zip(&s_segs)
+        .all(|(p, s)| eq_case_insensitive(p, s))
 }

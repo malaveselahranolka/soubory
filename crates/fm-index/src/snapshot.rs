@@ -12,7 +12,7 @@ use crate::arena::{
 };
 
 const MAGIC: [u8; 4] = *b"FMIX";
-const FORMAT_VERSION: u32 = 2;
+const FORMAT_VERSION: u32 = 3;
 const HEADER_SIZE: usize = 48;
 const MAX_READ_CHUNK_BYTES: usize = 1024 * 1024;
 const HDR_FLAG_EXT_OVERFLOW: u32 = 1 << 0;
@@ -217,7 +217,7 @@ impl Index {
         }
 
         let slot_usize = slot_count as usize;
-        let per_slot_bytes: u64 = if compact_offsets { 27 } else { 35 };
+        let per_slot_bytes: u64 = if compact_offsets { 35 } else { 43 };
         let body_len: u64 = (slot_usize as u64) * per_slot_bytes
             + (ext_blob.len() as u64)
             + (self.folded_arena.len() as u64)
@@ -276,6 +276,13 @@ impl Index {
             &mut hasher,
             &self.mtime,
             i64::to_le_bytes,
+            &mut scratch,
+        )?;
+        write_le_slice(
+            &mut w,
+            &mut hasher,
+            &self.file_id,
+            u64::to_le_bytes,
             &mut scratch,
         )?;
         write_le_slice(
@@ -374,7 +381,7 @@ impl Index {
         }
 
         let slot_usize = slot_count as usize;
-        let per_slot_bytes: u64 = if compact_offsets { 27 } else { 35 };
+        let per_slot_bytes: u64 = if compact_offsets { 35 } else { 43 };
         let expected_body = (slot_usize as u64)
             .checked_mul(per_slot_bytes)
             .and_then(|v| v.checked_add(ext_blob_len as u64))
@@ -392,6 +399,7 @@ impl Index {
         let attrs = read_le_vec_bounded(&mut r, &mut hasher, slot_usize, u32::from_le_bytes)?;
         let size = read_le_vec_bounded(&mut r, &mut hasher, slot_usize, u64::from_le_bytes)?;
         let mtime = read_le_vec_bounded(&mut r, &mut hasher, slot_usize, i64::from_le_bytes)?;
+        let file_id = read_le_vec_bounded(&mut r, &mut hasher, slot_usize, u64::from_le_bytes)?;
         let ext_id = read_le_vec_bounded(&mut r, &mut hasher, slot_usize, u16::from_le_bytes)?;
         let mut flags = read_bytes_bounded(&mut r, &mut hasher, slot_usize)?;
         let (folded_off, display_off) = if compact_offsets {
@@ -446,12 +454,16 @@ impl Index {
             attrs,
             size,
             mtime,
+            file_id,
             ext_id,
             flags,
             first_child: Vec::new(),
             next_sibling: Vec::new(),
             buckets: Vec::new(),
             bucket_occupied: 0,
+            fid_buckets: Vec::new(),
+            fid_occupied: 0,
+            fid_live: 0,
             roots: Vec::new(),
             exts,
             ext_map,

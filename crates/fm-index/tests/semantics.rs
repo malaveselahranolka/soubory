@@ -9,6 +9,7 @@ fn m_file(mtime: i64, hidden: bool) -> Meta {
         attrs: ARCHIVE | if hidden { HIDDEN } else { 0 },
         size: 1024,
         mtime,
+        file_id: 0,
     }
 }
 
@@ -17,6 +18,7 @@ fn m_dir(mtime: i64, hidden: bool) -> Meta {
         attrs: DIRECTORY | if hidden { HIDDEN } else { 0 },
         size: 0,
         mtime,
+        file_id: 0,
     }
 }
 
@@ -34,6 +36,7 @@ fn build_fixture() -> Index {
             attrs: DIRECTORY | SYSTEM,
             size: 0,
             mtime: 100,
+            file_id: 0,
         },
     );
     let sub_in_hidden = idx.insert(hidden_dir, "Podsložka", m_dir(100, false));
@@ -69,6 +72,7 @@ fn build_fixture() -> Index {
             attrs: ARCHIVE,
             size: 4096,
             mtime: 999,
+            file_id: 0,
         },
     );
 
@@ -754,4 +758,264 @@ fn cross_index_refine_and_root_edge_cases() {
         .refine(&prev_d, &parse_query("short_longer"), &opts, &cancel)
         .unwrap();
     assert_eq!(after_d.total_matches, 1);
+}
+
+#[test]
+fn file_id_map_property_vs_naive_model() {
+    use std::collections::HashMap;
+
+    #[derive(Clone)]
+    struct NaiveNode {
+        parent: Option<EntryId>,
+        name: String,
+        meta: Meta,
+        is_dir: bool,
+    }
+
+    fn is_ancestor(nodes: &HashMap<EntryId, NaiveNode>, anc: EntryId, mut node: EntryId) -> bool {
+        loop {
+            if node == anc {
+                return true;
+            }
+            match nodes.get(&node).and_then(|n| n.parent) {
+                Some(p) => node = p,
+                None => return false,
+            }
+        }
+    }
+
+    fn remove_subtree(nodes: &mut HashMap<EntryId, NaiveNode>, root: EntryId) {
+        let mut to_remove = vec![root];
+        let mut i = 0;
+        while i < to_remove.len() {
+            let cur = to_remove[i];
+            i += 1;
+            for (&cid, cnode) in nodes.iter() {
+                if cnode.parent == Some(cur) {
+                    to_remove.push(cid);
+                }
+            }
+        }
+        for id in to_remove {
+            nodes.remove(&id);
+        }
+    }
+
+    fn find_sibling_ci(
+        nodes: &HashMap<EntryId, NaiveNode>,
+        parent: EntryId,
+        name: &str,
+    ) -> Option<EntryId> {
+        let target: String = name.chars().flat_map(char::to_lowercase).collect();
+        nodes.iter().find_map(|(&id, n)| {
+            if n.parent == Some(parent) {
+                let cur: String = n.name.chars().flat_map(char::to_lowercase).collect();
+                (cur == target).then_some(id)
+            } else {
+                None
+            }
+        })
+    }
+
+    let mut idx = Index::new();
+    let root = idx.add_root("C:\\");
+    idx.set_file_id(root, 1);
+
+    let mut model: HashMap<EntryId, NaiveNode> = HashMap::new();
+    model.insert(
+        root,
+        NaiveNode {
+            parent: None,
+            name: "C:\\".to_owned(),
+            meta: idx.meta(root),
+            is_dir: true,
+        },
+    );
+
+    let mut rng = XorShift64::new(0x0F1D_C0DE_5678);
+    let mut next_fid = 2u64;
+    let mut retired_fids: Vec<u64> = Vec::new();
+    let names = [
+        "alpha", "Alpha", "beta", "žluť", "ŽLUŤ", "kun", "kůň", "doc.txt", "IMG.JPG",
+    ];
+
+    for step in 0..2500 {
+        let dirs: Vec<EntryId> = model
+            .iter()
+            .filter(|(_, n)| n.is_dir)
+            .map(|(&id, _)| id)
+            .collect();
+        let all_ids: Vec<EntryId> = model.keys().copied().collect();
+        let non_roots: Vec<EntryId> = model
+            .iter()
+            .filter(|(_, n)| n.parent.is_some())
+            .map(|(&id, _)| id)
+            .collect();
+
+        let op = rng.gen_range(100);
+        if op < 35 || non_roots.is_empty() {
+            // Insert (new or upsert)
+            let parent = dirs[rng.gen_range(dirs.len())];
+            let want_dir = rng.gen_range(5) == 0;
+            let base = names[rng.gen_range(names.len())];
+            let name = if rng.gen_range(3) == 0 {
+                base.to_owned()
+            } else {
+                format!("{base}_{}", rng.gen_range(60))
+            };
+            let fid = if rng.gen_range(8) == 0 {
+                0
+            } else {
+                let f = next_fid;
+                next_fid += 1;
+                f
+            };
+            let existing = find_sibling_ci(&model, parent, &name);
+            let is_dir = existing.map_or(want_dir, |eid| model[&eid].is_dir);
+            let meta = Meta {
+                attrs: if is_dir { DIRECTORY } else { ARCHIVE },
+                size: if is_dir { 0 } else { rng.next_u64() % 10000 },
+                mtime: (rng.next_u64() % 100000) as i64,
+                file_id: fid,
+            };
+            let id = idx.insert(parent, &name, meta);
+            if let Some(old_id) = existing {
+                assert_eq!(id, old_id);
+                let old_fid = model[&old_id].meta.file_id;
+                if old_fid != 0 && old_fid != fid {
+                    retired_fids.push(old_fid);
+                }
+                let entry = model.get_mut(&old_id).unwrap();
+                entry.name = name;
+                entry.meta = meta;
+            } else {
+                model.insert(
+                    id,
+                    NaiveNode {
+                        parent: Some(parent),
+                        name,
+                        meta,
+                        is_dir,
+                    },
+                );
+            }
+        } else if op < 50 {
+            // Update meta / set_file_id
+            let id = all_ids[rng.gen_range(all_ids.len())];
+            let new_fid = if rng.gen_range(6) == 0 {
+                0
+            } else {
+                let f = next_fid;
+                next_fid += 1;
+                f
+            };
+            let old_fid = model[&id].meta.file_id;
+            if old_fid != 0 {
+                retired_fids.push(old_fid);
+            }
+            if model[&id].parent.is_none() || rng.gen_range(2) == 0 {
+                idx.set_file_id(id, new_fid);
+                model.get_mut(&id).unwrap().meta.file_id = new_fid;
+            } else {
+                let mut m = model[&id].meta;
+                m.size = rng.next_u64() % 10000;
+                m.mtime = (rng.next_u64() % 100000) as i64;
+                m.file_id = new_fid;
+                idx.update_meta(id, m);
+                model.get_mut(&id).unwrap().meta = m;
+            }
+        } else if op < 65 {
+            // Rename
+            let id = non_roots[rng.gen_range(non_roots.len())];
+            let parent = model[&id].parent.unwrap();
+            let base = names[rng.gen_range(names.len())];
+            let new_name = format!("{base}_{}", rng.gen_range(40));
+            if let Some(victim) = find_sibling_ci(&model, parent, &new_name)
+                && victim != id
+            {
+                let old_v_fid = model[&victim].meta.file_id;
+                if old_v_fid != 0 {
+                    retired_fids.push(old_v_fid);
+                }
+                remove_subtree(&mut model, victim);
+            }
+            idx.rename(id, &new_name);
+            model.get_mut(&id).unwrap().name = new_name;
+        } else if op < 80 {
+            // Move
+            let id = non_roots[rng.gen_range(non_roots.len())];
+            let valid_targets: Vec<EntryId> = dirs
+                .iter()
+                .copied()
+                .filter(|&d| !is_ancestor(&model, id, d))
+                .collect();
+            let new_parent = valid_targets[rng.gen_range(valid_targets.len())];
+            let base = names[rng.gen_range(names.len())];
+            let new_name = format!("{base}_{}", rng.gen_range(40));
+            if let Some(victim) = find_sibling_ci(&model, new_parent, &new_name)
+                && victim != id
+            {
+                // Remember: detach `id` before removing victim if victim is ancestor?
+                // Actually `new_parent` is not in `id`'s subtree, so victim cannot be `id`'s ancestor
+                // unless victim == new_parent's sibling (so not ancestor of id unless id was under victim).
+                // Handle general case: update id's parent first, then remove victim!
+                model.get_mut(&id).unwrap().parent = Some(new_parent);
+                remove_subtree(&mut model, victim);
+            }
+            idx.move_to(id, new_parent, &new_name);
+            let entry = model.get_mut(&id).unwrap();
+            entry.parent = Some(new_parent);
+            entry.name = new_name;
+        } else if op < 95 {
+            // Remove
+            let id = non_roots[rng.gen_range(non_roots.len())];
+            // Collect retired file ids
+            for (&mid, mnode) in &model {
+                if is_ancestor(&model, id, mid) && mnode.meta.file_id != 0 {
+                    retired_fids.push(mnode.meta.file_id);
+                }
+            }
+            remove_subtree(&mut model, id);
+            idx.remove(id);
+        } else {
+            // Compact
+            let remap = idx.compact_with_remap();
+            let mut remapped = HashMap::with_capacity(model.len());
+            for (old_id, mut node) in model {
+                let new_id = remap[old_id as usize];
+                node.parent = node.parent.map(|p| remap[p as usize]);
+                remapped.insert(new_id, node);
+            }
+            model = remapped;
+        }
+
+        // Verify invariants after every step (full check every 25 steps, spot check otherwise)
+        assert_eq!(idx.len(), model.len(), "step {step}: len mismatch");
+        assert_eq!(idx.by_file_id(0), None, "step {step}: fid 0 must be None");
+        if step % 25 == 0 || step == 2499 {
+            for (&id, node) in &model {
+                assert!(idx.is_alive(id), "step {step}: {id} not alive");
+                assert_eq!(
+                    idx.file_id(id),
+                    node.meta.file_id,
+                    "step {step}: fid mismatch"
+                );
+                if node.meta.file_id != 0 {
+                    assert_eq!(
+                        idx.by_file_id(node.meta.file_id),
+                        Some(id),
+                        "step {step}: by_file_id({}) mismatch",
+                        node.meta.file_id
+                    );
+                }
+            }
+            for &rfid in retired_fids.iter().rev().take(50) {
+                assert_eq!(
+                    idx.by_file_id(rfid),
+                    None,
+                    "step {step}: retired fid {rfid} still present"
+                );
+            }
+        }
+    }
 }

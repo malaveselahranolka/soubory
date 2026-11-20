@@ -7,3 +7,6 @@ edition.workspace = true
 fm-fs = { workspace = true }
 rayon = { workspace = true }
 memchr = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true }
