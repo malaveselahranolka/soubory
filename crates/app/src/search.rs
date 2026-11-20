@@ -134,6 +134,8 @@ pub fn index_event(w: WPARAM, l: LPARAM) {
             ST.with(|s| s.borrow_mut().scanning = scanning);
             rerun_all();
         }
+        // A root that cannot be watched retries on its own and repeats this; log, no UI.
+        Event::Error { root, message } => crate::prefs::log(&format!("index {root}: {message}")),
         Event::Changed => {
             // Live results, at most twice a second.
             let arm = ST.with(|s| !std::mem::replace(&mut s.borrow_mut().rerun_armed, true));
