@@ -206,6 +206,8 @@ pub fn run(start: Loc) -> i32 {
             DispatchMessageW(&msg);
         }
         crate::search::stop();
+        // Files copied here must stay pasteable after we are gone (Explorer never exits).
+        let _ = windows::Win32::System::Ole::OleFlushClipboard();
         msg.wParam.0 as i32
     }
 }

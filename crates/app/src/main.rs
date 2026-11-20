@@ -51,5 +51,14 @@ fn main() {
     if !solo && win::hand_over(Some(std::path::Path::new(&folder)).filter(|_| !folder.is_empty())) {
         return;
     }
-    std::process::exit(win::run(start_loc(&folder)));
+    let code = win::run(start_loc(&folder));
+    // Everything is saved by now (prefs on close, the index in search::stop, the clipboard
+    // flushed). Leave without running any DLL's exit code: the Intel D3D11 driver
+    // (igd10um64xe.dll) can spin forever in its process-detach after ExitProcess has killed the
+    // thread it waits for, leaving a windowless fm at 100% of a core that even Task Manager
+    // cannot end.
+    unsafe {
+        let _ = windows::Win32::System::Threading::TerminateProcess(windows::Win32::System::Threading::GetCurrentProcess(), code as u32);
+    }
+    std::process::exit(code);
 }
