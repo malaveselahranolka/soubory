@@ -697,7 +697,7 @@ fn post(hwnd: isize, a: Action) {
     }
 }
 
-fn in_menu() -> bool {
+pub(crate) fn in_menu() -> bool {
     let mut g = GUITHREADINFO { cbSize: std::mem::size_of::<GUITHREADINFO>() as u32, ..Default::default() };
     // fm's own UI thread (0 would ask about whichever app is in front).
     let me = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };

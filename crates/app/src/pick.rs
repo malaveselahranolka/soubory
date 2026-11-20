@@ -325,8 +325,12 @@ pub fn clamp(app: &mut App) {
     }
 }
 
-/// Once a second: the host may have gone (closed, crashed, gave up); its picker goes too.
+/// Once a second: the host may have gone (closed, crashed, gave up); its picker goes too. Not
+/// while a menu tracks (its caller still holds the window).
 pub fn tick(app: &mut App) {
+    if crate::uia::in_menu() {
+        return;
+    }
     if let Some(p) = app.pick.as_mut()
         && !p.alive()
     {
