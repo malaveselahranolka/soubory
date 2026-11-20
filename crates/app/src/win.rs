@@ -442,6 +442,10 @@ fn drives_changed() {
         let (cur, focus) = (a.cur, a.focus);
         for i in 0..a.tabs.len() {
             let on_gone = gone(&a.tabs[i].loc);
+            if !on_gone && i != cur && matches!(a.tabs[i].loc, Loc::Computer) {
+                a.tabs[i].stale = true;
+                continue;
+            }
             if !on_gone && !(i == cur && matches!(a.tabs[i].loc, Loc::Computer)) {
                 continue;
             }
@@ -2105,6 +2109,10 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                 LRESULT(0)
             }
             WM_MBUTTONUP => {
+                // A live left press or drag owns the list (it would carry another item).
+                if !matches!(app.drag, Drag::None) {
+                    return LRESULT(0);
+                }
                 // Like the right button: closing a rename is all this click does.
                 if renaming(app) {
                     end_rename(app);
@@ -2115,6 +2123,10 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                 LRESULT(0)
             }
             WM_XBUTTONUP => {
+                // A live left press or drag owns the list: Back/Forward would swap its rows.
+                if !matches!(app.drag, Drag::None) {
+                    return LRESULT(1);
+                }
                 if (wparam.0 >> 16) & 0xFFFF == XBUTTON1 as usize {
                     app.back();
                 } else {

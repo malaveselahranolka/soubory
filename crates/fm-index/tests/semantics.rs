@@ -1068,8 +1068,4 @@ fn subtree_size_sums_files_below_a_folder() {
     idx.move_to(y, c, "y.bin");
     assert_eq!(idx.subtree_size(a), (10, 1));
     assert_eq!(idx.subtree_size(c), (49, 3));
-    // b lost its last child: childless now, like a folder never walked.
-    assert!(idx.has_children(a));
-    assert!(!idx.has_children(b));
-    assert!(!idx.has_children(deep)); // dead
 }

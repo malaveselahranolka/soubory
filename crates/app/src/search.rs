@@ -155,8 +155,9 @@ pub fn request_sizes(app: &App) {
     // Every folder: each is one lookup and a walk of its own subtree (C:\ whole takes ~15 ms).
     let dirs: Vec<&Entry> = t.entries.iter().filter(|e| e.is_dir && e.shell.is_none()).collect();
     let paths: Vec<PathBuf> = dirs.iter().map(|e| e.path_in(&dir)).collect();
-    // Never opened to check emptiness: links and junctions (they lead elsewhere, maybe a share).
-    let probe: Vec<bool> = dirs.iter().map(|e| e.attrs & 0x400 == 0 || e.is_placeholder()).collect();
+    // Never opened to check emptiness: links and junctions (they lead elsewhere, maybe a share)
+    // and cloud placeholders (opening one can fetch it from the cloud).
+    let probe: Vec<bool> = dirs.iter().map(|e| e.attrs & 0x400 == 0 && !e.is_placeholder()).collect();
     if paths.is_empty() {
         return;
     }
@@ -176,16 +177,16 @@ pub fn request_sizes(app: &App) {
         let found = svc.folder_sizes(&strs, &token);
         drop(svc);
         let Some(found) = found else { return };
-        // A folder the index lists nothing in is empty, or was never walked (a junction, access
-        // denied): it counts as empty only when it lists as empty here; otherwise unknown.
+        // The index says 0 for a folder it never walked too (a junction, access denied, or one
+        // holding only such folders): 0 counts only for a folder that lists as empty here.
         let mut sizes = Vec::with_capacity(found.len());
         for ((p, &probe), f) in paths.iter().zip(&probe).zip(found) {
             if token.is_cancelled() {
                 return;
             }
             sizes.push(match f {
-                Some((n, true)) => Some(n),
-                Some((_, false)) if probe && std::fs::read_dir(p).is_ok_and(|mut d| d.next().is_none()) => Some(0),
+                Some(n) if n > 0 => Some(n),
+                Some(_) if probe && std::fs::read_dir(p).is_ok_and(|mut d| d.next().is_none()) => Some(0),
                 _ => None,
             });
         }

@@ -535,6 +535,8 @@ fn draw(ql: &mut Ql, c: &mut Canvas, t: &Theme, w: f32, h: f32) {
             if ql.text_h == 0.0 {
                 ql.text_h = c.g.measure_wrapped(s, Font::Mono, inner.w);
             }
+            // The same file reloaded shorter (or the window grew): back within the text.
+            ql.scroll = ql.scroll.min((ql.text_h + 40.0 - area.h).max(0.0));
             c.push_clip(area);
             let r = Rect::new(inner.x, inner.y - ql.scroll, inner.w, ql.text_h + 20.0);
             c.text_wrapped(s, r, Font::Mono, t.ink, Align::Start);
