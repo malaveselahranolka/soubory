@@ -31,6 +31,7 @@ struct Pixels {
 pub struct Icons {
     by_ext: HashMap<String, i32>,
     by_path: HashMap<PathBuf, i32>,
+    by_shell: HashMap<crate::shellns::ShellId, i32>,
     lists: Vec<(i32, u32)>, // (SHIL_*, px)
     pixels: HashMap<(i32, i32), Option<Rc<Pixels>>>,
     bitmaps: HashMap<(usize, i32, i32), ID2D1Bitmap>,
@@ -95,6 +96,16 @@ impl Icons {
         }
         let i = sys_index("folder", true, true);
         self.by_ext.insert(key, i);
+        i
+    }
+
+    /// Index for a shell item without a file-system path (a network computer, a phone).
+    pub fn index_for_shell(&mut self, id: &crate::shellns::ShellId) -> i32 {
+        if let Some(&i) = self.by_shell.get(id) {
+            return i;
+        }
+        let i = crate::shellns::icon_index(id);
+        self.by_shell.insert(id.clone(), i);
         i
     }
 

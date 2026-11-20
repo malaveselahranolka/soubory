@@ -480,7 +480,7 @@ fn big_preview(app: &mut App, c: &mut Canvas, t: &Theme, r: Rect, path: &Path, e
             }
             let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
             let idx = match &e.shell {
-                Some(id) if e.full.is_none() => crate::shellns::icon_index(id),
+                Some(id) if e.full.is_none() => app.icons.index_for_shell(id),
                 _ if e.full.is_some() && e.is_dir => app.icons.index_for_path(path),
                 _ => app.icons.index(&dir, e),
             };
