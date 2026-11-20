@@ -170,7 +170,16 @@ pub fn request_sizes(app: &App) {
     let loc = t.loc.clone();
     std::thread::spawn(move || {
         let strs: Vec<String> = paths.iter().map(|p| p.to_string_lossy().into_owned()).collect();
-        let Some(sizes) = svc.folder_sizes(&strs, &token) else { return };
+        let sizes = svc.folder_sizes(&strs, &token);
+        drop(svc);
+        let Some(mut sizes) = sizes else { return };
+        // The index says 0 for folders it never walked too (junctions, links, access denied):
+        // only a folder that lists as empty is known to be empty; the rest stay unknown.
+        for (p, n) in paths.iter().zip(sizes.iter_mut()) {
+            if *n == Some(0) && !std::fs::read_dir(p).is_ok_and(|mut d| d.next().is_none()) {
+                *n = None;
+            }
+        }
         if token.is_cancelled() {
             return;
         }
@@ -214,7 +223,7 @@ pub fn sizes_message(app: &mut App, l: LPARAM) {
         }
         repaint |= changed && k == cur;
         // Sorted by size: the folders move to their places. The shown tab waits for a press,
-        // drag or rename to end (flush_resort), so nothing moves under the pointer or the field.
+        // drag or rename to end (flush_deferred), so nothing moves under the pointer or the field.
         let sorted = t.sort == fsys::SortKey::Size && !matches!(t.loc, Loc::Recents) && !(matches!(t.loc, Loc::Search { .. }) && t.by_rank);
         if changed && sorted {
             if k == cur {
@@ -224,7 +233,7 @@ pub fn sizes_message(app: &mut App, l: LPARAM) {
             }
         }
     }
-    app.flush_resort();
+    app.flush_deferred();
     if repaint {
         app.invalidate();
     }
@@ -245,10 +254,23 @@ pub fn forget(hwnd: HWND) {
     });
 }
 
-/// The rename field closed: run a query whose results arrived while it was open.
-pub fn after_rename(app: &mut App) {
-    if ST.with(|s| s.borrow_mut().deferred.remove(&(app.hwnd.0 as isize))) {
-        run(app);
+/// The window is no longer busy: run a query whose results arrived meanwhile. Through the
+/// rerun timer, not at once: a rename just applied reaches the index 50-100 ms later, and an
+/// earlier query would bring the old name back.
+pub fn replay(app: &mut App) {
+    let key = app.hwnd.0 as isize;
+    if ST.with(|s| {
+        let mut s = s.borrow_mut();
+        let d = s.deferred.remove(&key);
+        if d {
+            s.rerun_armed = true;
+        }
+        d
+    }) {
+        unsafe {
+            // Restarts the timer when it is already armed (it could fire inside that window).
+            SetTimer(Some(crate::win::hub()), TIMER_RERUN, 500, None);
+        }
     }
 }
 
@@ -422,8 +444,9 @@ pub fn message(app: &mut App, _w: WPARAM, l: LPARAM) {
     if current != Some(reply.generation) || !matches!(app.tab().loc, Loc::Search { .. }) {
         return;
     }
-    // Never replace the list under an open rename field: it would name another row's file.
-    if crate::win::renaming(app) {
+    // Never replace the list under a press, drag or open rename field: the drag, click or
+    // rename would act on whatever moved into that row. flush_deferred runs it again.
+    if app.busy() {
         ST.with(|s| s.borrow_mut().deferred.insert(app.hwnd.0 as isize));
         return;
     }

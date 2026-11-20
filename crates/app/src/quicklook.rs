@@ -197,7 +197,15 @@ pub fn follow(app: &mut App) {
         return;
     }
     let Some((path, entry, index)) = current_item(app) else { return };
-    let same = QL.with(|q| q.borrow().as_ref().map(|ql| (ql.path == path, ql.index == index && ql.entry.size == entry.size)));
+    let same = QL.with(|q| {
+        q.borrow().as_ref().map(|ql| {
+            let e = &ql.entry;
+            let content = e.size == entry.size && e.modified == entry.modified;
+            // In place only for a folder (its size arrived) or an item that just moved; a file
+            // whose size or date changed is previewed again.
+            (ql.path == path && (entry.is_dir || content), ql.index == index && content && e.sized == entry.sized)
+        })
+    });
     match same {
         Some((true, true)) => {}
         // The same item moved (a re-sort) or its folder size arrived: no reload, the preview

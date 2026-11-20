@@ -1341,7 +1341,7 @@ pub fn status_text(app: &App) -> String {
         // Search and tag places list full paths: an item inside a selected folder is already
         // counted in that folder's size.
         let dirs: std::collections::HashSet<&std::path::Path> = if matches!(tab.loc, Loc::Search { .. } | Loc::Tag(_)) {
-            picked.iter().filter(|&&i| tab.entries[i].is_dir).filter_map(|&i| full(i)).collect()
+            picked.iter().filter(|&&i| tab.entries[i].is_dir && tab.entries[i].size_known()).filter_map(|&i| full(i)).collect()
         } else {
             Default::default()
         };

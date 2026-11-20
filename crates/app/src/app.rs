@@ -99,8 +99,10 @@ pub struct Tab {
     pub groups: Vec<groups::Group>,
     /// Bring the focus into view when the pending async list arrives (after a regroup).
     pub reveal_on_load: bool,
-    /// Folder sizes arrived under a press, drag or rename: re-sort once it ends (flush_resort).
+    /// Folder sizes arrived under a press, drag or rename: re-sort once it ends (flush_deferred).
     pub resort_pending: bool,
+    /// List again when shown: tags changed or a shell listing landed while the tab was hidden.
+    pub stale: bool,
 }
 
 impl Tab {
@@ -126,6 +128,7 @@ impl Tab {
             groups: Vec::new(),
             reveal_on_load: false,
             resort_pending: false,
+            stale: false,
         }
     }
     pub fn dir(&self) -> PathBuf {
@@ -235,9 +238,10 @@ pub enum Drag {
         now: (f32, f32),
         keep: Vec<usize>,
     },
+    /// Pressed on an item: a drag starts past 4 px. The item is the focus, which every list
+    /// replacement carries along (by path or shell ID), never a row number.
     Pending {
         at: (f32, f32),
-        index: usize,
     },
     Slider,
 }
@@ -392,6 +396,7 @@ impl App {
         crate::win::sync_search_field(self);
         // A shell listing sets it again; any other place never waits.
         self.tab_mut().loading = false;
+        self.tab_mut().stale = false;
         if matches!(self.tab().loc, Loc::Search { .. }) {
             // Results come from the index (async); the current ones stay until they arrive.
             crate::search::run(self);
@@ -405,17 +410,12 @@ impl App {
         }
         let show_hidden = self.prefs.show_hidden;
         let folders_first = self.prefs.folders_first;
-        let keep: Vec<String> = {
+        // By path: names repeat in tag places and Recents (two README.md from two folders).
+        let (keep, focus_path): (Vec<PathBuf>, Option<PathBuf>) = {
             let t = self.tab();
-            t.sel
-                .indices()
-                .iter()
-                .filter_map(|&i| t.entries.get(i).map(|e| e.name.clone()))
-                .collect()
+            let at = |i: usize| (i < t.entries.len()).then(|| t.path_of(i));
+            (t.sel.indices().into_iter().filter_map(at).collect(), t.sel.focus.and_then(at))
         };
-        let focus_name = select
-            .map(str::to_string)
-            .or_else(|| self.tab().focused_name());
         let t = &mut self.tabs[self.cur];
         t.error = None;
         t.resort_pending = false;
@@ -433,8 +433,8 @@ impl App {
                     full: Some(v.root),
                     shell: None,
                     origin: None,
-                    // A drive carries its capacity.
-                    sized: true,
+                    // A drive carries its capacity; 0 (network, no media) is unknown.
+                    sized: false,
                 })
                 .collect()),
             Loc::Recents => Ok(crate::shell::recent_items(200)),
@@ -463,24 +463,25 @@ impl App {
         groups::apply(t, folders_first);
         t.icon_idx = vec![i32::MIN; t.entries.len()];
         t.sel = Selection::new(t.entries.len());
-        let mut sel_any = false;
-        for (i, e) in t.entries.iter().enumerate() {
-            if keep.iter().any(|k| k == &e.name) && select.is_none() {
-                t.sel.toggle(i);
-                sel_any = true;
-            }
+        let dir = t.dir();
+        let mut hits = Vec::new();
+        if select.is_none() && !keep.is_empty() {
+            let keep: std::collections::HashSet<PathBuf> = keep.into_iter().collect();
+            hits = (0..t.entries.len()).filter(|&i| keep.contains(&t.entries[i].path_in(&dir))).collect();
+            t.sel.set_many(hits.iter().copied(), &[]);
         }
-        if let Some(name) = &focus_name {
-            if let Some(i) = t.entries.iter().position(|e| &e.name == name) {
-                if select.is_some() || !sel_any {
-                    if select.is_some() {
-                        t.sel.select_only(i);
-                    } else {
-                        t.sel.focus = Some(i);
-                        t.sel.anchor = Some(i);
-                    }
-                } else {
-                    t.sel.focus = Some(i);
+        // `select`: a child to select by name (going up, history); otherwise the focus stays.
+        let focus = match select {
+            Some(name) => t.entries.iter().position(|e| e.name == name),
+            None => focus_path.and_then(|p| t.entries.iter().position(|e| e.path_in(&dir) == p)).or(hits.last().copied()),
+        };
+        if let Some(i) = focus {
+            if select.is_some() {
+                t.sel.select_only(i);
+            } else {
+                t.sel.focus = Some(i);
+                if hits.is_empty() || t.sel.anchor.is_none() {
+                    t.sel.anchor = Some(i);
                 }
             }
         }
@@ -529,6 +530,8 @@ impl App {
     }
 
     pub fn back(&mut self) {
+        // Mouse Back button, UIA: no click took focus from an open rename field.
+        crate::win::end_rename(self);
         let t = self.tab_mut();
         let cur = (t.loc.clone(), t.focused_name());
         if let Some((loc, sel)) = t.hist.back(cur) {
@@ -541,6 +544,7 @@ impl App {
     }
 
     pub fn forward(&mut self) {
+        crate::win::end_rename(self);
         let t = self.tab_mut();
         let cur = (t.loc.clone(), t.focused_name());
         if let Some((loc, sel)) = t.hist.forward(cur) {
@@ -652,13 +656,15 @@ impl App {
     }
 
     fn after_tab_switch(&mut self) {
-        // A tag place has no watcher, and a shell listing that finished in the background was dropped.
+        // Stale: tags changed or a shell listing landed while hidden. A search runs again: its
+        // replies are per window, so one that landed meanwhile was dropped or would fill this tab
+        // with another tab's results (running bumps the window's generation and drops those).
         let t = self.tab();
-        if self.groups_by_tags() || t.loading || matches!(t.loc, Loc::Tag(_)) {
+        if t.stale || matches!(t.loc, Loc::Search { .. }) {
             self.reload(None);
         } else {
             crate::search::request_sizes(self);
-            self.flush_resort();
+            self.flush_deferred();
         }
         crate::win::sync_search_field(self);
         self.relayout();
@@ -1088,15 +1094,15 @@ impl App {
                 self.invalidate();
                 return;
             }
-            Drag::Pending { at, index } => {
+            Drag::Pending { at } => {
                 let (dx, dy) = (x - at.0, y - at.1);
                 if dx * dx + dy * dy > 16.0 {
-                    let i = *index;
                     self.drag = Drag::None;
+                    let Some(i) = self.tab().sel.focus else { return };
                     crate::shell::drag_out(self, i);
                     // The modal drag loop ate the button-up.
                     self.pressed = Hit::None;
-                    self.flush_resort();
+                    self.flush_deferred();
                 }
                 return;
             }
@@ -1187,10 +1193,7 @@ impl App {
                     t.sel.focus = Some(i);
                 }
                 if !shift && !ctrl {
-                    self.drag = Drag::Pending {
-                        at: (x, y),
-                        index: i,
-                    };
+                    self.drag = Drag::Pending { at: (x, y) };
                 }
             }
             Hit::Empty => {
@@ -1241,10 +1244,10 @@ impl App {
         let was = std::mem::replace(&mut self.drag, Drag::None);
         let h = self.hit(x, y);
         let pressed = std::mem::take(&mut self.pressed);
-        if let Drag::Pending { index, .. } = was {
+        if let (Drag::Pending { .. }, Some(f)) = (was, self.tab().sel.focus) {
             // Plain click on an already selected item collapses the selection to it.
             if !ctrl && !shift {
-                self.tab_mut().sel.select_only(index);
+                self.tab_mut().sel.select_only(f);
             }
         }
         if h != pressed {
@@ -1252,14 +1255,22 @@ impl App {
         } else {
             self.activate(h);
         }
-        self.flush_resort();
+        self.flush_deferred();
     }
 
-    /// Re-sorts the current tab when folder sizes arrived while a press, drag or rename held its
-    /// rows in place (the items under the pointer or the field must not move).
-    pub fn flush_resort(&mut self) {
-        let busy = !matches!(self.drag, Drag::None) || matches!(self.pressed, Hit::Row(_)) || crate::win::renaming(self);
-        if busy || !self.tab().resort_pending {
+    /// A press, drag or rename holds the rows in place: nothing may move the item under the
+    /// pointer or the field (search replies, file-change reloads and size re-sorts wait).
+    pub fn busy(&self) -> bool {
+        !matches!(self.drag, Drag::None) || matches!(self.pressed, Hit::Row(_)) || crate::win::renaming(self)
+    }
+
+    /// Runs what waited while the window was busy: a search reply, a re-sort by folder size.
+    pub fn flush_deferred(&mut self) {
+        if self.busy() {
+            return;
+        }
+        crate::search::replay(self);
+        if !self.tab().resort_pending {
             return;
         }
         let folders_first = self.prefs.folders_first;

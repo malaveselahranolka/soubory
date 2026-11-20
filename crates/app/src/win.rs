@@ -1289,6 +1289,8 @@ fn position_edits(app: &App) {
 /// After a DPI or theme change: the fields are recreated on demand with the new font and
 /// colours; the palette's comes back at once with its query.
 fn rebuild_edits(app: &mut App) {
+    // Commits like a resize would; destroying the field would drop the typed name.
+    end_rename(app);
     let query = edit_of(app.hwnd, EditKind::Palette).map(|(h, _)| edit_text(h));
     for k in [EditKind::Search, EditKind::Rename, EditKind::Path, EditKind::Palette] {
         destroy_edit(app.hwnd, k);
@@ -1620,8 +1622,7 @@ fn commit_rename(app: &mut App, cancel: bool) {
         }
     }
     // What waited for the field to close: search results, a re-sort by folder size.
-    crate::search::after_rename(app);
-    app.flush_resort();
+    app.flush_deferred();
 }
 
 fn apply_rename(app: &mut App, i: usize, text: String) {
@@ -2034,7 +2035,7 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                 let (x, y) = xy(lparam, app.scale);
                 let (ctrl, shift, _) = mods();
                 // Same for a click on an item (it would select or drag whatever moved there).
-                if renaming(app) && matches!(app.hit(x, y), Hit::Row(_) | Hit::Group(_)) {
+                if renaming(app) && matches!(app.hit(x, y), Hit::Row(_) | Hit::Group(_) | Hit::Empty | Hit::ColRow(..) | Hit::ColEmpty(_)) {
                     end_rename(app);
                     // Nor does a double-click begun with it.
                     app.eat_dblclk = true;
@@ -2055,10 +2056,27 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                 }
                 let (x, y) = xy(lparam, app.scale);
                 let (ctrl, shift, _) = mods();
+                // The first click left only its item selected: another item under the pointer
+                // means the list moved in between (a re-sort, live results), so this is a click.
+                let moved = !ctrl && !shift && matches!(app.hit(x, y), Hit::Row(i) if !app.tab().sel.is(i));
                 SetCapture(hwnd);
                 app.mouse_down(x, y, ctrl, shift);
                 app.drag = Drag::None;
-                app.double_click(x, y);
+                if !moved {
+                    app.double_click(x, y);
+                }
+                LRESULT(0)
+            }
+            WM_CAPTURECHANGED => {
+                // Capture lost with the button still down (a dialog came up, Alt+Tab): no
+                // button-up will follow, so the press ends here. Our own release on button-up
+                // comes with the button already up.
+                if GetKeyState(VK_LBUTTON.0 as i32) < 0 && (!matches!(app.drag, Drag::None) || app.pressed != Hit::None) {
+                    app.drag = Drag::None;
+                    app.pressed = Hit::None;
+                    app.flush_deferred();
+                    app.invalidate();
+                }
                 LRESULT(0)
             }
             WM_LBUTTONUP => {
@@ -2069,6 +2087,11 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                 LRESULT(0)
             }
             WM_MBUTTONUP => {
+                // Like the right button: closing a rename is all this click does.
+                if renaming(app) {
+                    end_rename(app);
+                    return LRESULT(0);
+                }
                 let (x, y) = xy(lparam, app.scale);
                 app.middle_click(x, y);
                 LRESULT(0)
@@ -2192,15 +2215,16 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
             }
             WM_TIMER => {
                 match wparam.0 {
-                    TIMER_FS => {
+                    // While busy (press, drag, rename) the timer keeps ticking: the reload comes
+                    // once the rows may move.
+                    TIMER_FS if !app.busy() => {
                         let _ = KillTimer(Some(hwnd), TIMER_FS);
-                        if edit_of(app.hwnd, EditKind::Rename).is_none() {
-                            crate::thumbs::refresh();
-                            app.reload(None);
-                            crate::views::refresh_columns(app);
-                            app.invalidate();
-                        }
+                        crate::thumbs::refresh();
+                        app.reload(None);
+                        crate::views::refresh_columns(app);
+                        app.invalidate();
                     }
+                    TIMER_FS => {}
                     TIMER_NOTE => {
                         let _ = KillTimer(Some(hwnd), TIMER_NOTE);
                         app.invalidate();

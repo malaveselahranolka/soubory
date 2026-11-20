@@ -257,6 +257,13 @@ pub fn message(app: &mut App, l: LPARAM) {
 }
 
 fn finish(app: &mut App, listed: Listed) {
+    // Hidden tabs showing this place list again when shown (the reply goes to the shown tab).
+    let cur = app.cur;
+    for (k, t) in app.tabs.iter_mut().enumerate() {
+        if k != cur && matches!(&t.loc, Loc::Shell { id, .. } if *id == listed.id) {
+            t.stale = true;
+        }
+    }
     let same = matches!(&app.tab().loc, Loc::Shell { id, .. } if *id == listed.id);
     if !same {
         return;

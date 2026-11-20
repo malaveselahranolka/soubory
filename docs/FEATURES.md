@@ -59,7 +59,7 @@ Nothing here has been tried by hand in daily use yet; see "Not verified" at the 
 | Instant whole-disk search with Czech diacritics folding (`kun` finds `kůň`), live as files change | ✅ (C: 4.2 M entries, 30 s walk, queries 3–8 ms: `docs/search-bench.md`; index reviewed twice, see `26ad376`) |
 | New file/folder from any Open/Save dialog | ✅ |
 | Cold start ≈ 200 ms (D3D device built in parallel, power-saving GPU) | ✅ (`--dev-startup`) |
-| Folder sizes in list view, live from the index; sort by size moves folders too; in the selection total and the inspector | ✅ (scratch-index harness and capture; the whole C: sums in 15 ms) |
+| Folder sizes in list, tiles and column views, live from the index (an empty folder shows 0 bajtů, an unindexed one —); sort by size moves folders too; in the selection total and the inspector | ✅ (scratch-index harness and capture; the whole C: sums in 15 ms) |
 | Filter the current folder as you type | 🔶 (search scoped to the folder) |
 | Command palette (Ctrl+K): every command plus every sidebar place, diacritics-insensitive | 🔶 (filtering tested and captured; running uses the menu handlers) |
 

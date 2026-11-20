@@ -27,7 +27,7 @@ use windows::Win32::{
         Ole::{SafeArrayCreateVector, SafeArrayPutElement},
         Variant::{VARIANT, VT_I4, VT_UNKNOWN},
     },
-    UI::{Accessibility::*, Input::KeyboardAndMouse::SetFocus, WindowsAndMessaging::PostMessageW},
+    UI::{Accessibility::*, Input::KeyboardAndMouse::SetFocus, WindowsAndMessaging::{GUI_INMENUMODE, GUITHREADINFO, GetGUIThreadInfo, PostMessageW}},
 };
 use windows_core::{BOOL, Error, HRESULT, IUnknown, Interface, Result, implement};
 
@@ -59,7 +59,7 @@ enum Kind {
     Toolbar,
     Button(Hit),
     Sidebar,
-    /// A sidebar row: index (a hint) and its label (the identity).
+    /// A sidebar row: index (a hint) and its place (the identity; labels repeat).
     Place(usize, String),
     /// The item list of the current place.
     Content,
@@ -78,11 +78,24 @@ fn place_label(row: &Row) -> Option<String> {
     }
 }
 
-fn place_index(app: &App, hint: usize, label: &str) -> Option<usize> {
+/// A sidebar row's identity: where it goes (two favourites can both be called "src").
+fn place_key(row: &Row) -> Option<String> {
+    match row {
+        Row::Item { loc, .. } => Some(format!("{loc:?}")),
+        Row::Tag(i) => Some(format!("Tag({i})")),
+        Row::Header(_) => None,
+    }
+}
+
+fn place(app: &App, k: usize) -> Kind {
+    Kind::Place(k, app.side_rows.get(k).and_then(place_key).unwrap_or_default())
+}
+
+fn place_index(app: &App, hint: usize, key: &str) -> Option<usize> {
     if !app.sidebar_on {
         return None;
     }
-    let is = |k: usize| app.side_rows.get(k).and_then(place_label).as_deref() == Some(label);
+    let is = |k: usize| app.side_rows.get(k).and_then(place_key).as_deref() == Some(key);
     if is(hint) { Some(hint) } else { (0..app.side_rows.len()).find(|&k| is(k)) }
 }
 
@@ -90,7 +103,7 @@ fn places(app: &App) -> Vec<usize> {
     if !app.sidebar_on {
         return Vec::new();
     }
-    (0..app.side_rows.len()).filter(|&k| place_label(&app.side_rows[k]).is_some()).collect()
+    (0..app.side_rows.len()).filter(|&k| place_key(&app.side_rows[k]).is_some()).collect()
 }
 
 fn item_index(app: &App, hint: usize, path: &Path) -> Option<usize> {
@@ -122,7 +135,7 @@ fn top_level(app: &App) -> Vec<Kind> {
 /// The element still exists; an item or place may have moved (its index is refreshed).
 fn resolve(app: &App, k: &Kind) -> Option<Kind> {
     match k {
-        Kind::Place(hint, label) => place_index(app, *hint, label).map(|i| Kind::Place(i, label.clone())),
+        Kind::Place(hint, key) => place_index(app, *hint, key).map(|i| Kind::Place(i, key.clone())),
         Kind::Item(hint, path) => item_index(app, *hint, path).map(|i| Kind::Item(i, path.clone())),
         Kind::Sidebar if !app.sidebar_on => None,
         other => Some(other.clone()),
@@ -135,7 +148,7 @@ fn first_child(app: &App, k: &Kind, last: bool) -> Option<Kind> {
         Kind::Sidebar => {
             let p = places(app);
             let k = if last { p.last() } else { p.first() };
-            k.map(|&k| Kind::Place(k, place_label(&app.side_rows[k]).unwrap_or_default()))
+            k.map(|&k| place(app, k))
         }
         Kind::Content => {
             let n = app.tab().entries.len();
@@ -155,7 +168,7 @@ fn sibling(app: &App, k: &Kind, next: bool) -> Option<Kind> {
         Kind::Place(i, _) => {
             let p = places(app);
             let at = p.iter().position(|x| x == i)?;
-            step(at, p.len()).map(|j| Kind::Place(p[j], place_label(&app.side_rows[p[j]]).unwrap_or_default()))
+            step(at, p.len()).map(|j| place(app, p[j]))
         }
         Kind::Item(i, _) => step(*i, app.tab().entries.len()).map(|j| item(app, j)),
         top => {
@@ -273,7 +286,7 @@ fn runtime_id(k: &Kind) -> [i32; 3] {
         Kind::Toolbar => (1, 0),
         Kind::Button(h) => (2, BUTTONS.iter().position(|b| b == h).unwrap_or(0) as i32),
         Kind::Sidebar => (3, 0),
-        Kind::Place(_, label) => (4, hash(label)),
+        Kind::Place(_, key) => (4, hash(key)),
         Kind::Content => (5, 0),
         Kind::Item(_, p) => (6, hash(&p.to_string_lossy())),
         Kind::Status => (7, 0),
@@ -402,7 +415,7 @@ impl IRawElementProviderFragmentRoot_Impl for Root_Impl {
         let l = &app.lay;
         let k = match app.hit(cx, cy) {
             Hit::Row(i) => Some(item(app, i)),
-            Hit::SideRow(k) => app.side_rows.get(k).and_then(place_label).map(|label| Kind::Place(k, label)),
+            Hit::SideRow(k) => app.side_rows.get(k).and_then(place_key).map(|key| Kind::Place(k, key)),
             h @ (Hit::SidebarBtn | Hit::Back | Hit::Fwd | Hit::View(_) | Hit::More) => Some(Kind::Button(h)),
             _ if l.body.contains(cx, cy) => Some(Kind::Content),
             _ if app.sidebar_on && l.sidebar.contains(cx, cy) => Some(Kind::Sidebar),
@@ -463,7 +476,7 @@ impl IRawElementProviderSimple_Impl for Node_Impl {
             (Kind::Sidebar, UIA_ControlTypePropertyId) => control(UIA_ListControlTypeId),
             (Kind::Sidebar, UIA_NamePropertyId) => VARIANT::from("Postranní panel"),
             (Kind::Place(..), UIA_ControlTypePropertyId) => control(UIA_ListItemControlTypeId),
-            (Kind::Place(_, label), UIA_NamePropertyId) => VARIANT::from(label.as_str()),
+            (Kind::Place(i, _), UIA_NamePropertyId) => VARIANT::from(app.side_rows.get(*i).and_then(place_label).unwrap_or_default().as_str()),
             (Kind::Content, UIA_ControlTypePropertyId) => control(UIA_ListControlTypeId),
             (Kind::Content, UIA_NamePropertyId) => VARIANT::from(app.tab().loc.title().as_str()),
             (Kind::Content, UIA_IsKeyboardFocusablePropertyId) => VARIANT::from(true),
@@ -552,7 +565,7 @@ impl ISelectionProvider_Impl for Node_Impl {
             Kind::Sidebar => places(app)
                 .into_iter()
                 .filter(|&p| place_selected(app, p))
-                .map(|p| self.simple(Kind::Place(p, place_label(&app.side_rows[p]).unwrap_or_default())))
+                .map(|p| self.simple(place(app, p)))
                 .collect(),
             _ => return Err(not_now()),
         };
@@ -654,9 +667,22 @@ fn post(hwnd: isize, a: Action) {
     }
 }
 
+fn in_menu() -> bool {
+    let mut g = GUITHREADINFO { cbSize: std::mem::size_of::<GUITHREADINFO>() as u32, ..Default::default() };
+    unsafe { GetGUIThreadInfo(0, &mut g) }.is_ok() && g.flags.contains(GUI_INMENUMODE)
+}
+
 /// WM_APP_UIA: a client asked for an action; the element is looked up again first.
 pub fn act(app: &mut App, l: LPARAM) {
     let a = unsafe { Box::from_raw(l.0 as *mut Action) };
+    // Not under a press or drag, nor inside a menu (its commands read the selection when
+    // chosen): the item under the pointer or a menu's target must not change. Dropped, as a
+    // click there would be.
+    if !matches!(app.drag, crate::app::Drag::None) || matches!(app.pressed, Hit::Row(_)) || in_menu() {
+        return;
+    }
+    // An open rename closes first, as a click would (the action may move or replace the rows).
+    crate::win::end_rename(app);
     let k = match &*a {
         Action::Invoke(k) | Action::Select(k, _) | Action::Focus(k) | Action::Reveal(k) => resolve(app, k),
     };
@@ -718,7 +744,8 @@ struct Seen {
     /// The place and its list: a change re-reads the children.
     list: (String, usize, Option<PathBuf>, Option<PathBuf>),
     focus: Option<Kind>,
-    selection: (usize, Option<usize>),
+    /// Count and the first selected item's path (an index moves when the list reloads).
+    selection: (usize, Option<PathBuf>),
 }
 
 thread_local! {
@@ -731,7 +758,7 @@ fn seen(app: &App) -> Seen {
     Seen {
         list: (t.loc.title(), n, (n > 0).then(|| t.path_of(0)), (n > 0).then(|| t.path_of(n - 1))),
         focus: if has_focus(app) { focused(app) } else { None },
-        selection: (t.sel.count(), t.sel.first()),
+        selection: (t.sel.count(), t.sel.first().map(|i| t.path_of(i))),
     }
 }
 
@@ -751,14 +778,15 @@ pub fn after_paint(app: &App) {
             let mut id = runtime_id(&Kind::Content);
             let _ = UiaRaiseStructureChangedEvent(&content, StructureChangeType_ChildrenInvalidated, id.as_mut_ptr(), id.len() as i32);
         }
-        if prev.focus != now.focus {
+        // By identity: the same item at another row (a reload, a re-sort) did not change.
+        if prev.focus.as_ref().map(runtime_id) != now.focus.as_ref().map(runtime_id) {
             if let Some(k) = &now.focus {
                 let p: IRawElementProviderSimple = node(hwnd, k.clone()).into();
                 let _ = UiaRaiseAutomationEvent(&p, UIA_AutomationFocusChangedEventId);
             }
         }
         if prev.selection != now.selection {
-            match now.selection {
+            match (now.selection.0, app.tab().sel.first()) {
                 (1, Some(i)) => {
                     let p: IRawElementProviderSimple = node(hwnd, item(app, i)).into();
                     let _ = UiaRaiseAutomationEvent(&p, UIA_SelectionItem_ElementSelectedEventId);

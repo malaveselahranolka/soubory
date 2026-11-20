@@ -1410,6 +1410,13 @@ pub fn open_terminal(app: &mut App) {
 /// lists again (background tabs do it when shown).
 pub fn tags_changed(app: &mut App) {
     fn refresh(a: &mut App) {
+        // Hidden tabs list again when shown.
+        let cur = a.cur;
+        for (k, t) in a.tabs.iter_mut().enumerate() {
+            if k != cur && (matches!(t.loc, Loc::Tag(_)) || t.group == crate::groups::GroupKey::Tags) {
+                t.stale = true;
+            }
+        }
         if matches!(a.tab().loc, Loc::Tag(_)) || a.groups_by_tags() {
             a.reload(None);
         }
