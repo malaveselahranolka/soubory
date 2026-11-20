@@ -70,7 +70,11 @@ pub fn sync_columns(app: &mut App) {
     }
     let t = app.tab();
     let idx = t.sel.indices();
-    let want = (idx.len() == 1).then(|| idx[0]).filter(|&i| t.entries[i].is_dir).map(|i| t.path_of(i));
+    let want = (idx.len() == 1)
+        .then(|| idx[0])
+        .filter(|&i| t.entries[i].is_dir)
+        .map(|i| t.path_of(i))
+        .filter(|p| p.is_absolute());
     let have = t.col_right.as_ref().map(|p| p.dir.clone());
     if want != have {
         let pane = want.map(|d| Pane::load(app, &d));
@@ -550,6 +554,8 @@ pub fn paint_inspector(app: &mut App, c: &mut Canvas, t: &Theme, r: Rect) {
                     created: 0,
                     attrs: 0x10,
                     full: Some(dir.clone()),
+                    shell: None,
+                    origin: None,
                 };
                 preview_card(app, c, t, r, &dir, &e, false);
             }

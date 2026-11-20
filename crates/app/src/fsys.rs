@@ -27,6 +27,10 @@ pub struct Entry {
     pub attrs: u32,
     /// Full path for items outside the current folder (search results, Recents, drives).
     pub full: Option<PathBuf>,
+    /// Shell locations (Recycle Bin, Network, devices): the item's absolute ID list.
+    pub shell: Option<crate::shellns::ShellId>,
+    /// Recycle Bin: where the item was deleted from.
+    pub origin: Option<String>,
 }
 
 impl Entry {
@@ -77,6 +81,8 @@ pub fn entry_of(p: &Path) -> Option<Entry> {
         created: ft(d.ftCreationTime),
         attrs: d.dwFileAttributes,
         full: Some(p.to_path_buf()),
+        shell: None,
+        origin: None,
     })
 }
 
@@ -137,6 +143,8 @@ pub fn list_dir(dir: &Path, show_hidden: bool) -> std::io::Result<Vec<Entry>> {
                         attrs: fd.dwFileAttributes,
                         name,
                         full: None,
+                        shell: None,
+                        origin: None,
                     });
                 }
             }
@@ -507,6 +515,8 @@ mod tests {
             created: 0,
             attrs: 0,
             full: None,
+            shell: None,
+            origin: None,
         }
     }
 

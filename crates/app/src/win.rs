@@ -26,6 +26,7 @@ pub const WM_APP_THUMB: u32 = WM_APP + 11;
 pub const WM_APP_SEARCH: u32 = WM_APP + 12;
 pub const WM_APP_INDEX: u32 = WM_APP + 13;
 pub const WM_APP_OPDONE: u32 = WM_APP + 14;
+pub const WM_APP_SHELLLIST: u32 = WM_APP + 15;
 const TIMER_FS: usize = 1;
 const TIMER_NOTE: usize = 2;
 const EDIT_SEARCH: usize = 100;
@@ -54,6 +55,8 @@ struct Edit {
 struct Watch {
     stop: HANDLE,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// Shell locations are watched through SHChangeNotifyRegister instead.
+    shell: u32,
 }
 
 thread_local! {
@@ -397,6 +400,18 @@ fn dev_keys(app: &mut App, script: &str, out: Option<String>) {
             }
         } else if let Some(ms) = step.strip_prefix("wait:").and_then(|n| n.parse::<u64>().ok()) {
             pump(ms);
+        } else if step == "go:bin" || step == "go:net" {
+            let loc = if step == "go:bin" { crate::shellns::recycle_bin() } else { crate::shellns::network() };
+            if let Some(l) = loc {
+                app.go(l);
+            }
+        } else if step == "dumpshell" {
+            // Counts only, plus items that came from the scratch folder: never the user's own.
+            let t = app.tab();
+            log += &format!("loc={} count={} loading={} error={:?}\n", t.loc.title(), t.entries.len(), t.loading, t.error);
+            for e in t.entries.iter().filter(|e| e.origin.as_deref().unwrap_or("").contains("scratchpad")) {
+                log += &format!("  {} | from {} | deleted>0={} | shell={}\n", e.name, e.origin.clone().unwrap_or_default(), e.modified > 0, e.shell.is_some());
+            }
         } else if step == "dump" {
             app.reload(None);
             let names: Vec<String> = app.tab().entries.iter().map(|e| e.name.clone()).collect();
@@ -608,6 +623,7 @@ fn stop_watch(hwnd: HWND) {
     });
     {
         if let Some(mut old) = gone {
+            crate::shellns::unwatch(old.shell);
             unsafe {
                 let _ = SetEvent(old.stop);
             }
@@ -627,6 +643,13 @@ pub fn watch_current(app: &mut App) {
         return;
     }
     stop_watch(app.hwnd);
+    if let Loc::Shell { id, .. } = &app.tab().loc {
+        let reg = crate::shellns::watch(app.hwnd, id);
+        if let Ok(stop) = unsafe { CreateEventW(None, true, false, None) } {
+            WATCHES.with(|w| w.borrow_mut().push((app.hwnd.0 as isize, Watch { stop, thread: None, shell: reg })));
+        }
+        return;
+    }
     let Some(dir) = app.tab().loc.folder().map(Path::to_path_buf) else {
         return;
     };
@@ -670,6 +693,7 @@ pub fn watch_current(app: &mut App) {
                 Watch {
                     stop,
                     thread: Some(thread),
+                    shell: 0,
                 },
             ))
         });
@@ -1579,6 +1603,10 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
             }
             WM_APP_SEARCH => {
                 crate::search::message(app, wparam, lparam);
+                LRESULT(0)
+            }
+            WM_APP_SHELLLIST => {
+                crate::shellns::message(app, lparam);
                 LRESULT(0)
             }
             WM_SETTINGCHANGE

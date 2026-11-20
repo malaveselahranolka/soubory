@@ -202,7 +202,7 @@ fn submenu(m: HMENU, text: &str) -> HMENU {
     }
 }
 
-fn track(app: &App, m: HMENU, pt: POINT) -> u32 {
+pub(crate) fn track(app: &App, m: HMENU, pt: POINT) -> u32 {
     unsafe {
         let _ = SetForegroundWindow(app.hwnd);
         let r = TrackPopupMenuEx(
@@ -238,7 +238,7 @@ fn verb_of(cm: &IContextMenu, offset: u32) -> String {
     String::new()
 }
 
-fn invoke(cm: &IContextMenu, hwnd: HWND, offset: u32, dir: Option<&Path>, pt: Option<POINT>) {
+pub(crate) fn invoke(cm: &IContextMenu, hwnd: HWND, offset: u32, dir: Option<&Path>, pt: Option<POINT>) {
     let dir_w = dir.map(|d| wide(&d.to_string_lossy()));
     let dir_a: Option<Vec<u8>> = dir.map(|d| d.to_string_lossy().bytes().chain([0]).collect());
     let mut info = CMINVOKECOMMANDINFOEX {
@@ -288,7 +288,7 @@ pub fn invoke_verb(cm: &IContextMenu, hwnd: HWND, verb: &str) -> bool {
     }
 }
 
-fn with_active<R>(cms: &[&IContextMenu], f: impl FnOnce() -> R) -> R {
+pub(crate) fn with_active<R>(cms: &[&IContextMenu], f: impl FnOnce() -> R) -> R {
     ACTIVE.with(|a| a.borrow_mut().extend(cms.iter().map(|c| (*c).clone())));
     let r = f();
     ACTIVE.with(|a| a.borrow_mut().clear());
@@ -316,6 +316,10 @@ pub fn open_path(hwnd: HWND, path: &Path) {
 
 /// Right-click on items: our Finder-style entries, then Explorer's full menu.
 pub fn item_menu(app: &mut App, pt: POINT) {
+    if matches!(app.tab().loc, Loc::Shell { .. }) {
+        crate::shellns::item_menu(app, pt);
+        return;
+    }
     let paths = app.tab().selected_paths();
     if paths.is_empty() {
         return;
@@ -440,6 +444,10 @@ pub fn item_menu(app: &mut App, pt: POINT) {
 
 /// Right-click on empty space: New, Paste, view options, then the folder's shell extensions.
 pub fn background_menu(app: &mut App, pt: POINT) {
+    if matches!(app.tab().loc, Loc::Shell { .. }) {
+        crate::shellns::background_menu(app, pt);
+        return;
+    }
     let Some(dir) = app.tab().loc.folder().map(Path::to_path_buf) else {
         more_menu_at(app, pt);
         return;
@@ -1387,6 +1395,8 @@ pub fn recent_items(limit: usize) -> Vec<Entry> {
                     | data.ftCreationTime.dwLowDateTime as u64,
                 attrs: data.dwFileAttributes,
                 full: Some(target),
+                shell: None,
+                origin: None,
             });
         }
     }

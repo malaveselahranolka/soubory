@@ -18,6 +18,7 @@ mod render;
 mod search;
 mod sel;
 mod shell;
+mod shellns;
 mod sidebar;
 mod tags;
 mod undo;

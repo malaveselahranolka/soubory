@@ -257,6 +257,8 @@ pub fn message(app: &mut App, _w: WPARAM, l: LPARAM) {
             created: 0,
             attrs: h.attrs,
             full: Some(PathBuf::from(h.path)),
+            shell: None,
+            origin: None,
         })
         .collect();
     set_entries(app, entries);

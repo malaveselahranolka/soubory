@@ -32,6 +32,7 @@ pub mod glyph {
     pub const COMPUTER: char = '\u{E7F8}';
     pub const FOLDER: char = '\u{E8B7}';
     pub const EJECT: char = '\u{F847}';
+    pub const BIN: char = '\u{E74D}';
 }
 
 pub fn build(favorites: &[PathBuf]) -> Vec<Row> {
@@ -99,6 +100,12 @@ pub fn build(favorites: &[PathBuf]) -> Vec<Row> {
             loc: Loc::Folder(v.root),
             eject: v.removable,
         });
+    }
+    if let Some(loc) = crate::shellns::network() {
+        rows.push(Row::Item { label: "Síť".into(), glyph: glyph::NETWORK, loc, eject: false });
+    }
+    if let Some(loc) = crate::shellns::recycle_bin() {
+        rows.push(Row::Item { label: "Koš".into(), glyph: glyph::BIN, loc, eject: false });
     }
     rows.push(Row::Header("Štítky"));
     for i in 0..crate::theme::TAGS.len() {

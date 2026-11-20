@@ -569,7 +569,8 @@ pub fn list_cols(app: &App) -> Vec<(Col, f32)> {
     if matches!(
         app.tab().loc,
         Loc::Search { .. } | Loc::Recents | Loc::Tag(_)
-    ) {
+    ) || app.tab().entries.iter().take(1).any(|e| e.origin.is_some())
+    {
         v.push((Col::Location, 220.0));
     }
     v.push((Col::Modified, 150.0));
@@ -657,6 +658,9 @@ fn ensure_icon(app: &mut App, i: usize) -> i32 {
     let dir = tab.dir();
     let e = tab.entries[i].clone();
     let idx = match &e.full {
+        _ if matches!(tab.loc, Loc::Shell { .. }) && e.shell.is_some() => {
+            crate::shellns::icon_index(e.shell.as_ref().unwrap())
+        }
         Some(p) if matches!(tab.loc, Loc::Computer) => app.icons.index_for_path(p),
         Some(p) => {
             let parent = p.parent().map(|q| q.to_path_buf()).unwrap_or_default();
@@ -790,12 +794,13 @@ fn list_view(app: &mut App, c: &mut Canvas, t: &Theme) {
                     Align::Start,
                 ),
                 Col::Location => {
-                    let loc = e
-                        .full
-                        .as_ref()
-                        .and_then(|p| p.parent())
-                        .map(|p| p.to_string_lossy().into_owned())
-                        .unwrap_or_default();
+                    let loc = e.origin.clone().unwrap_or_else(|| {
+                        e.full
+                            .as_ref()
+                            .and_then(|p| p.parent())
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .unwrap_or_default()
+                    });
                     let loc = c.fit_path(&loc, Font::Body, cell.w - 16.0);
                     c.text(&loc, cell.inset(8.0, 0.0), Font::Body, ink2, Align::Start);
                 }
@@ -832,6 +837,26 @@ fn empty_state(app: &App, c: &mut Canvas, t: &Theme, b: Rect) {
             g::SEARCH,
             "Nic nenalezeno".into(),
             "Zkuste kratší nebo jiný výraz.".into(),
+        ),
+        (None, _) if tab.loading => (
+            g::SEARCH,
+            "Načítání…".into(),
+            "Síťová místa a zařízení mohou chvíli trvat.".into(),
+        ),
+        (None, Loc::Shell { id, .. }) if crate::shellns::is_recycle_bin(id) => (
+            g::EMPTY,
+            "Koš je prázdný".into(),
+            "Smazané položky tu zůstanou, dokud koš nevysypete.".into(),
+        ),
+        (None, Loc::Shell { id, .. }) if crate::shellns::is_network(id) => (
+            g::EMPTY,
+            "V síti nic nevidím".into(),
+            "Zapněte zjišťování sítě v Nastavení › Síť a internet.".into(),
+        ),
+        (None, Loc::Shell { .. }) => (
+            g::EMPTY,
+            "Nic tu není".into(),
+            "Zkuste to znovu (F5).".into(),
         ),
         (None, Loc::Tag(_)) => (
             g::EMPTY,

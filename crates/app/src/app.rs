@@ -24,6 +24,11 @@ pub enum Loc {
         text: String,
         scope: Option<PathBuf>,
     },
+    /// A shell namespace folder that is not a plain folder (Recycle Bin, Network, a phone).
+    Shell {
+        id: crate::shellns::ShellId,
+        name: String,
+    },
 }
 
 impl Loc {
@@ -40,6 +45,7 @@ impl Loc {
             Loc::Recents => "Nedávné".into(),
             Loc::Tag(i) => crate::theme::TAGS[*i].1.into(),
             Loc::Search { text, .. } => format!("Hledání „{text}“"),
+            Loc::Shell { name, .. } => name.clone(),
         }
     }
 }
@@ -72,6 +78,8 @@ pub struct Tab {
     pub col_scroll: f32,
     /// Search results in relevance order until a column header is clicked.
     pub by_rank: bool,
+    /// A slow location (network, device) is still being listed.
+    pub loading: bool,
 }
 
 impl Tab {
@@ -92,6 +100,7 @@ impl Tab {
             col_right: None,
             col_scroll: 0.0,
             by_rank: true,
+            loading: false,
         }
     }
     pub fn dir(&self) -> PathBuf {
@@ -318,6 +327,10 @@ impl App {
             crate::search::run(self);
             return;
         }
+        if matches!(self.tab().loc, Loc::Shell { .. }) {
+            crate::shellns::start_list(self);
+            return;
+        }
         let show_hidden = self.prefs.show_hidden;
         let folders_first = self.prefs.folders_first;
         let keep: Vec<String> = {
@@ -345,6 +358,8 @@ impl App {
                     created: 0,
                     attrs: 0x10,
                     full: Some(v.root),
+                    shell: None,
+                    origin: None,
                 })
                 .collect()),
             Loc::Recents => Ok(crate::shell::recent_items(200)),
@@ -352,7 +367,7 @@ impl App {
                 .iter()
                 .filter_map(|p| fsys::entry_of(p))
                 .collect()),
-            Loc::Search { .. } => Ok(Vec::new()),
+            Loc::Search { .. } | Loc::Shell { .. } => Ok(Vec::new()),
         };
         match res {
             Ok(mut v) => {
@@ -468,6 +483,10 @@ impl App {
 
     /// Opens entry `i`: folders navigate, files open with their default app.
     pub fn open(&mut self, i: usize, new_tab: bool) {
+        if matches!(self.tab().loc, Loc::Shell { .. }) {
+            crate::shellns::open(self, i, new_tab);
+            return;
+        }
         let t = self.tab();
         let Some(e) = t.entries.get(i) else { return };
         let path = t.path_of(i);
@@ -488,6 +507,10 @@ impl App {
             self.open(idx[0], false);
         } else {
             for i in idx {
+                if matches!(self.tab().loc, Loc::Shell { .. }) {
+                    crate::shellns::open(self, i, true);
+                    continue;
+                }
                 let t = self.tab();
                 if t.entries[i].is_dir {
                     self.new_tab(Loc::Folder(t.path_of(i)));
