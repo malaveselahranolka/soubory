@@ -497,6 +497,27 @@ impl Service {
         Some(merged.into_iter().map(|r| r.hit).collect())
     }
 
+    /// Sizes of the folders at `paths`: bytes of every file below each, as far as the index has
+    /// seen them (`None` where no managed volume indexes the path). `None` if cancelled. The read
+    /// lock is taken per folder, so the watcher is never held up for a whole batch.
+    #[must_use]
+    pub fn folder_sizes(&self, paths: &[String], cancel: &CancelToken) -> Option<Vec<Option<u64>>> {
+        let mut out = vec![None; paths.len()];
+        for (k, p) in paths.iter().enumerate() {
+            for vol in &self.volumes {
+                if cancel.is_cancelled() {
+                    return None;
+                }
+                let guard = read_or_recover(&vol.index);
+                if let Some(id) = guard.lookup(p).filter(|&id| guard.is_dir(id)) {
+                    out[k] = Some(guard.subtree_size(id).0);
+                    break;
+                }
+            }
+        }
+        Some(out)
+    }
+
     /// Returns the total live entry count across all managed volumes.
     #[must_use]
     pub fn entries(&self) -> usize {

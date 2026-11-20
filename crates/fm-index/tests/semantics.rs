@@ -1045,3 +1045,27 @@ fn file_id_map_property_vs_naive_model() {
         }
     }
 }
+
+#[test]
+fn subtree_size_sums_files_below_a_folder() {
+    let mut idx = Index::new();
+    let c = idx.add_root("C:\\");
+    let a = idx.insert(c, "a", m_dir(1, false));
+    let b = idx.insert(a, "b", m_dir(1, false));
+    let deep = idx.insert(b, "deep", m_dir(1, false));
+    idx.insert(a, "x.txt", Meta { size: 10, ..m_file(1, false) });
+    idx.insert(b, "y.bin", Meta { size: 32, ..m_file(1, false) });
+    let z = idx.insert(deep, "z.dat", Meta { size: 100, ..m_file(1, false) });
+    idx.insert(c, "outside.txt", Meta { size: 7, ..m_file(1, false) });
+    assert_eq!(idx.subtree_size(a), (142, 3));
+    assert_eq!(idx.subtree_size(b), (132, 2));
+    assert_eq!(idx.subtree_size(c), (149, 4));
+    assert_eq!(idx.subtree_size(z), (0, 0)); // a file
+    idx.remove(deep);
+    assert_eq!(idx.subtree_size(a), (42, 2));
+    assert_eq!(idx.subtree_size(deep), (0, 0)); // dead
+    let y = idx.lookup(r"C:\a\b\y.bin").unwrap();
+    idx.move_to(y, c, "y.bin");
+    assert_eq!(idx.subtree_size(a), (10, 1));
+    assert_eq!(idx.subtree_size(c), (49, 3));
+}

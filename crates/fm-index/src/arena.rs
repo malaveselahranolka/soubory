@@ -742,6 +742,30 @@ impl Index {
             .filter_map(|(i, &f)| ((f & FLAG_ALIVE) != 0).then_some(i as EntryId))
     }
 
+    /// Bytes and count of the files anywhere under directory `id` (0 for a file or a dead id).
+    /// Walks only that subtree, iteratively, so deep trees cannot overflow the stack.
+    #[must_use]
+    pub fn subtree_size(&self, id: EntryId) -> (u64, u64) {
+        if !self.is_alive(id) || (self.attrs[id as usize] & DIRECTORY) == 0 {
+            return (0, 0);
+        }
+        let (mut bytes, mut files) = (0u64, 0u64);
+        let mut stack = vec![self.first_child[id as usize]];
+        while let Some(mut c) = stack.pop() {
+            while c != NONE {
+                let i = c as usize;
+                if (self.attrs[i] & DIRECTORY) != 0 {
+                    stack.push(self.first_child[i]);
+                } else {
+                    bytes = bytes.saturating_add(self.size[i]);
+                    files += 1;
+                }
+                c = self.next_sibling[i];
+            }
+        }
+        (bytes, files)
+    }
+
     /// Returns `true` if `id` is a directory.
     #[inline]
     #[must_use]

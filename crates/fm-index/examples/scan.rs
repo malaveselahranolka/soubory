@@ -70,4 +70,20 @@ fn main() {
             res.total_matches
         );
     }
+
+    // Folder sizes (list view): the root and each of its folders, timings only.
+    if let Some(rid) = idx.lookup(&root) {
+        let t0 = Instant::now();
+        let (_, files) = idx.subtree_size(rid);
+        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+        println!("
+Folder size of the root: {files} files summed in {ms:.1} ms");
+        let tops: Vec<_> = idx.iter_ids().filter(|&id| idx.parent(id) == Some(rid) && idx.is_dir(id)).collect();
+        let t0 = Instant::now();
+        for &id in &tops {
+            let _ = idx.subtree_size(id);
+        }
+        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+        println!("Folder sizes of its {} folders (a list of the root): {ms:.1} ms", tops.len());
+    }
 }
