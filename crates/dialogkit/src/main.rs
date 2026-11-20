@@ -50,7 +50,15 @@ fn main() {
             attach_console();
             dump()
         }
-        _ => app::run(),
+        _ => {
+            let code = app::run();
+            // The pill draws through Direct2D on the GPU; some drivers (Intel igd10um64xe.dll)
+            // can spin forever in their process-detach code. Everything is cleaned up by now.
+            unsafe {
+                let _ = windows::Win32::System::Threading::TerminateProcess(windows::Win32::System::Threading::GetCurrentProcess(), code as u32);
+            }
+            code
+        }
     };
     std::process::exit(code);
 }
