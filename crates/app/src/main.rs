@@ -20,6 +20,7 @@ mod sel;
 mod shell;
 mod sidebar;
 mod tags;
+mod undo;
 mod theme;
 mod thumbs;
 mod views;

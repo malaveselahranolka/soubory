@@ -270,7 +270,7 @@ fn invoke(cm: &IContextMenu, hwnd: HWND, offset: u32, dir: Option<&Path>, pt: Op
     }
 }
 
-fn invoke_verb(cm: &IContextMenu, hwnd: HWND, verb: &str) -> bool {
+pub fn invoke_verb(cm: &IContextMenu, hwnd: HWND, verb: &str) -> bool {
     let a: Vec<u8> = verb.bytes().chain([0]).collect();
     let w = wide(verb);
     let info = CMINVOKECOMMANDINFOEX {
@@ -851,6 +851,41 @@ pub fn verb_on_selection(app: &mut App, verb: &str) {
     }
 }
 
+/// File paths on the clipboard and whether they were cut (Preferred DropEffect = move).
+/// None for anything that is not plain files (the shell's paste handles those).
+fn clipboard_files(hwnd: HWND) -> Option<(Vec<PathBuf>, bool)> {
+    unsafe {
+        OpenClipboard(Some(hwnd)).ok()?;
+        let read = || -> Option<(Vec<PathBuf>, bool)> {
+            let h = GetClipboardData(15).ok()?; // CF_HDROP
+            let drop = HDROP(h.0);
+            let n = DragQueryFileW(drop, u32::MAX, None);
+            let mut paths = Vec::new();
+            for i in 0..n {
+                let len = DragQueryFileW(drop, i, None) as usize;
+                let mut buf = vec![0u16; len + 1];
+                DragQueryFileW(drop, i, Some(&mut buf));
+                paths.push(PathBuf::from(String::from_utf16_lossy(&buf[..len])));
+            }
+            let fmt = RegisterClipboardFormatW(w!("Preferred DropEffect"));
+            let moving = GetClipboardData(fmt)
+                .ok()
+                .map(|g| {
+                    let hg = HGLOBAL(g.0);
+                    let p = GlobalLock(hg) as *const u32;
+                    let v = if p.is_null() { 0 } else { *p };
+                    let _ = GlobalUnlock(hg);
+                    v & DROPEFFECT_MOVE.0 != 0
+                })
+                .unwrap_or(false);
+            (!paths.is_empty()).then_some((paths, moving))
+        };
+        let r = read();
+        let _ = CloseClipboard();
+        r
+    }
+}
+
 fn can_paste() -> bool {
     unsafe { IsClipboardFormatAvailable(15).is_ok() } // CF_HDROP
 }
@@ -861,6 +896,25 @@ pub fn paste(app: &mut App) {
     };
     if !can_paste() {
         app.note("Ve schránce nejsou žádné soubory.");
+        return;
+    }
+    if let Some((paths, moving)) = clipboard_files(app.hwnd) {
+        if !moving && paths.iter().all(|p| p.parent() == Some(dir.as_path())) {
+            duplicate_into(app, &dir, paths);
+        } else if moving && paths.iter().all(|p| p.parent() == Some(dir.as_path())) {
+            // Cut and pasted back into the same folder: nothing to do.
+        } else {
+            file_op(app.hwnd, paths, Some(dir), if moving { Op::Move } else { Op::Copy }, true);
+            if moving {
+                // A cut is used up by its paste (Explorer).
+                unsafe {
+                    if OpenClipboard(Some(app.hwnd)).is_ok() {
+                        let _ = EmptyClipboard();
+                        let _ = CloseClipboard();
+                    }
+                }
+            }
+        }
         return;
     }
     if let Some(bg) = background_cm(app.hwnd, &dir) {
@@ -948,6 +1002,7 @@ pub fn delete(app: &mut App, permanent: bool) {
         } else {
             Op::Recycle
         },
+        true,
     );
     if let Some(n) = next_name {
         app.tab_mut().sel.clear();
@@ -966,31 +1021,45 @@ pub enum Op {
 }
 
 /// Runs an IFileOperation on its own STA thread; the shell shows progress, conflicts and errors.
-pub fn file_op(owner: HWND, paths: Vec<PathBuf>, dest: Option<PathBuf>, op: Op) {
+/// With `record`, what actually happened goes onto the undo stack when it finishes.
+pub fn file_op(owner: HWND, paths: Vec<PathBuf>, dest: Option<PathBuf>, op: Op, record: bool) {
     let owner_raw = owner.0 as usize;
+    let hub = crate::win::hub().0 as usize;
     std::thread::spawn(move || unsafe {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
-        let run = || -> Result<()> {
-            let fo: IFileOperation = CoCreateInstance(&FileOperation, None, CLSCTX_ALL)?;
-            fo.SetOwnerWindow(HWND(owner_raw as *mut c_void))?;
-            let flags = match op {
-                Op::Recycle => {
-                    FOF_ALLOWUNDO.0 as u32 | FOFX_RECYCLEONDELETE.0 | FOF_WANTNUKEWARNING.0 as u32
+        let done = file_op_sync(HWND(owner_raw as *mut c_void), &paths, dest.as_deref(), op);
+        if record {
+            if let Some(op) = done {
+                let b = Box::into_raw(Box::new(crate::undo::Done { op }));
+                if PostMessageW(Some(HWND(hub as *mut c_void)), crate::win::WM_APP_OPDONE, WPARAM(0), LPARAM(b as isize)).is_err() {
+                    drop(Box::from_raw(b));
                 }
+            }
+        }
+        CoUninitialize();
+    });
+}
+
+/// The same, on the calling (STA) thread. Returns what happened, for undo.
+pub fn file_op_sync(owner: HWND, paths: &[PathBuf], dest: Option<&Path>, op: Op) -> Option<crate::undo::Op> {
+    let target = |p: &PathBuf| dest.zip(p.file_name()).map(|(d, n)| d.join(n));
+    let existed: Vec<bool> = paths.iter().map(|p| target(p).is_some_and(|t| t.exists())).collect();
+    let run = || -> Result<()> {
+        unsafe {
+            let fo: IFileOperation = CoCreateInstance(&FileOperation, None, CLSCTX_ALL)?;
+            fo.SetOwnerWindow(owner)?;
+            let flags = match op {
+                Op::Recycle => FOF_ALLOWUNDO.0 as u32 | FOFX_RECYCLEONDELETE.0 | FOF_WANTNUKEWARNING.0 as u32,
                 Op::DeletePermanent => FOF_WANTNUKEWARNING.0 as u32,
                 Op::Copy | Op::Move => FOF_ALLOWUNDO.0 as u32 | FOF_NOCONFIRMMKDIR.0 as u32,
             };
             fo.SetOperationFlags(FILEOPERATION_FLAGS(flags))?;
-            let dest_item: Option<IShellItem> = match &dest {
-                Some(d) => Some(SHCreateItemFromParsingName(
-                    PCWSTR(wide(&d.to_string_lossy()).as_ptr()),
-                    None,
-                )?),
+            let dest_item: Option<IShellItem> = match dest {
+                Some(d) => Some(SHCreateItemFromParsingName(PCWSTR(wide(&d.to_string_lossy()).as_ptr()), None)?),
                 None => None,
             };
-            for p in &paths {
-                let item: IShellItem =
-                    SHCreateItemFromParsingName(PCWSTR(wide(&p.to_string_lossy()).as_ptr()), None)?;
+            for p in paths {
+                let item: IShellItem = SHCreateItemFromParsingName(PCWSTR(wide(&p.to_string_lossy()).as_ptr()), None)?;
                 match op {
                     Op::Recycle | Op::DeletePermanent => fo.DeleteItem(&item, None)?,
                     Op::Copy => fo.CopyItem(&item, dest_item.as_ref(), PCWSTR::null(), None)?,
@@ -998,10 +1067,29 @@ pub fn file_op(owner: HWND, paths: Vec<PathBuf>, dest: Option<PathBuf>, op: Op) 
                 }
             }
             fo.PerformOperations()
-        };
-        let _ = run();
-        CoUninitialize();
-    });
+        }
+    };
+    if let Err(e) = run() {
+        crate::prefs::log(&format!("file operation failed: {e}"));
+    }
+    match op {
+        Op::Recycle => Some(crate::undo::Op::Recycled(paths.iter().filter(|p| !p.exists()).cloned().collect())),
+        Op::DeletePermanent => None,
+        Op::Move => Some(crate::undo::Op::Moved(
+            paths
+                .iter()
+                .filter_map(|p| target(p).map(|t| (p.clone(), t)))
+                .filter(|(p, t)| !p.exists() && t.exists())
+                .collect(),
+        )),
+        Op::Copy => Some(crate::undo::Op::Created(
+            paths
+                .iter()
+                .zip(existed)
+                .filter_map(|(p, before)| target(p).filter(|t| !before && t.exists()))
+                .collect(),
+        )),
+    }
 }
 
 pub fn rename(old: &Path, new_name: &str) -> std::result::Result<(), String> {
@@ -1046,6 +1134,7 @@ pub fn new_folder(app: &mut App) {
     match fm_fs::create_new_dir(&dir, "Nová složka") {
         Ok(p) => {
             notify_created(&p, true);
+            crate::undo::push(crate::undo::Op::Created(vec![p.clone()]));
             let name = p.file_name().map(|n| n.to_string_lossy().into_owned());
             if app.tab().view == View::Columns || app.tab().view == View::Gallery {
                 app.set_view(View::List);
@@ -1084,7 +1173,13 @@ pub fn new_folder_with_selection(app: &mut App) {
     match fm_fs::create_new_dir(&dir, "Nová složka s položkami") {
         Ok(p) => {
             notify_created(&p, true);
-            file_op(app.hwnd, paths, Some(p.clone()), Op::Move);
+            crate::undo::push(crate::undo::Op::Group(vec![
+                crate::undo::Op::Created(vec![p.clone()]),
+                crate::undo::Op::Moved(
+                    paths.iter().filter_map(|s| s.file_name().map(|n| (s.clone(), p.join(n)))).collect(),
+                ),
+            ]));
+            file_op(app.hwnd, paths, Some(p.clone()), Op::Move, false);
             let name = p.file_name().map(|n| n.to_string_lossy().into_owned());
             app.reload(name.as_deref());
             crate::win::begin_rename(app);
@@ -1099,6 +1194,14 @@ pub fn duplicate(app: &mut App) {
         return;
     };
     let paths = app.tab().selected_paths();
+    duplicate_into(app, &dir, paths);
+}
+
+/// Copies `paths` into `dir` as "name - kopie" (", 2", …), which is what copying an item into
+/// its own folder does in Explorer. The copies go onto the undo stack.
+fn duplicate_into(app: &mut App, dir: &Path, paths: Vec<PathBuf>) {
+    let mut made = Vec::new();
+    let mut taken = names(dir);
     for p in paths {
         let name = p
             .file_name()
@@ -1109,14 +1212,15 @@ pub fn duplicate(app: &mut App) {
             Some(i) if i > 0 && !is_dir => (name[..i].to_string(), name[i + 1..].to_string()),
             _ => (name.clone(), String::new()),
         };
-        let existing = names(&dir);
         let target = fm_fs::unique_name(
-            |n| existing.contains(&n.to_lowercase()),
+            |n| taken.contains(&n.to_lowercase()),
             &format!("{stem} - kopie"),
             &ext,
         );
+        taken.insert(target.to_lowercase());
+        made.push(dir.join(&target));
         std::thread::spawn({
-            let (p, dir, owner) = (p.clone(), dir.clone(), app.hwnd.0 as usize);
+            let (p, dir, owner) = (p.clone(), dir.to_path_buf(), app.hwnd.0 as usize);
             move || unsafe {
                 let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
                 let run = || -> Result<()> {
@@ -1139,6 +1243,9 @@ pub fn duplicate(app: &mut App) {
                 CoUninitialize();
             }
         });
+    }
+    if !made.is_empty() {
+        crate::undo::push(crate::undo::Op::Created(made));
     }
 }
 

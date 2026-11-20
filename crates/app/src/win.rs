@@ -25,6 +25,7 @@ pub const WM_APP_FS: u32 = WM_APP + 10;
 pub const WM_APP_THUMB: u32 = WM_APP + 11;
 pub const WM_APP_SEARCH: u32 = WM_APP + 12;
 pub const WM_APP_INDEX: u32 = WM_APP + 13;
+pub const WM_APP_OPDONE: u32 = WM_APP + 14;
 const TIMER_FS: usize = 1;
 const TIMER_NOTE: usize = 2;
 const EDIT_SEARCH: usize = 100;
@@ -283,6 +284,10 @@ unsafe extern "system" fn hub_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
                 crate::search::tick(w.0);
                 Some(LRESULT(0))
             }
+            WM_APP_OPDONE => {
+                crate::undo::done(Box::from_raw(l.0 as *mut crate::undo::Done));
+                Some(LRESULT(0))
+            }
             WM_COPYDATA => {
                 let cds = &*(l.0 as *const COPYDATASTRUCT);
                 if cds.dwData != COPY_OPEN {
@@ -358,7 +363,57 @@ fn dev_flags(app: &mut App) {
         crate::quicklook::toggle(app);
     }
     crate::droptarget::dev(app, &args);
+    if let Some(script) = val("--dev-keys") {
+        dev_keys(app, &script, val("--dev-out"));
+    }
     app.invalidate();
+}
+
+/// `--dev-keys "sel:0,ctrl+d,wait:1500,dump,ctrl+z,…"`: feeds keys to the app's own key handler
+/// (never synthesized input), pumping messages between steps; `dump` appends the folder listing
+/// and the status note to `--dev-out`.
+fn dev_keys(app: &mut App, script: &str, out: Option<String>) {
+    let mut log = String::new();
+    let pump = |ms: u64| unsafe {
+        let start = std::time::Instant::now();
+        while start.elapsed() < std::time::Duration::from_millis(ms) {
+            let mut msg = MSG::default();
+            while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    };
+    for step in script.split(',').map(str::trim) {
+        let (mods, key) = match step.rsplit_once('+') {
+            Some((m, k)) => (m, k),
+            None => ("", step),
+        };
+        let (ctrl, shift) = (mods.contains("ctrl"), mods.contains("shift"));
+        if let Some(n) = step.strip_prefix("sel:").and_then(|n| n.parse::<usize>().ok()) {
+            if n < app.tab().entries.len() {
+                app.tab_mut().sel.select_only(n);
+            }
+        } else if let Some(ms) = step.strip_prefix("wait:").and_then(|n| n.parse::<u64>().ok()) {
+            pump(ms);
+        } else if step == "dump" {
+            app.reload(None);
+            let names: Vec<String> = app.tab().entries.iter().map(|e| e.name.clone()).collect();
+            log += &format!("{} | note: {}\n", names.join(" ; "), app.status_note.as_ref().map(|n| n.0.clone()).unwrap_or_default());
+        } else {
+            let vk = match key {
+                "del" => VK_DELETE,
+                k if k.len() == 1 => VIRTUAL_KEY(k.to_ascii_uppercase().as_bytes()[0] as u16),
+                _ => continue,
+            };
+            app.key(vk, ctrl, shift, false);
+            pump(50);
+        }
+    }
+    if let Some(o) = out {
+        let _ = std::fs::write(o, log);
+    }
 }
 
 /// Dev/test runs (`--dev-*`) must not overwrite the user's saved window and view.
@@ -1023,6 +1078,9 @@ fn commit_rename(app: &mut App, cancel: bool) {
     }
     match crate::shell::rename(&old, &new_name) {
         Ok(()) => {
+            if let Some(parent) = old.parent() {
+                crate::undo::push(crate::undo::Op::Rename { from: old.clone(), to: parent.join(&new_name) });
+            }
             if matches!(app.tab().loc, Loc::Folder(_)) {
                 app.reload(Some(&new_name));
             } else {

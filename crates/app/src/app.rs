@@ -1135,6 +1135,9 @@ impl App {
             (VK_X, true, false, false) => crate::shell::verb_on_selection(self, "cut"),
             (VK_V, true, false, false) => crate::shell::paste(self),
             (VK_C, true, true, false) => crate::shell::copy_path(self),
+            (VK_Z, true, false, false) => crate::undo::undo(self),
+            (VK_Y, true, false, false) | (VK_Z, true, true, false) => crate::undo::redo(self),
+            (VK_D, true, false, false) => crate::shell::duplicate(self),
             (VK_DELETE, false, s, false) => crate::shell::delete(self, s),
             (VK_F2, false, false, false) => crate::win::begin_rename(self),
             (VK_F5, false, false, false) => {
