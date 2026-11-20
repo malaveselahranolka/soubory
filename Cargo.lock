@@ -74,6 +74,7 @@ dependencies = [
  "fm-fs",
  "memchr",
  "rayon",
+ "windows",
 ]
 
 [[package]]

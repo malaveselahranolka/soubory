@@ -71,7 +71,7 @@ fn snapshot_rejects_bad_headers_truncations_and_bitflips_without_panic() {
     // Forged giant slot_count + body_len on tiny input must fail cleanly without huge allocation
     let mut forged = good[..48].to_vec();
     forged[12..16].copy_from_slice(&2_000_000_000u32.to_le_bytes());
-    let forged_body_len: u64 = 2_000_000_000u64 * 35
+    let forged_body_len: u64 = 2_000_000_000u64 * 43
         + u32::from_le_bytes([forged[24], forged[25], forged[26], forged[27]]) as u64
         + u32::from_le_bytes([forged[28], forged[29], forged[30], forged[31]]) as u64
         + u32::from_le_bytes([forged[32], forged[33], forged[34], forged[35]]) as u64;
@@ -136,4 +136,71 @@ fn snapshot_roundtrip_dirty_non_compact() {
         .unwrap();
     assert_eq!(r1.total_matches, r2.total_matches);
     assert_eq!(r1.ids, r2.ids);
+}
+
+#[test]
+fn snapshot_file_id_roundtrip_v2_rejection_and_zeroed_tail() {
+    use fm_fs::attrs::{ARCHIVE, DIRECTORY};
+    use fm_index::Meta;
+
+    let mut idx = Index::new();
+    let root = idx.add_root("C:\\");
+    idx.set_file_id(root, 100);
+    let dir = idx.insert(
+        root,
+        "Docs",
+        Meta {
+            attrs: DIRECTORY,
+            size: 0,
+            mtime: 10,
+            file_id: 200,
+        },
+    );
+    let f1 = idx.insert(
+        dir,
+        "Žluťoučký.txt",
+        Meta {
+            attrs: ARCHIVE,
+            size: 42,
+            mtime: 20,
+            file_id: 0x1000_0000_0000_0001,
+        },
+    );
+    let f2 = idx.insert(
+        dir,
+        "unknown_fid.txt",
+        Meta {
+            attrs: ARCHIVE,
+            size: 7,
+            mtime: 30,
+            file_id: 0,
+        },
+    );
+
+    let mut buf = Vec::new();
+    idx.save(&mut buf).expect("save with file_ids");
+
+    let loaded = Index::load(Cursor::new(&buf), None).expect("load v3");
+    assert_eq!(loaded.by_file_id(0), None);
+    assert_eq!(loaded.by_file_id(100), Some(root));
+    assert_eq!(loaded.by_file_id(200), Some(dir));
+    assert_eq!(loaded.by_file_id(0x1000_0000_0000_0001), Some(f1));
+    assert_eq!(loaded.file_id(f2), 0);
+
+    // Old v2 snapshot must be rejected cleanly
+    let mut old_v2 = buf.clone();
+    old_v2[4..8].copy_from_slice(&2u32.to_le_bytes());
+    assert!(matches!(
+        Index::load(Cursor::new(&old_v2), None),
+        Err(SnapshotError::UnsupportedVersion(2))
+    ));
+
+    // Intact header + zeroed tail must fail cleanly without panic
+    let mut zeroed_tail = buf.clone();
+    let half = zeroed_tail.len() / 2;
+    zeroed_tail[half..].fill(0);
+    let res = catch_unwind(AssertUnwindSafe(|| {
+        Index::load(Cursor::new(&zeroed_tail), None)
+    }));
+    assert!(res.expect("must not panic").is_err());
 }

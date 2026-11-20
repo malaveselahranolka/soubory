@@ -44,6 +44,8 @@ pub struct Meta {
     pub size: u64,
     /// Last modification time in Windows `FILETIME` ticks (100-ns intervals since 1601-01-01).
     pub mtime: i64,
+    /// 64-bit NTFS/ReFS file identifier (`0` if unknown).
+    pub file_id: u64,
 }
 
 /// Structure-of-arrays in-memory filename and metadata index.
@@ -58,6 +60,7 @@ pub struct Index {
     pub(crate) attrs: Vec<u32>,
     pub(crate) size: Vec<u64>,
     pub(crate) mtime: Vec<i64>,
+    pub(crate) file_id: Vec<u64>,
     pub(crate) ext_id: Vec<u16>,
     pub(crate) flags: Vec<u8>,
     pub(crate) first_child: Vec<EntryId>,
@@ -65,6 +68,10 @@ pub struct Index {
     /// Open-addressed hash table mapping `(parent, folded_name) -> EntryId`.
     pub(crate) buckets: Vec<EntryId>,
     pub(crate) bucket_occupied: usize,
+    /// Open-addressed hash table mapping non-zero `file_id -> EntryId`.
+    pub(crate) fid_buckets: Vec<EntryId>,
+    pub(crate) fid_occupied: usize,
+    pub(crate) fid_live: usize,
     pub(crate) roots: Vec<EntryId>,
     pub(crate) exts: Vec<String>,
     pub(crate) ext_map: HashMap<String, u16>,
@@ -96,12 +103,16 @@ impl Index {
             attrs: Vec::new(),
             size: Vec::new(),
             mtime: Vec::new(),
+            file_id: Vec::new(),
             ext_id: Vec::new(),
             flags: Vec::new(),
             first_child: Vec::new(),
             next_sibling: Vec::new(),
             buckets: vec![NONE; 64],
             bucket_occupied: 0,
+            fid_buckets: Vec::new(),
+            fid_occupied: 0,
+            fid_live: 0,
             roots: Vec::new(),
             exts: vec![String::new()],
             ext_map: HashMap::new(),
@@ -128,12 +139,16 @@ impl Index {
             attrs: Vec::with_capacity(entries),
             size: Vec::with_capacity(entries),
             mtime: Vec::with_capacity(entries),
+            file_id: Vec::with_capacity(entries),
             ext_id: Vec::with_capacity(entries),
             flags: Vec::with_capacity(entries),
             first_child: Vec::with_capacity(entries),
             next_sibling: Vec::with_capacity(entries),
             buckets: vec![NONE; bucket_cap],
             bucket_occupied: 0,
+            fid_buckets: Vec::new(),
+            fid_occupied: 0,
+            fid_live: 0,
             roots: Vec::with_capacity(4),
             exts: vec![String::new()],
             ext_map: HashMap::new(),
@@ -183,11 +198,13 @@ impl Index {
             + self.attrs.capacity() * std::mem::size_of::<u32>()
             + self.size.capacity() * std::mem::size_of::<u64>()
             + self.mtime.capacity() * std::mem::size_of::<i64>()
+            + self.file_id.capacity() * std::mem::size_of::<u64>()
             + self.ext_id.capacity() * std::mem::size_of::<u16>()
             + self.flags.capacity() * std::mem::size_of::<u8>()
             + self.first_child.capacity() * std::mem::size_of::<EntryId>()
             + self.next_sibling.capacity() * std::mem::size_of::<EntryId>()
             + self.buckets.capacity() * std::mem::size_of::<EntryId>()
+            + self.fid_buckets.capacity() * std::mem::size_of::<EntryId>()
             + self.roots.capacity() * std::mem::size_of::<EntryId>()
             + exts_bytes
     }
@@ -235,6 +252,7 @@ impl Index {
         self.attrs.push(DIRECTORY);
         self.size.push(0);
         self.mtime.push(0);
+        self.file_id.push(0);
         self.ext_id.push(EXT_NONE);
         self.flags.push(FLAG_ALIVE);
         self.first_child.push(NONE);
@@ -295,6 +313,7 @@ impl Index {
         self.attrs.push(meta.attrs);
         self.size.push(meta.size);
         self.mtime.push(meta.mtime);
+        self.file_id.push(meta.file_id);
         self.ext_id.push(ext);
         self.flags.push(flag);
         self.first_child.push(NONE);
@@ -302,6 +321,9 @@ impl Index {
         self.first_child[parent as usize] = id;
 
         self.bucket_insert(parent, folded.as_bytes(), name, id);
+        if meta.file_id != 0 {
+            self.fid_insert(meta.file_id, id);
+        }
         self.live_count += 1;
         self.index_gen = self.index_gen.wrapping_add(1);
         id
@@ -343,6 +365,12 @@ impl Index {
             if self.display_off[ui] != NONE {
                 self.dead_arena_bytes +=
                     arena_entry_total_len(&self.display_arena, self.display_off[ui]);
+            }
+
+            let old_fid = self.file_id[ui];
+            if old_fid != 0 {
+                self.fid_remove(old_fid, u);
+                self.file_id[ui] = 0;
             }
 
             self.flags[ui] = 0;
@@ -549,7 +577,98 @@ impl Index {
             attrs: self.attrs[idx],
             size: self.size[idx],
             mtime: self.mtime[idx],
+            file_id: self.file_id[idx],
         }
+    }
+
+    /// Looks up a live entry by its 64-bit NTFS/ReFS `file_id` (`0` always returns `None`).
+    #[must_use]
+    pub fn by_file_id(&self, fid: u64) -> Option<EntryId> {
+        if fid == 0 || self.fid_buckets.is_empty() {
+            return None;
+        }
+        let len = self.fid_buckets.len();
+        let hash = hash_fid(fid);
+        let mut slot = fastrange(hash, len);
+        loop {
+            let entry = self.fid_buckets[slot];
+            if entry == NONE {
+                return None;
+            }
+            if entry != TOMBSTONE && self.is_alive(entry) && self.file_id[entry as usize] == fid {
+                return Some(entry);
+            }
+            slot += 1;
+            if slot == len {
+                slot = 0;
+            }
+        }
+    }
+
+    /// Returns the 64-bit `file_id` stored for `id` (`0` if unknown).
+    #[inline]
+    #[must_use]
+    pub fn file_id(&self, id: EntryId) -> u64 {
+        assert!(self.is_alive(id), "file_id on invalid or dead entry {id}");
+        self.file_id[id as usize]
+    }
+
+    /// Updates the 64-bit `file_id` stored for `id` (`0` clears the mapping).
+    pub fn set_file_id(&mut self, id: EntryId, file_id: u64) {
+        assert!(
+            self.is_alive(id),
+            "set_file_id on invalid or dead entry {id}"
+        );
+        self.set_file_id_inner(id, file_id);
+        self.index_gen = self.index_gen.wrapping_add(1);
+    }
+
+    pub(crate) fn reserve_fid_map(&mut self, expected_non_zero: usize) {
+        if expected_non_zero == 0 {
+            return;
+        }
+        let target = ((expected_non_zero.saturating_mul(10)) / 7 + 16).max(64);
+        if self.fid_buckets.is_empty() {
+            self.fid_buckets = vec![NONE; target];
+        } else if self.fid_buckets.len() < target {
+            self.rehash_fid_buckets_to(target);
+        }
+    }
+
+    pub(crate) fn find_child_by_file_id(&self, parent: EntryId, fid: u64) -> Option<EntryId> {
+        if fid == 0 {
+            return None;
+        }
+        if let Some(eid) = self.by_file_id(fid)
+            && self.parent[eid as usize] == parent
+        {
+            return Some(eid);
+        }
+        let mut child = self.first_child[parent as usize];
+        while child != NONE {
+            if self.file_id[child as usize] == fid {
+                return Some(child);
+            }
+            child = self.next_sibling[child as usize];
+        }
+        None
+    }
+
+    /// Returns the parent [`EntryId`] of `id`, or `None` if `id` is a root.
+    #[inline]
+    #[must_use]
+    pub fn parent(&self, id: EntryId) -> Option<EntryId> {
+        assert!(self.is_alive(id), "parent on invalid or dead entry {id}");
+        let p = self.parent[id as usize];
+        if p == NONE { None } else { Some(p) }
+    }
+
+    /// Iterates over all live [`EntryId`]s in the index.
+    pub fn iter_ids(&self) -> impl Iterator<Item = EntryId> + '_ {
+        self.flags
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &f)| ((f & FLAG_ALIVE) != 0).then_some(i as EntryId))
     }
 
     /// Returns `true` if `id` is a directory.
@@ -601,6 +720,11 @@ impl Index {
         }
 
         let n = self.live_count;
+        let fid_cap = if self.fid_live > 0 {
+            ((self.fid_live * 10) / 7 + 16).max(64)
+        } else {
+            0
+        };
         let mut new_idx = Self {
             folded_arena: Vec::with_capacity(folded_bytes_needed),
             display_arena: Vec::with_capacity(display_bytes_needed),
@@ -610,12 +734,20 @@ impl Index {
             attrs: Vec::with_capacity(n),
             size: Vec::with_capacity(n),
             mtime: Vec::with_capacity(n),
+            file_id: Vec::with_capacity(n),
             ext_id: Vec::with_capacity(n),
             flags: Vec::with_capacity(n),
             first_child: vec![NONE; n],
             next_sibling: vec![NONE; n],
             buckets: vec![NONE; ((n * 10) / 7 + 16).max(64)],
             bucket_occupied: 0,
+            fid_buckets: if fid_cap > 0 {
+                vec![NONE; fid_cap]
+            } else {
+                Vec::new()
+            },
+            fid_occupied: 0,
+            fid_live: 0,
             roots: Vec::with_capacity(self.roots.len()),
             exts: std::mem::take(&mut self.exts),
             ext_map: std::mem::take(&mut self.ext_map),
@@ -647,15 +779,20 @@ impl Index {
                 remap[old_p as usize]
             };
 
+            let fid = self.file_id[old_i];
             new_idx.folded_off.push(f_off);
             new_idx.display_off.push(d_off);
             new_idx.parent.push(new_p);
             new_idx.attrs.push(self.attrs[old_i]);
             new_idx.size.push(self.size[old_i]);
             new_idx.mtime.push(self.mtime[old_i]);
+            new_idx.file_id.push(fid);
             new_idx.ext_id.push(self.ext_id[old_i]);
             new_idx.flags.push(self.flags[old_i]);
 
+            if fid != 0 {
+                new_idx.fid_insert(fid, mapped);
+            }
             if new_p == NONE {
                 new_idx.roots.push(mapped);
             } else {
@@ -750,6 +887,7 @@ impl Index {
         self.attrs[idx] = meta.attrs;
         self.size[idx] = meta.size;
         self.mtime[idx] = meta.mtime;
+        self.set_file_id_inner(id, meta.file_id);
         let parent = self.parent[idx];
         let parent_hidden =
             parent != NONE && (self.flags[parent as usize] & FLAG_EFFECTIVE_HIDDEN) != 0;
@@ -1014,11 +1152,29 @@ impl Index {
         self.buckets.resize(cap, NONE);
         self.bucket_occupied = 0;
 
+        let fid_total = self
+            .flags
+            .iter()
+            .zip(&self.file_id)
+            .filter(|&(&fl, &fid)| (fl & FLAG_ALIVE) != 0 && fid != 0)
+            .count();
+        self.fid_buckets.clear();
+        if fid_total > 0 {
+            let fid_cap = ((fid_total * 10) / 7 + 16).max(64);
+            self.fid_buckets.resize(fid_cap, NONE);
+        }
+        self.fid_occupied = 0;
+        self.fid_live = 0;
+
         for i in 0..n {
             if (self.flags[i] & FLAG_ALIVE) == 0 {
                 continue;
             }
             let id = i as EntryId;
+            let fid = self.file_id[i];
+            if fid != 0 {
+                self.fid_insert(fid, id);
+            }
             let p = self.parent[i];
             if p == NONE {
                 let disp = trim_trailing_root_slash(self.display_str_unchecked(id));
@@ -1061,6 +1217,143 @@ impl Index {
         }
         Ok(())
     }
+
+    fn set_file_id_inner(&mut self, id: EntryId, new_fid: u64) {
+        let ui = id as usize;
+        let old_fid = self.file_id[ui];
+        if old_fid == new_fid {
+            return;
+        }
+        if old_fid != 0 {
+            self.fid_remove(old_fid, id);
+        }
+        self.file_id[ui] = new_fid;
+        if new_fid != 0 {
+            self.fid_insert(new_fid, id);
+        }
+    }
+
+    fn fid_insert(&mut self, fid: u64, id: EntryId) {
+        if fid == 0 {
+            return;
+        }
+        if self.fid_buckets.is_empty() || self.fid_occupied * 10 >= self.fid_buckets.len() * 7 {
+            self.rehash_fid_buckets();
+        }
+        let len = self.fid_buckets.len();
+        let hash = hash_fid(fid);
+        let mut slot = fastrange(hash, len);
+        let mut first_tombstone = None;
+        loop {
+            let entry = self.fid_buckets[slot];
+            if entry == NONE {
+                let dst = first_tombstone.unwrap_or(slot);
+                if first_tombstone.is_none() {
+                    self.fid_occupied += 1;
+                }
+                self.fid_buckets[dst] = id;
+                self.fid_live += 1;
+                return;
+            }
+            if entry == TOMBSTONE {
+                if first_tombstone.is_none() {
+                    first_tombstone = Some(slot);
+                }
+            } else if entry == id || self.file_id[entry as usize] == fid {
+                self.fid_buckets[slot] = id;
+                return;
+            }
+            slot += 1;
+            if slot == len {
+                slot = 0;
+            }
+        }
+    }
+
+    fn fid_remove(&mut self, fid: u64, id: EntryId) {
+        if fid == 0 || self.fid_buckets.is_empty() {
+            return;
+        }
+        let len = self.fid_buckets.len();
+        let hash = hash_fid(fid);
+        let mut slot = fastrange(hash, len);
+        loop {
+            let entry = self.fid_buckets[slot];
+            if entry == NONE {
+                return;
+            }
+            if entry == id {
+                self.fid_buckets[slot] = TOMBSTONE;
+                self.fid_live = self.fid_live.saturating_sub(1);
+                return;
+            }
+            slot += 1;
+            if slot == len {
+                slot = 0;
+            }
+        }
+    }
+
+    fn rehash_fid_buckets(&mut self) {
+        let target_min = ((self.fid_live * 10) / 7 + 16).max(64);
+        let cur_len = self.fid_buckets.len();
+        let new_cap = if cur_len >= target_min {
+            cur_len
+        } else {
+            (cur_len + cur_len / 2).max(target_min)
+        };
+        self.rehash_fid_buckets_to(new_cap);
+    }
+
+    fn rehash_fid_buckets_to(&mut self, new_cap: usize) {
+        let mut next = vec![NONE; new_cap];
+        let mut occupied = 0usize;
+        let mut live = 0usize;
+
+        for (i, &flags) in self.flags.iter().enumerate() {
+            if (flags & FLAG_ALIVE) == 0 {
+                continue;
+            }
+            let fid = self.file_id[i];
+            if fid == 0 {
+                continue;
+            }
+            let hash = hash_fid(fid);
+            let mut slot = fastrange(hash, new_cap);
+            let mut replaced = false;
+            while next[slot] != NONE {
+                let cur = next[slot];
+                if self.file_id[cur as usize] == fid {
+                    next[slot] = i as EntryId;
+                    replaced = true;
+                    break;
+                }
+                slot += 1;
+                if slot == new_cap {
+                    slot = 0;
+                }
+            }
+            if !replaced {
+                next[slot] = i as EntryId;
+                occupied += 1;
+                live += 1;
+            }
+        }
+        self.fid_buckets = next;
+        self.fid_occupied = occupied;
+        self.fid_live = live;
+    }
+}
+
+#[inline]
+fn hash_fid(fid: u64) -> u64 {
+    let mut x = fid.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^= x >> 31;
+    x
 }
 
 #[inline]

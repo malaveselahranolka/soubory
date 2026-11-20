@@ -189,8 +189,20 @@ fn is_camelcase_boundary(folded: &[u8], display: &str, folded_pos: usize) -> boo
 
 /// Partially sorts `entries` so the top `limit` ranked entries come first in exact rank order.
 pub(crate) fn rank_top_limit(idx: &Index, entries: &mut [RankEntry], limit: usize) -> Vec<EntryId> {
+    rank_top_limit_entries(idx, entries, limit)
+        .iter()
+        .map(|e| e.id)
+        .collect()
+}
+
+/// Partially sorts `entries` and returns the top `limit` [`RankEntry`] records in rank order.
+pub(crate) fn rank_top_limit_entries<'a>(
+    idx: &Index,
+    entries: &'a mut [RankEntry],
+    limit: usize,
+) -> &'a [RankEntry] {
     if limit == 0 || entries.is_empty() {
-        return Vec::new();
+        return &[];
     }
     let mut path_a = String::new();
     let mut path_b = String::new();
@@ -208,7 +220,7 @@ pub(crate) fn rank_top_limit(idx: &Index, entries: &mut [RankEntry], limit: usiz
         entries.select_nth_unstable_by(keep, &mut cmp);
     }
     entries[..keep].sort_unstable_by(cmp);
-    entries[..keep].iter().map(|e| e.id).collect()
+    &entries[..keep]
 }
 
 fn compare_paths(

@@ -169,6 +169,7 @@ pub fn generate(n: usize, seed: u64) -> Index {
                 attrs: DIRECTORY,
                 size: 0,
                 mtime,
+                file_id: 0,
             },
         );
         dirs.push((id, d as u8));
@@ -206,6 +207,7 @@ pub fn generate(n: usize, seed: u64) -> Index {
                 attrs: DIRECTORY | if hidden { HIDDEN } else { 0 },
                 size: 0,
                 mtime,
+                file_id: 0,
             }
         } else {
             let size = 64 + (rng.next_u64() % 10_000_000);
@@ -213,6 +215,7 @@ pub fn generate(n: usize, seed: u64) -> Index {
                 attrs: ARCHIVE | if hidden { HIDDEN } else { 0 },
                 size,
                 mtime,
+                file_id: 0,
             }
         };
 

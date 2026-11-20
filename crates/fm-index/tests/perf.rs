@@ -131,6 +131,7 @@ fn perf_2m_suite() {
             attrs: ARCHIVE,
             size: 1234,
             mtime: 133_600_000_000_000_000,
+            file_id: 0,
         };
         let t0 = Instant::now();
         let id = idx.insert(parent, &name, meta);
