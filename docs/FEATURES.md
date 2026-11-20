@@ -55,7 +55,7 @@ Nothing here has been tried by hand in daily use yet; see "Not verified" at the 
 ## Our own
 | Feature | Status |
 |---|---|
-| Instant whole-disk search with Czech diacritics folding (`kun` finds `kůň`), live as files change | ✅ (C: bench in `docs/search-bench.md`) |
+| Instant whole-disk search with Czech diacritics folding (`kun` finds `kůň`), live as files change | ✅ (C: 4.2 M entries, 30 s walk, queries 3–8 ms: `docs/search-bench.md`; index reviewed twice, see `26ad376`) |
 | New file/folder from any Open/Save dialog | ✅ |
 | Cold start ≈ 200 ms (D3D device built in parallel, power-saving GPU) | ✅ (`--dev-startup`) |
 | Folder sizes in list view, live from the index | ⬜ |
