@@ -16,9 +16,9 @@ use fm_fs::attrs::{
 };
 use fm_index::win::service::{Event, Service, default_roots};
 use fm_index::win::walker::{
-    DirEntryRef, DirSource, MAX_WALK_DEPTH, RootInfo, WalkBatch, WalkOptions, Win32DirSource,
-    merge_index, merge_index_with_report, walk_root, walk_with_source, walk_with_source_report,
-    walk_with_source_streaming,
+    DirEntryRef, DirSource, MAX_WALK_DEPTH, RootInfo, WalkBatch, WalkFolderRef, WalkOptions,
+    Win32DirSource, merge_index, merge_index_with_report, walk_root, walk_with_source,
+    walk_with_source_report, walk_with_source_streaming,
 };
 use fm_index::win::watcher::{
     NoopWatcherFs, NotifyAction, NotifyRecord, VolumeWatcher, WatcherConfig, WatcherFs,
@@ -2446,4 +2446,93 @@ fn walk_on_one_or_eight_threads_builds_the_same_index() {
     );
     let deep = format!(r"{root}\a4\b3\c2\f432.txt");
     assert_eq!(eight.meta(eight.lookup(&deep).expect("deep file")).size, 9);
+}
+
+#[test]
+fn walk_lists_winsxs_but_never_enters_it_and_a_merge_drops_its_old_contents() {
+    let entry = |name: &str, attrs: u32, file_id: u64| MockEntry {
+        name: name.to_owned(),
+        attrs,
+        size: 1,
+        mtime: 5,
+        file_id,
+        reparse_tag: 0,
+    };
+    let mut mock = MockDirSource::new(
+        RootInfo {
+            volume_serial: 7,
+            file_id: 1,
+            attrs: DIRECTORY,
+            mtime: 1,
+        },
+        32,
+    );
+    mock.nodes.insert(
+        r"M:\".to_owned(),
+        MockNodeKind::Dir(vec![entry("Windows", DIRECTORY, 2)]),
+    );
+    mock.nodes.insert(
+        r"M:\Windows".to_owned(),
+        MockNodeKind::Dir(vec![
+            entry("winsxs", DIRECTORY, 3),
+            entry("System32", DIRECTORY, 4),
+        ]),
+    );
+    mock.nodes.insert(
+        r"M:\Windows\System32".to_owned(),
+        MockNodeKind::Dir(vec![entry("kernel32.dll", ARCHIVE, 5)]),
+    );
+    mock.nodes.insert(
+        r"M:\Windows\winsxs".to_owned(),
+        MockNodeKind::Dir(vec![entry("a.dll", ARCHIVE, 6)]),
+    );
+
+    let (fresh, stats, report) = walk_with_source_report(
+        &mock,
+        r"M:\",
+        WalkOptions::default(),
+        &AtomicBool::new(false),
+        |_| {},
+    )
+    .expect("walk succeeds");
+    assert!(
+        fresh
+            .lookup(r"M:\Windows\WinSxS")
+            .is_some_and(|id| fresh.is_dir(id))
+    );
+    assert!(fresh.lookup(r"M:\Windows\System32\kernel32.dll").is_some());
+    assert_eq!(fresh.lookup(r"M:\Windows\winsxs\a.dll"), None);
+    assert!(
+        !mock
+            .dir_opens
+            .lock()
+            .unwrap()
+            .contains_key(r"M:\Windows\winsxs")
+    );
+    // Reported as denied, so the watcher drops changes inside it; not counted as an error.
+    assert_eq!(
+        report.denied,
+        vec![WalkFolderRef {
+            file_id: 3,
+            rel_path: r"Windows\winsxs".to_owned(),
+        }]
+    );
+    assert_eq!((stats.denied, stats.errors), (0, 0));
+
+    // An index from before the exclusion loses the folder's contents, keeps the folder.
+    let mut live = Index::new();
+    let root = live.add_root(r"M:\");
+    let meta = |attrs, file_id| fm_index::Meta {
+        attrs,
+        size: 1,
+        mtime: 5,
+        file_id,
+    };
+    let win = live.insert(root, "Windows", meta(DIRECTORY, 2));
+    let sxs = live.insert(win, "winsxs", meta(DIRECTORY, 3));
+    live.insert(sxs, "a.dll", meta(ARCHIVE, 6));
+    merge_index_with_report(&mut live, fresh, &report, true);
+    assert!(live.lookup(r"M:\Windows\winsxs").is_some());
+    assert_eq!(live.lookup(r"M:\Windows\winsxs\a.dll"), None);
+    assert!(live.lookup(r"M:\Windows\System32\kernel32.dll").is_some());
 }

@@ -27,6 +27,11 @@ use crate::win::{
 /// Maximum recursion depth below the walk root (`0` = root).
 pub const MAX_WALK_DEPTH: u16 = 512;
 
+/// Folders (by name, any case) that a walk lists but never enters, so their contents stay out of
+/// the index. The walk reports them as denied, so the watcher drops changes inside them as well.
+/// WinSxS (the user's call, 2026-11-20): 174 k entries of Windows component-store hard links on C:.
+pub const SKIPPED_DIRS: &[&str] = &["WinSxS"];
+
 /// Default 64 KiB enumeration buffer size for `GetFileInformationByHandleEx`.
 pub const DIR_ENUM_BUFFER_BYTES: usize = 64 * 1024;
 
@@ -46,7 +51,8 @@ pub struct WalkFoldersReport {
     pub root_failed: bool,
     /// Folders whose open or enumeration failed (excluding access denied).
     pub failed: Vec<WalkFolderRef>,
-    /// Folders that returned `ERROR_ACCESS_DENIED` / `PermissionDenied`.
+    /// Folders that returned `ERROR_ACCESS_DENIED` / `PermissionDenied`, and the
+    /// [`SKIPPED_DIRS`] the walk did not enter.
     pub denied: Vec<WalkFolderRef>,
 }
 
@@ -494,6 +500,7 @@ where
         root_failed: bool,
         failed: Vec<WalkFolderRef>,
         denied: Vec<WalkFolderRef>,
+        skipped: Vec<WalkFolderRef>,
     }
 
     // Workers insert each listed directory straight into the index (a task carries its folder's
@@ -559,6 +566,8 @@ where
                 let mut root_failed = false;
                 let mut failed = Vec::<WalkFolderRef>::new();
                 let mut denied = Vec::<WalkFolderRef>::new();
+                // Kept apart from `denied`, which marks the batch of the folder being listed.
+                let mut skipped = Vec::<WalkFolderRef>::new();
                 let mut pending_tasks = Vec::<DirTask<S::Handle>>::new();
                 let duty = u32::from(opts.duty.clamp(1, 100));
                 let mut working_since = Instant::now();
@@ -590,6 +599,7 @@ where
                                     root_failed,
                                     failed,
                                     denied,
+                                    skipped,
                                 };
                             }
                             if let Some(t) = guard.queue.pop_front() {
@@ -606,6 +616,7 @@ where
                                     root_failed,
                                     failed,
                                     denied,
+                                    skipped,
                                 };
                             }
                             guard = wait_or_recover(&shared.cv, guard);
@@ -663,7 +674,12 @@ where
                                             return;
                                         };
 
+                                        let skip = is_dir
+                                            && SKIPPED_DIRS
+                                                .iter()
+                                                .any(|s| entry.name.eq_ignore_ascii_case(s));
                                         let should_descend = is_dir
+                                            && !skip
                                             && (!is_reparse
                                                 || is_cloud_reparse_tag(entry.reparse_tag))
                                             && task.depth + 1 < opts.max_depth;
@@ -674,12 +690,21 @@ where
                                             file_id: entry.file_id,
                                         };
 
-                                        if should_descend {
-                                            let child_rel = if task.rel_path.is_empty() {
+                                        let child_rel = || {
+                                            if task.rel_path.is_empty() {
                                                 entry.name.to_owned()
                                             } else {
                                                 join_child_path(&task.rel_path, entry.name)
-                                            };
+                                            }
+                                        };
+                                        if skip {
+                                            skipped.push(WalkFolderRef {
+                                                file_id: entry.file_id,
+                                                rel_path: child_rel(),
+                                            });
+                                        }
+                                        if should_descend {
+                                            let child_rel = child_rel();
                                             pending_tasks.push(DirTask {
                                                 // Its position here until it has an EntryId.
                                                 dir_id: nodes.len() as u32,
@@ -870,6 +895,7 @@ where
         report.root_failed |= out.root_failed;
         report.failed.extend(out.failed.iter().cloned());
         report.denied.extend(out.denied.iter().cloned());
+        report.denied.extend(out.skipped.iter().cloned());
     }
 
     let idx = built.into_inner().unwrap_or_else(PoisonError::into_inner);
