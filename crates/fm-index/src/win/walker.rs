@@ -93,7 +93,14 @@ pub struct WalkOptions {
     pub low_priority: bool,
     /// Maximum directory recursion depth (default [`MAX_WALK_DEPTH`] = 512).
     pub max_depth: u16,
+    /// Percent of the time a worker may spend walking (1–100; default 100, never pausing). Below
+    /// 100 it rests after every [`PACE_SLICE`] of work, so a background re-walk of a few million
+    /// entries leaves the disk mostly idle instead of busy for minutes.
+    pub duty: u8,
 }
+
+/// The work between two rests of a paced walk ([`WalkOptions::duty`]).
+pub const PACE_SLICE: Duration = Duration::from_millis(50);
 
 impl Default for WalkOptions {
     fn default() -> Self {
@@ -102,6 +109,7 @@ impl Default for WalkOptions {
             progress_interval: Duration::from_millis(100),
             low_priority: false,
             max_depth: MAX_WALK_DEPTH,
+            duty: 100,
         }
     }
 }
@@ -541,8 +549,23 @@ where
                 let mut failed = Vec::<WalkFolderRef>::new();
                 let mut denied = Vec::<WalkFolderRef>::new();
                 let mut pending_tasks = Vec::<DirTask<S::Handle>>::new();
+                let duty = u32::from(opts.duty.clamp(1, 100));
+                let mut working_since = Instant::now();
 
                 loop {
+                    if duty < 100 && working_since.elapsed() >= PACE_SLICE {
+                        // Rest outside the queue lock, in short steps so a cancel stays prompt.
+                        let rest_until =
+                            Instant::now() + working_since.elapsed() * (100 - duty) / duty;
+                        while !cancel.load(Ordering::Relaxed) && Instant::now() < rest_until {
+                            std::thread::sleep(
+                                rest_until
+                                    .saturating_duration_since(Instant::now())
+                                    .min(Duration::from_millis(50)),
+                            );
+                        }
+                        working_since = Instant::now();
+                    }
                     let task = {
                         let mut guard = lock_or_recover(&shared.mu);
                         loop {

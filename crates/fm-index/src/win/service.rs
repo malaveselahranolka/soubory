@@ -42,6 +42,19 @@ const HOURLY_SAVE_INTERVAL: Duration = Duration::from_secs(3600);
 const DAILY_REWALK_INTERVAL: Duration = Duration::from_secs(86400);
 const HOUSEKEEP_TICK: Duration = Duration::from_secs(60);
 const MAX_DURING_WALK_BUFFER: usize = 100_000;
+/// [`WalkOptions::duty`] of a re-walk over an index that is already searchable.
+const REWALK_DUTY: u8 = 33;
+
+/// The wait before a gap (overflow) re-walk: the configured cooldown, but never less than four
+/// times the last walk, so a busy disk that keeps overflowing the watcher cannot keep a slow
+/// re-walk running back to back.
+fn gap_cooldown(configured: Duration, last_walk: Duration) -> Duration {
+    if configured.is_zero() {
+        configured
+    } else {
+        configured.max(last_walk * 4)
+    }
+}
 /// Minimum delay before retrying a failed walk, even with a zero overflow cooldown.
 #[cfg(not(test))]
 const FAILED_WALK_RETRY_MIN: Duration = Duration::from_secs(5);
@@ -723,6 +736,7 @@ fn rewalk_worker<S: DirSource>(
     let (mu, cv) = &*coord;
     let fs = Win32WatcherFs;
     let mut emitted_initial_ready = false;
+    let mut last_walk = Duration::ZERO;
 
     loop {
         {
@@ -743,7 +757,7 @@ fn rewalk_worker<S: DirSource>(
                     let cooldown = if st.failed_streak > 0 {
                         failed_walk_cooldown(overflow_cooldown, st.failed_streak)
                     } else {
-                        overflow_cooldown
+                        gap_cooldown(overflow_cooldown, last_walk)
                     };
                     if let Some(last) = st.last_finished
                         && !cooldown.is_zero()
@@ -771,14 +785,19 @@ fn rewalk_worker<S: DirSource>(
             scanning.store(true, Ordering::Release);
         }
 
-        let walk_opts = WalkOptions {
-            low_priority: true,
-            ..Default::default()
-        };
         let walk_started = Instant::now();
         // Nothing indexed yet (no snapshot): show results while the walk runs. A re-walk keeps
         // the existing index untouched until its merge.
         let progressive = read_or_recover(&index).is_empty();
+        // A re-walk (the index already searchable, at every start, daily, after a gap) goes
+        // slowly: flat out, one walk of C: (4 M entries) kept the disk at 100% for two minutes.
+        // One thread a third of the time leaves it mostly idle; only a first walk is urgent.
+        let walk_opts = WalkOptions {
+            low_priority: true,
+            threads: if progressive { 0 } else { 1 },
+            duty: if progressive { 100 } else { REWALK_DUTY },
+            ..Default::default()
+        };
         if progressive {
             partial.store(true, Ordering::Release);
         }
@@ -806,6 +825,7 @@ fn rewalk_worker<S: DirSource>(
             progressive.then_some(&sink as &(dyn Fn(WalkBatch) + Sync)),
         );
         drop(batches);
+        last_walk = walk_started.elapsed();
 
         let Some((fresh, stats, walk_report)) = walk_res else {
             let mut st = lock_or_recover(mu);
@@ -1632,6 +1652,15 @@ mod tests {
             failed_walk_cooldown(Duration::from_secs(60), 40),
             FAILED_WALK_RETRY_MAX
         );
+    }
+
+    #[test]
+    fn gap_rewalk_waits_at_least_four_walks() {
+        let s = Duration::from_secs;
+        assert_eq!(gap_cooldown(s(60), s(5)), s(60));
+        assert_eq!(gap_cooldown(s(60), s(400)), s(1600));
+        // Tests that force overflow with no cooldown keep it.
+        assert_eq!(gap_cooldown(Duration::ZERO, s(400)), Duration::ZERO);
     }
 
     #[test]

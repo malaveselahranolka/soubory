@@ -1225,58 +1225,85 @@ fn service_multi_root_ranked_merge_save_cancel_and_rewalk_coalesce() {
     svc.stop();
 }
 
-#[test]
-fn walker_progress_callback_fires_periodically_during_slow_walk() {
-    struct SlowMockSource {
-        dirs: usize,
-    }
-    impl DirSource for SlowMockSource {
-        type Handle = String;
-        type Scratch = ();
+/// `S:\` with `dirs` subfolders of one file each; every listing takes 8 ms.
+struct SlowMockSource {
+    dirs: usize,
+}
+impl DirSource for SlowMockSource {
+    type Handle = String;
+    type Scratch = ();
 
-        fn open_dir(&self, path: &str) -> io::Result<Self::Handle> {
-            Ok(path.to_owned())
+    fn open_dir(&self, path: &str) -> io::Result<Self::Handle> {
+        Ok(path.to_owned())
+    }
+    fn root_info(&self, _dir: &Self::Handle) -> io::Result<RootInfo> {
+        Ok(RootInfo::default())
+    }
+    fn read_batch(
+        &self,
+        dir: &Self::Handle,
+        restart: bool,
+        _scratch: &mut Self::Scratch,
+        emit: &mut dyn FnMut(DirEntryRef<'_>),
+    ) -> io::Result<bool> {
+        if !restart {
+            return Ok(false);
         }
-        fn root_info(&self, _dir: &Self::Handle) -> io::Result<RootInfo> {
-            Ok(RootInfo::default())
-        }
-        fn read_batch(
-            &self,
-            dir: &Self::Handle,
-            restart: bool,
-            _scratch: &mut Self::Scratch,
-            emit: &mut dyn FnMut(DirEntryRef<'_>),
-        ) -> io::Result<bool> {
-            if !restart {
-                return Ok(false);
-            }
-            thread::sleep(Duration::from_millis(8));
-            if dir == "S:\\" {
-                for i in 0..self.dirs {
-                    let name = format!("d{i:02}");
-                    emit(DirEntryRef {
-                        name: &name,
-                        attrs: DIRECTORY,
-                        size: 0,
-                        mtime: 1,
-                        file_id: (i + 2) as u64,
-                        reparse_tag: 0,
-                    });
-                }
-            } else {
+        thread::sleep(Duration::from_millis(8));
+        if dir == "S:\\" {
+            for i in 0..self.dirs {
+                let name = format!("d{i:02}");
                 emit(DirEntryRef {
-                    name: "item.txt",
-                    attrs: ARCHIVE,
-                    size: 10,
+                    name: &name,
+                    attrs: DIRECTORY,
+                    size: 0,
                     mtime: 1,
-                    file_id: 0,
+                    file_id: (i + 2) as u64,
                     reparse_tag: 0,
                 });
             }
-            Ok(true)
+        } else {
+            emit(DirEntryRef {
+                name: "item.txt",
+                attrs: ARCHIVE,
+                size: 10,
+                mtime: 1,
+                file_id: 0,
+                reparse_tag: 0,
+            });
         }
+        Ok(true)
     }
+}
 
+#[test]
+fn paced_walk_rests_between_slices_and_lists_the_same() {
+    let walk = |duty| {
+        let opts = WalkOptions {
+            threads: 1,
+            duty,
+            ..Default::default()
+        };
+        let t = Instant::now();
+        let (idx, _) = walk_with_source(
+            &SlowMockSource { dirs: 40 },
+            "S:\\",
+            opts,
+            &AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap();
+        (idx.len(), t.elapsed())
+    };
+    let (full, fast) = walk(100);
+    let (paced, slow) = walk(40);
+    assert_eq!((full, paced), (81, 81));
+    // 40 % duty rests 1.5x every slice of work; the last slice may end without a rest.
+    assert!(slow >= fast * 9 / 5, "paced {slow:?} vs flat out {fast:?}");
+}
+
+#[test]
+fn walker_progress_callback_fires_periodically_during_slow_walk() {
     let mock = SlowMockSource { dirs: 30 };
     let cancel = AtomicBool::new(false);
     let mut progress_samples = Vec::new();
