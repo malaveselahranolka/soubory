@@ -660,11 +660,11 @@ impl App {
         crate::views::reset_columns(self);
         if before != shows_groups(self.tab()) {
             // Columns and gallery show the plain sort order, icons and list the grouped one.
-            self.reload(None);
+            self.reload_and_reveal();
         }
         self.relayout();
         crate::views::sync_columns(self);
-        self.reveal_soon();
+        self.reveal_focus();
         self.invalidate();
     }
 
@@ -713,16 +713,17 @@ impl App {
         t.groups.clear();
         t.scroll = 0.0;
         // A search re-runs: grouping permuted its relevance order, and dates come with it.
-        self.reload(None);
-        self.reveal_soon();
+        self.reload_and_reveal();
         self.invalidate();
     }
 
-    /// Reveals the focus now, or when an async list (search, shell folder) arrives.
-    fn reveal_soon(&mut self) {
-        if self.tab().loading || matches!(self.tab().loc, Loc::Search { .. }) {
-            self.tab_mut().reveal_on_load = true;
-        }
+    /// Reloads and brings the focus into view, also when the list arrives later (search,
+    /// shell folders). Armed before the reload, so a list that lands at once consumes it and
+    /// a later live update never scrolls on its own.
+    fn reload_and_reveal(&mut self) {
+        let async_list = matches!(self.tab().loc, Loc::Search { .. } | Loc::Shell { .. });
+        self.tab_mut().reveal_on_load = async_list;
+        self.reload(None);
         self.reveal_focus();
     }
 
