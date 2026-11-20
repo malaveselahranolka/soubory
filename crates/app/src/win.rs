@@ -2333,14 +2333,13 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
             }
             WM_NCCALCSIZE if wparam.0 != 0 => {
                 // Keep the side and bottom resize frames, drop the caption: the client area
-                // starts at the window top, where the toolbar draws its own caption buttons.
+                // starts at the window top, under Windows' caption buttons. Also when maximized:
+                // with the top frame cut off DWM stops hit-testing its buttons, so the layout
+                // moves the toolbar below the off-screen frame instead (App::top_inset).
                 let params = &mut *(lparam.0 as *mut NCCALCSIZE_PARAMS);
                 let top = params.rgrc[0].top;
                 DefWindowProcW(hwnd, msg, wparam, lparam);
                 params.rgrc[0].top = top;
-                if IsZoomed(hwnd).as_bool() {
-                    params.rgrc[0].top += frame_thickness(hwnd).1;
-                }
                 LRESULT(0)
             }
             WM_NCHITTEST => {
@@ -2393,6 +2392,7 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                 );
                 if w > 0 && h > 0 {
                     app.maximized = wparam.0 == SIZE_MAXIMIZED as usize;
+                    app.top_inset = if app.maximized { frame_thickness(hwnd).1 as f32 / app.scale } else { 0.0 };
                     app.w = w as f32 / app.scale;
                     app.h = h as f32 / app.scale;
                     // Room for Windows' caption buttons, whose size depends on DPI and state.

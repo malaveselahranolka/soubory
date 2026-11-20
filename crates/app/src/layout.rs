@@ -52,6 +52,8 @@ pub struct LayoutIn {
     pub sidebar: Option<f32>,
     /// Width of the caption buttons at the top right.
     pub caption_w: f32,
+    /// Off-screen strip at the top of a maximized window.
+    pub top: f32,
     pub tabs: bool,
     pub scope: bool,
     pub header: bool,
@@ -60,13 +62,13 @@ pub struct LayoutIn {
 
 pub fn compute(i: &LayoutIn) -> Layout {
     let full = Rect::new(0.0, 0.0, i.w, i.h);
-    let toolbar = full.top(TOOLBAR_H);
+    let toolbar = Rect::new(0.0, i.top, i.w, TOOLBAR_H);
     let mut caption = [Rect::default(); 3];
     let cw = i.caption_w / 3.0;
     for (k, c) in caption.iter_mut().enumerate() {
-        *c = Rect::new(i.w - cw * (3 - k) as f32, 0.0, cw, CAPTION_H);
+        *c = Rect::new(i.w - cw * (3 - k) as f32, i.top, cw, CAPTION_H);
     }
-    let cy = (TOOLBAR_H - BTN_H) / 2.0;
+    let cy = i.top + (TOOLBAR_H - BTN_H) / 2.0;
     let sidebar_btn = Rect::new(12.0, cy, BTN_W, BTN_H);
     let sw = i.sidebar.unwrap_or(0.0);
     let nav_x = if i.sidebar.is_some() {
@@ -93,7 +95,7 @@ pub fn compute(i: &LayoutIn) -> Layout {
         BTN_H,
     );
 
-    let below = full.cut_top(TOOLBAR_H);
+    let below = full.cut_top(i.top + TOOLBAR_H);
     let sidebar = below.left(sw);
     let side_resize = Rect::new(sw - 3.0, below.y, 6.0, below.h);
     let card = below.cut_left(sw);
@@ -225,6 +227,7 @@ mod tests {
             h: 800.0,
             sidebar: Some(208.0),
             caption_w: 3.0 * CAPTION_W,
+            top: 0.0,
             tabs: true,
             scope: true,
             header: true,
@@ -238,6 +241,25 @@ mod tests {
         assert!(l.title.x >= l.fwd.r());
         assert_eq!(l.tabs.unwrap().h, TABS_H);
         assert!((l.body.b() - l.status.y).abs() < 0.01);
+        assert!((l.status.b() - 800.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn maximized_inset_moves_the_toolbar_down() {
+        let l = compute(&LayoutIn {
+            w: 1200.0,
+            h: 800.0,
+            sidebar: Some(208.0),
+            caption_w: 3.0 * CAPTION_W,
+            top: 6.0,
+            tabs: false,
+            scope: false,
+            header: false,
+            preview: None,
+        });
+        assert_eq!(l.toolbar.y, 6.0);
+        assert_eq!(l.back.y, 6.0 + (TOOLBAR_H - BTN_H) / 2.0);
+        assert_eq!(l.card.y, 6.0 + TOOLBAR_H);
         assert!((l.status.b() - 800.0).abs() < 0.01);
     }
 

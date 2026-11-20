@@ -278,6 +278,8 @@ pub struct App {
     pub sidebar_w: f32,
     /// Width of Windows' caption buttons at the top right (DIPs), kept free of toolbar items.
     pub caption_w: f32,
+    /// Maximized: the window's top frame is off screen and the client area starts there.
+    pub top_inset: f32,
     pub sidebar_on: bool,
     pub preview_on: bool,
     pub hover: Hit,
@@ -339,6 +341,7 @@ impl App {
             side_scroll: 0.0,
             sidebar_w: DEFAULT_SIDEBAR,
             caption_w: 3.0 * layout::CAPTION_W,
+            top_inset: 0.0,
             sidebar_on: true,
             preview_on: false,
             hover: Hit::None,
@@ -382,6 +385,7 @@ impl App {
             h: self.h,
             sidebar: self.sidebar_on.then_some(self.sidebar_w),
             caption_w: self.caption_w,
+            top: self.top_inset,
             tabs: self.tabs.len() > 1,
             scope: matches!(t.loc, Loc::Search { .. }),
             header: matches!(t.view, View::List)
