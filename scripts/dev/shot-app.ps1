@@ -1,6 +1,7 @@
 ﻿# Captures ONLY the fm window itself (PrintWindow, full content) into a PNG. Never the screen.
 # Never synthesizes input (it could land in another window); drive fm with its --dev-* flags.
-param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Out, [int]$Wait = 1500, [string[]]$Dev = @(), [string]$Class = '', [switch]$Keep, [string]$Exe = 'C:\Users\adame\.fm-target\debug\fm.exe')
+param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Out, [int]$Wait = 1500, [string[]]$Dev = @(), [string]$Class = '', [switch]$Keep, [string]$Exe = '')
+. (Join-Path $PSScriptRoot '..\lib\target-dir.ps1'); if (-not $Exe) { $Exe = Join-Path (Get-TargetDir) 'debug\fm.exe' }
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing
 Add-Type @'

@@ -1,0 +1,4 @@
+# Copy to .cargo/config.toml to build outside the repository, for example when it sits in a
+# synced folder such as OneDrive (sync churn and file locks slow cargo down).
+# [build]
+# target-dir = "C:/fm-target"

@@ -1,6 +1,8 @@
 [package]
 name = "fm-dialogkit"
 version.workspace = true
+license.workspace = true
+repository.workspace = true
 edition.workspace = true
 description = "Adds a native-looking New menu to every Windows Open/Save dialog."
 

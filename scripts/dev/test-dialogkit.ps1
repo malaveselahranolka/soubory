@@ -3,8 +3,9 @@
 param([switch]$Release, [string]$Root = "$env:TEMP\fm-dialogkit-test")
 $ErrorActionPreference = 'Stop'
 $cfg = if ($Release) { 'release' } else { 'debug' }
-$kit = "C:\Users\adame\.fm-target\$cfg\fm-dialogkit.exe"
-$env:FM_X86_DIR = "C:\Users\adame\.fm-target\i686-pc-windows-msvc\$cfg"
+. (Join-Path $PSScriptRoot '..\lib\target-dir.ps1'); $target = Get-TargetDir
+$kit = "$target\$cfg\fm-dialogkit.exe"
+$env:FM_X86_DIR = "$target\i686-pc-windows-msvc\$cfg"
 $fail = 0
 
 function Open-Dialog([string]$Dir, [string]$Kind, [switch]$X86) {

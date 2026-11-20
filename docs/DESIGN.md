@@ -13,7 +13,7 @@ Brief: "sleek, modern, mainly like macOS Finder, with a Windows touch". Finder g
 │ [▤] [‹][›]  Dokumenty                 [▦ ☰ ▥ ▭] [⋯]   [⌕ Hledat        ]  │  52 px unified toolbar
 │┌ sidebar (Mica) ┐╭─────────────── content card (opaque) ───────────────────╮│
 ││ ◷ Nedávné      ││ Název                  Změněno         Velikost  Druh   ││
-││ ⌂ adame        ││ ▸ 📁 Faktury           Dnes 9:41          —     Složka   ││
+││ ⌂ Domů         ││ ▸ 📁 Faktury           Dnes 9:41          —     Složka   ││
 ││░▤ Dokumenty░░░░││ ███ 📄 Smlouva.pdf ███ Včera 18:02    1,2 MB  PDF       ││  selection = accent capsule
 ││ ───────────    ││                                                          ││
 ││ ☁ OneDrive     ││                                                          ││

@@ -1,6 +1,8 @@
 [package]
 name = "fm-dialog-hook"
 version.workspace = true
+license.workspace = true
+repository.workspace = true
 edition.workspace = true
 description = "Tiny DLL loaded on demand into a file dialog's UI thread to read its folder and select new items."
 

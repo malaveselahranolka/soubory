@@ -28,7 +28,7 @@ Nothing on the machine was changed.
   - `[C:"] -> trimmed [C:] is_dir=true`
   - `[D:"] -> [D:] is_dir=true`
   - `"C:\Program Files\" extra` arrives as one argument, `C:\Program Files" extra`, which is not a directory, so fm falls back to the profile folder.
-- Test source: `C:\Users\adame\AppData\Local\Temp\claude\d5a2f667c153e111\e5657664-345a-43d3-b9f9-d2c727afc9c9\scratchpad\argtest\a.rs` and `C:\Users\adame\AppData\Local\Temp\claude\d5a2f667c153e111\e5657664-345a-43d3-b9f9-d2c727afc9c9\scratchpad\argtest\t.cmd`.
+- Test source: a small `a.rs` and `t.cmd` in a scratch folder (not kept).
 - Fix it in fm by tokenizing the raw `GetCommandLineW` tail. A registry trick such as `"%1\."` would break `::{GUID}` targets.
 - set-default-fm.ps1 should not be run for real before this fix.
 

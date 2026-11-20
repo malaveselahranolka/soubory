@@ -2,7 +2,8 @@
 param([string]$Out = "$env:TEMP\fm-dialogkit-preview", [switch]$Release)
 Add-Type -AssemblyName System.Drawing
 $cfg = if ($Release) { 'release' } else { 'debug' }
-$kit = "C:\Users\adame\.fm-target\$cfg\fm-dialogkit.exe"
+. (Join-Path $PSScriptRoot '..\lib\target-dir.ps1'); $target = Get-TargetDir
+$kit = "$target\$cfg\fm-dialogkit.exe"
 New-Item -ItemType Directory -Force $Out | Out-Null
 $dir = Join-Path $Out 'folder'; New-Item -ItemType Directory -Force $dir | Out-Null
 foreach ($kind in 'save', 'legacy') {

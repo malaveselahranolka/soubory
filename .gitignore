@@ -3,3 +3,6 @@ target/
 .playwright-mcp/
 *.pdb
 dist/
+.cargo/config.toml
+.claude/
+docs/navrhy-ikon.html

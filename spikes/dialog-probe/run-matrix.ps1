@@ -1,5 +1,5 @@
 # Opens throwaway file dialogs (own PowerShell host processes) at several locations and runs the probe on each.
-$probe = 'C:\Users\adame\AppData\Local\cargo-target\file-manager\debug\dialog-probe.exe'
+$probe = Join-Path $(if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $PSScriptRoot 'target' }) 'debug\dialog-probe.exe'
 $docs = [Environment]::GetFolderPath('MyDocuments')
 $cases = @(
   @{ Name='Documents';      Dir=$docs },
@@ -7,7 +7,7 @@ $cases = @(
   @{ Name='Desktop';        Dir=[Environment]::GetFolderPath('Desktop') },
   @{ Name='Downloads';      Dir="$env:USERPROFILE\Downloads" },
   @{ Name='C root';         Dir='C:\' },
-  @{ Name='Deep w/ space';  Dir='C:\Users\adame\OneDrive\Desktop\file manager' },
+  @{ Name='Deep w/ space';  Dir=(Resolve-Path "$PSScriptRoot\..\..").Path },
   @{ Name='OneDrive root';  Dir=$env:OneDrive },
   @{ Name='This PC';        Dir='::{20D04FE0-3AEA-1069-A2D8-08002B30309D}' },
   @{ Name='Home';           Dir='::{f874310e-b6b7-47dc-bc84-b9e6b38f5903}' },

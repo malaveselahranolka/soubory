@@ -1,6 +1,7 @@
 ﻿# Usage: uia-test.ps1 -Path <a scratch folder with several items, at least one of them a folder>
 #        [-Exe fm.exe] [-View list|icons|tiles|columns] [-Group none|kind|modified|...]
-param([Parameter(Mandatory)][string]$Path, [string]$Exe = 'C:\Users\adame\.fm-target\release\fm.exe', [string]$View = 'list', [string]$Group = 'none')
+param([Parameter(Mandatory)][string]$Path, [string]$Exe = '', [string]$View = 'list', [string]$Group = 'none')
+. (Join-Path $PSScriptRoot '..\lib\target-dir.ps1'); if (-not $Exe) { $Exe = Join-Path (Get-TargetDir) 'release\fm.exe' }
 # UI Automation client test against fm's OWN test window only (FromHandle on its window; never RootElement).
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes

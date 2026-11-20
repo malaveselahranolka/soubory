@@ -13,7 +13,8 @@ public static class R { [StructLayout(LayoutKind.Sequential)] public struct RECT
   [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
   public static IntPtr Top(uint pid) { IntPtr r = IntPtr.Zero; EnumWindows((h, l) => { uint p; GetWindowThreadProcessId(h, out p); if (p == pid && IsWindowVisible(h)) { r = h; return false; } return true; }, IntPtr.Zero); return r; } }
 "@
-$probe = if ($X86) { 'C:\Users\adame\AppData\Local\cargo-target\file-manager\i686-pc-windows-msvc\debug\dialog-probe.exe' } else { 'C:\Users\adame\AppData\Local\cargo-target\file-manager\debug\dialog-probe.exe' }
+$t = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $PSScriptRoot 'target' }
+$probe = if ($X86) { "$t\i686-pc-windows-msvc\debug\dialog-probe.exe" } else { "$t\debug\dialog-probe.exe" }
 $dir = Join-Path $Out 'folder'
 Remove-Item $Out -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force $dir | Out-Null

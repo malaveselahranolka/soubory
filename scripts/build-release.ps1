@@ -10,11 +10,8 @@
 param([switch]$SkipX86)
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
-$target = 'C:\Users\adame\.fm-target'
-if (Test-Path "$root\.cargo\config.toml") {
-    $m = Select-String -Path "$root\.cargo\config.toml" -Pattern 'target-dir\s*=\s*"([^"]+)"'
-    if ($m) { $target = $m.Matches[0].Groups[1].Value -replace '/', '\' }
-}
+. (Join-Path $PSScriptRoot 'lib\target-dir.ps1')
+$target = Get-TargetDir
 
 Push-Location $root
 # cargo writes progress to stderr; with 'Stop' Windows PowerShell would treat that as a failure.

@@ -1,5 +1,5 @@
-// Generates crates/app/src/phosphor.rs (path data of the Phosphor icons fm uses) and the Phosphor
-// part of THIRD-PARTY-NOTICES.txt from the pinned npm package. Run: node scripts/dev/gen-phosphor.mjs
+// Generates crates/app/src/phosphor.rs (path data of the Phosphor icons fm uses) from the pinned npm
+// package. Run: node scripts/dev/gen-phosphor.mjs, then node scripts/dev/gen-notices.mjs if VERSION changed.
 // Adding an icon: put its Phosphor name in NAMES and run this again.
 import fs from 'node:fs'
 import path from 'node:path'
@@ -72,13 +72,4 @@ ${arms.join('\n')}
 `
 fs.writeFileSync(path.join(ROOT, 'crates', 'app', 'src', 'phosphor.rs'), rs)
 
-const lic = await get(`${BASE}/LICENSE`)
-const notices = `Third-party notices for Soubory (fm)
-
-fm draws its sidebar, toolbar and file-type icons with Phosphor Icons ${VERSION}
-(https://phosphoricons.com, @phosphor-icons/core), used under the MIT License:
-
-${lic.trim()}
-`
-fs.writeFileSync(path.join(ROOT, 'THIRD-PARTY-NOTICES.txt'), notices.replace(/\r?\n/g, '\r\n'))
-console.log(`phosphor.rs: ${NAMES.length} icons; THIRD-PARTY-NOTICES.txt written`)
+console.log(`phosphor.rs: ${NAMES.length} icons`)

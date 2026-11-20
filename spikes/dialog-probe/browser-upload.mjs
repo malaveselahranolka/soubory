@@ -6,7 +6,7 @@ import { writeFileSync, mkdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 
 const [browser, tmp] = process.argv.slice(2);
-const probe = 'C:\\Users\\adame\\AppData\\Local\\cargo-target\\file-manager\\debug\\dialog-probe.exe';
+const probe = join(process.env.CARGO_TARGET_DIR || join(import.meta.dirname, 'target'), 'debug', 'dialog-probe.exe');
 const port = 9300 + Math.floor(process.pid % 500);
 mkdirSync(tmp, { recursive: true });
 const page = join(tmp, 'upload.html');
