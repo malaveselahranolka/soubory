@@ -52,8 +52,9 @@ pub fn cli(dir: &Path) -> i32 {
             ok &= gfx.render_png(&out, WIZARD_W, ph / k, k, |c| wizard(c, &t, ph / k)).is_ok();
         }
         let out = dir.join(format!("wizard-small-{pct}.png"));
+        // Inset: the header puts this image close to the window's right edge.
         let s = 58.0;
-        ok &= gfx.render_png(&out, s, s, WIZARD_SMALL[i] / s, |c| icon(c, Rect::new(0.0, 0.0, s, s))).is_ok();
+        ok &= gfx.render_png(&out, s, s, WIZARD_SMALL[i] / s, |c| icon(c, Rect::new(6.0, 6.0, s - 12.0, s - 12.0))).is_ok();
     }
     if ok { 0 } else { 1 }
 }
@@ -177,6 +178,9 @@ fn wizard(c: &mut Canvas, t: &Theme, h: f32) {
     let y0 = 236.0;
     for (row, names) in rows.iter().enumerate() {
         let y = y0 + row as f32 * step;
+        if y + size > h {
+            break;
+        }
         let fade = (1.0 - row as f32 / rows.len() as f32).powf(1.6);
         for (col, name) in names.iter().enumerate() {
             let x = x0 + col as f32 * (size + gap) + if names.len() == 2 { (size + gap) / 2.0 } else { 0.0 };

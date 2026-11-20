@@ -72,7 +72,7 @@ Name: "cs"; MessagesFile: "compiler:Languages\Czech.isl"
 
 [Messages]
 WelcomeLabel1=Vítejte v instalaci Souborů
-WelcomeLabel2=Soubory jsou správce souborů ve stylu Finderu: vyhledávání v názvech souborů na všech discích, rychlý náhled mezerníkem, karty a barevné štítky.%n%nInstalují se jen pro váš účet a nepotřebují práva správce. Tohle je testovací verze {#AppVersion}.
+WelcomeLabel2=Soubory jsou správce souborů ve stylu Finderu: vyhledávání v názvech souborů na všech discích, rychlý náhled mezerníkem, karty a barevné štítky.%n%nInstalují se jen pro váš účet a nepotřebují práva správce. Jde o testovací verzi {#AppVersion}.
 SelectTasksLabel2=Vyberte, co má instalátor nastavit, a klikněte na Instalovat. Později to změníte tak, že instalátor spustíte znovu.
 FinishedHeadingLabel=Soubory jsou nainstalované
 
@@ -246,6 +246,9 @@ begin
     if HasMarker(OldDir('dialogkit'), 'fm-dialogkit') then
       WizardSelectTasks('dialogkit');
   end;
+  { The Ready page is off, so this page starts the install; Inno still labels it Next. }
+  if CurPageID = wpSelectTasks then
+    WizardForm.NextButton.Caption := SetupMessage(msgButtonInstall);
   if CurPageID = wpFinished then begin
     if WizardIsTaskSelected('defaultfm') and not FailedDefault then
       WizardForm.FinishedLabel.Caption := CustomMessage('FinishedDefault')
