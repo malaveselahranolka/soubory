@@ -2036,8 +2036,17 @@ fn apply_rename(app: &mut App, i: usize, text: String) {
 unsafe extern "system" fn edit_proc(h: HWND, m: u32, w: WPARAM, l: LPARAM, id: usize, d: usize) -> LRESULT {
     // Reached from the message loop, not through wndproc: a dialog started from the field (the
     // palette's commands) must see itself nested.
-    let _busy = Busy::new();
-    unsafe { edit_proc_inner(h, m, w, l, id, d) }
+    let r = {
+        let _busy = Busy::new();
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { edit_proc_inner(h, m, w, l, id, d) }))
+    };
+    match r {
+        Ok(r) => r,
+        Err(e) => {
+            crate::prefs::log(&format!("panic in edit_proc (msg {m:#x}): {}", panic_text(&e)));
+            unsafe { DefSubclassProc(h, m, w, l) }
+        }
+    }
 }
 
 unsafe fn edit_proc_inner(

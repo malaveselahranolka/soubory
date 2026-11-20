@@ -47,8 +47,14 @@ $files = @(Get-ChildItem -LiteralPath $SourceDir -File)
 foreach ($f in $files) { Copy-Item -LiteralPath $f.FullName (Join-Path $InstallDir "$($f.Name).new") -Force }
 foreach ($f in $files) {
     $dest = Join-Path $InstallDir $f.Name
-    Remove-OrSetAside $dest | Out-Null
-    Rename-Item -LiteralPath "$dest.new" -NewName $f.Name
+    $aside = $null
+    if (Test-Path -LiteralPath $dest) {
+        $aside = "$dest.$([guid]::NewGuid().ToString('N')).del"
+        Rename-Item -LiteralPath $dest -NewName (Split-Path $aside -Leaf)
+    }
+    # A failed swap puts the old file back (the *.del cleanup would otherwise remove it).
+    try { Rename-Item -LiteralPath "$dest.new" -NewName $f.Name }
+    catch { if ($aside) { Rename-Item -LiteralPath $aside -NewName $f.Name }; throw }
 }
 # Old files still mapped somewhere go at the next sign-in; otherwise nothing stays pending.
 Get-ChildItem -LiteralPath $InstallDir -File -Filter '*.del' | ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }

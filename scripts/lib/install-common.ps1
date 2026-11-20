@@ -101,7 +101,7 @@ function Stop-FromDir([string]$dir, [string]$name) {
 # closed at once, or this PowerShell would keep the mutex alive. One we may not open is an fm too.
 function Test-Instance([string]$name) {
     $m = $null
-    try { if ([Threading.Mutex]::TryOpenExisting($name, 'Synchronize', [ref]$m)) { $m.Dispose(); return $true } }
+    try { if ([Threading.Mutex]::TryOpenExisting($name, [ref]$m)) { $m.Dispose(); return $true } }
     catch [UnauthorizedAccessException] { return $true }
     $false
 }
@@ -119,7 +119,8 @@ function Stop-Fm([string]$dir, [int]$wait = 120, [string]$Mutex = 'Local\fm.main
         (Start-Process -FilePath $q -ArgumentList '--quit' -WorkingDirectory "$env:SystemRoot\System32" -PassThru).WaitForExit(5000) | Out-Null
     }
     $sw = [Diagnostics.Stopwatch]::StartNew(); $next = 10
-    while ((Get-FromDir $dir 'fm') -or (Test-Instance $Mutex)) {
+    # With nothing to send --quit (uninstall with no fm.exe left), only fm from $dir is waited for.
+    while ((Get-FromDir $dir 'fm') -or ($q -and (Test-Instance $Mutex))) {
         $s = [int]$sw.Elapsed.TotalSeconds
         if ($s -ge $wait) { throw 'Soubory pořád běží: dokončují kopírování nebo přesun, nebo mají otevřený dialog. Dokonči nebo zruš operaci (případně Soubory zavři) a spusť skript znovu. Nic jsem nezměnil.' }
         if ($s -ge $next) { Write-Host "Soubory ještě dokončují kopírování nebo přesun, nebo mají otevřený dialog; čekám ($s s z $wait s)…"; $next += 10 }

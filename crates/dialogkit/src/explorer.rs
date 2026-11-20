@@ -276,8 +276,10 @@ fn replace(p: &Pending, app: &IWebBrowserApp, folder: Folder, selection: Option<
         Folder::Shell(target) => command_line(&fm, target, None),
         Folder::Other => return log("explorer: not a file-system folder, left alone"),
     };
-    // Before the deadline check, so the ping counts against it.
-    if fm_unresponsive() {
+    // Before the deadline check, so the ping counts against it. A busy fm (opening the previous
+    // hand-over) gets the time left, less a margin for the launch and the re-check.
+    let left = TOO_LATE.saturating_sub(p.since.elapsed()).saturating_sub(Duration::from_millis(300));
+    if fm_unresponsive(left.max(Duration::from_millis(300))) {
         return log("explorer: fm is not responding, Explorer stays");
     }
     if p.since.elapsed() >= TOO_LATE {
@@ -307,10 +309,11 @@ fn replace(p: &Pending, app: &IWebBrowserApp, folder: Folder, selection: Option<
 /// dropped share), and would show nothing until it recovers: then Explorer stays. Its top-level
 /// FmHub lives on that UI thread; FindWindowExW(None, ..) skips the message-only FmHub every fm
 /// process has. No resident fm (a cold start) is no reason to wait. Needs a real fm to test.
-fn fm_unresponsive() -> bool {
+fn fm_unresponsive(wait: Duration) -> bool {
     unsafe {
         let Ok(hub) = FindWindowExW(None, None, w!("FmHub"), None) else { return false };
-        SendMessageTimeoutW(hub, WM_NULL, WPARAM(0), LPARAM(0), SMTO_ABORTIFHUNG, 300, None).0 == 0
+        let ms = wait.as_millis().min(u32::MAX as u128) as u32;
+        SendMessageTimeoutW(hub, WM_NULL, WPARAM(0), LPARAM(0), SMTO_ABORTIFHUNG, ms, None).0 == 0
     }
 }
 

@@ -186,6 +186,28 @@ try {
         (Val $runOnce 'Soubory.Cleanup') -eq '<none>')
     & "$scripts\install-fm.ps1" @inst -SourceDir $src -NoStart | Out-Null
 
+    '=== a failed swap puts the old fm.exe back'
+    # No test hook: the new copy (fm.exe.new) inherits a deny on delete and the folder denies
+    # "delete child", so it cannot be renamed into place; the old fm.exe keeps its own permissions,
+    # so it can still be moved aside and back.
+    $oldHash = (Get-FileHash $exe).Hash
+    $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $err = $null
+    icacls $exe /inheritance:d | Out-Null
+    icacls $dir /deny "*${sid}:(DC)" | Out-Null
+    icacls $dir /deny "*${sid}:(OI)(IO)(DE)" | Out-Null
+    try { & "$scripts\install-fm.ps1" @inst -SourceDir $src2 -NoStart | Out-Null } catch { $err = $_ }
+    finally {
+        icacls $dir /remove:d "*$sid" | Out-Null
+        icacls $exe /inheritance:e | Out-Null
+    }
+    Check 'install fails on the rename of fm.exe.new' ($err -and $err.FullyQualifiedErrorId -like 'RenameItem*')
+    Check 'old fm.exe is back, unchanged and registered; nothing left aside' ((Get-FileHash $exe).Hash -eq $oldHash -and -not (Get-ChildItem $dir -Filter 'fm.exe.*.del') -and
+        (Val $run 'Soubory') -eq "`"$exe`" --background" -and (Def "$reg\App Paths\fm.exe") -eq $exe)
+    & "$scripts\install-fm.ps1" @inst -SourceDir $src -NoStart | Out-Null
+    Check 'the next install clears the stuck *.new and the pending cleanup' (-not (Get-ChildItem $dir -Filter '*.new') -and -not (Get-ChildItem $dir -Filter '*.del') -and
+        (Get-FileHash $exe).Hash -eq $oldHash -and (Val $runOnce 'Soubory.Cleanup') -eq '<none>')
+
     '=== a resident fm from elsewhere (a dev build) is quit before a first install'
     $dev = Join-Path $Root 'devbuild'; New-Item -ItemType Directory -Force $dev | Out-Null; Copy-Item "$src\fm.exe" "$dev\fm.exe"
     $stray = Start-Process "$dev\fm.exe" -ArgumentList '--background' -PassThru
@@ -354,6 +376,23 @@ try {
     Check 'Run value removed, other app kept' ((Val $run 'Soubory') -eq '<none>' -and (Val $run 'Other') -eq $foreign)
     Check 'install dir removed, no cleanup pending' (-not (Test-Path $dir) -and (Val $runOnce 'Soubory.Cleanup') -eq '<none>')
     Check 'App Paths and shortcut removed' (-not (Test-Path "$reg\App Paths\fm.exe") -and -not (Test-Path "$menu\Soubory.lnk"))
+
+    '=== uninstall with no fm.exe left does not wait for a resident from elsewhere'
+    $elsewhere = Join-Path $Root 'elsewhere'; New-Item -ItemType Directory -Force $elsewhere | Out-Null; Copy-Item "$src\fm.exe" "$elsewhere\fm.exe" -Force
+    $res = Start-Process "$elsewhere\fm.exe" -ArgumentList '--background' -PassThru
+    for ($i = 0; $i -lt 50 -and -not (TestMutex); $i++) { Start-Sleep -Milliseconds 100 }
+    $graceful = @(FakeLog | Where-Object { $_ -eq 'graceful' }).Count
+    foreach ($case in 'missing', 'holding only the marker') {
+        if ($case -ne 'missing') { New-Item -ItemType Directory -Force $dir | Out-Null; Set-Content "$dir\.fm-install" 'fm' }
+        $a = $inst + $def; $a.QuitWait = 5
+        $sw = [Diagnostics.Stopwatch]::StartNew(); $threw = $null
+        try { & "$scripts\uninstall-fm.ps1" @a | Out-Null } catch { $threw = $_.Exception.Message }
+        Check "install folder $case`: uninstall completes at once, no throw" (-not $threw -and $sw.Elapsed.TotalSeconds -lt 4 -and -not (Test-Path $dir))
+        if ($threw) { "        threw: $threw" }
+    }
+    Check 'the resident from elsewhere is left running, not asked to quit' (-not $res.HasExited -and (TestMutex) -and @(FakeLog | Where-Object { $_ -eq 'graceful' }).Count -eq $graceful)
+    Start-Process "$elsewhere\fm.exe" -ArgumentList '--quit' -Wait; $res.WaitForExit(5000) | Out-Null
+    Check 'it quits when asked' ($res.HasExited -and -not (TestMutex))
 
     '=== uninstall while a file is in use, then reinstall'
     & "$scripts\install-fm.ps1" @inst -SourceDir $src -NoStart | Out-Null
