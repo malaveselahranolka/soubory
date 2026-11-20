@@ -74,7 +74,7 @@ fn place_label(row: &Row) -> Option<String> {
     match row {
         Row::Item { label, .. } => Some(label.clone()),
         Row::Tag(i) => Some(crate::theme::TAGS[*i].1.to_string()),
-        Row::Header(_) => None,
+        Row::Divider | Row::Spacer => None,
     }
 }
 
@@ -83,7 +83,7 @@ fn place_key(row: &Row) -> Option<String> {
     match row {
         Row::Item { loc, .. } => Some(format!("{loc:?}")),
         Row::Tag(i) => Some(format!("Tag({i})")),
-        Row::Header(_) => None,
+        Row::Divider | Row::Spacer => None,
     }
 }
 

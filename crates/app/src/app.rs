@@ -1045,7 +1045,7 @@ impl App {
             return Hit::SideResize;
         }
         if self.sidebar_on && l.sidebar.contains(x, y) {
-            return crate::paint::side_row_at(self, y)
+            return crate::paint::side_row_at(self, x, y)
                 .map(Hit::SideRow)
                 .unwrap_or(Hit::Drag);
         }

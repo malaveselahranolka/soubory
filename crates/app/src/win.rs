@@ -875,6 +875,11 @@ unsafe extern "system" fn hub_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
             }
             WM_APP_OPDONE => {
                 crate::undo::done(Box::from_raw(l.0 as *mut crate::undo::Done));
+                // The drives' fill bars follow what the operation wrote or freed.
+                for_each_app(|a| {
+                    crate::sidebar::refresh_usage(&mut a.side_rows);
+                    a.invalidate();
+                });
                 Some(LRESULT(0))
             }
             _ => None,

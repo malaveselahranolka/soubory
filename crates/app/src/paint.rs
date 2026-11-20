@@ -3,7 +3,7 @@ use crate::app::{App, Cap, Drag, Focus, Hit, Loc, View};
 use crate::fsys::{self, SortKey};
 use crate::geom::Rect;
 use crate::gfx::{Align, Canvas, Font};
-use crate::layout::{self, Col, INSET, SIDE_HEADER, SIDE_ROW};
+use crate::layout::{self, Col, INSET, SIDE_ROW};
 use crate::sidebar::Row;
 use crate::theme::{Color, Mode, Theme};
 use windows::Win32::Foundation::POINT;
@@ -266,31 +266,70 @@ fn toolbar(app: &App, c: &mut Canvas, t: &Theme) {
 
 // ---- sidebar --------------------------------------------------------------------------------------
 
-/// Y offset of each sidebar row (relative to the sidebar top, before scrolling).
-fn side_offsets(app: &App) -> Vec<(f32, f32)> {
-    let mut y = 4.0;
-    let mut out = Vec::with_capacity(app.side_rows.len());
-    for (k, row) in app.side_rows.iter().enumerate() {
-        let h = match row {
-            Row::Header(_) => {
-                if k > 0 {
-                    y += 10.0;
+/// Sidebar metrics: rows, drives with their fill bar, dividers, the row of tag dots.
+const SIDE_TOP: f32 = 2.0;
+const SIDE_BOTTOM: f32 = 10.0;
+const DRIVE_ROW: f32 = 40.0;
+const DIVIDER: f32 = 17.0;
+const TAG_HIT: f32 = 24.0;
+const TAGS_PAD: f32 = 3.0;
+
+/// Each sidebar row's rect relative to the sidebar's top-left, before scrolling. Tags share rows
+/// of dots (24 px targets); the spacer takes the height left over so the Recycle Bin sits at the
+/// bottom while everything fits.
+fn side_rects(app: &App) -> Vec<Rect> {
+    let w = app.lay.sidebar.w;
+    let rows = &app.side_rows;
+    let mut out = Vec::with_capacity(rows.len());
+    let mut y = SIDE_TOP;
+    let mut spacer = None;
+    let mut k = 0;
+    while k < rows.len() {
+        match &rows[k] {
+            Row::Tag(_) => {
+                let left = INSET + 6.0;
+                let mut x = left;
+                y += TAGS_PAD;
+                while matches!(rows.get(k), Some(Row::Tag(_))) {
+                    if x > left && x + TAG_HIT > w - INSET {
+                        x = left;
+                        y += TAG_HIT;
+                    }
+                    out.push(Rect::new(x, y, TAG_HIT, TAG_HIT));
+                    x += TAG_HIT;
+                    k += 1;
                 }
-                SIDE_HEADER
+                y += TAG_HIT + TAGS_PAD;
+                continue;
             }
-            _ => SIDE_ROW,
-        };
-        out.push((y, h));
-        y += h;
+            Row::Spacer => {
+                spacer = Some(k);
+                out.push(Rect::new(0.0, y, w, 0.0));
+            }
+            Row::Divider => {
+                out.push(Rect::new(0.0, y, w, DIVIDER));
+                y += DIVIDER;
+            }
+            Row::Item { usage, .. } => {
+                let h = if usage.is_some() { DRIVE_ROW } else { SIDE_ROW };
+                out.push(Rect::new(INSET, y, w - 2.0 * INSET, h));
+                y += h;
+            }
+        }
+        k += 1;
+    }
+    let free = app.lay.sidebar.h - y - SIDE_BOTTOM;
+    if let (Some(sp), true) = (spacer, free > 0.0) {
+        out[sp].h = free;
+        for r in &mut out[sp + 1..] {
+            r.y += free;
+        }
     }
     out
 }
 
 pub fn sidebar_height(app: &App) -> f32 {
-    side_offsets(app)
-        .last()
-        .map(|(y, h)| y + h + 12.0)
-        .unwrap_or(0.0)
+    side_rects(app).iter().fold(0.0f32, |m, r| m.max(r.b())) + SIDE_BOTTOM
 }
 
 // ---- search scope bar ------------------------------------------------------------------------------
@@ -345,9 +384,9 @@ fn scope_bar(app: &App, c: &mut Canvas, t: &Theme, bar: Rect) {
 }
 
 pub fn side_row_rect(app: &App, k: usize) -> Rect {
-    let (oy, h) = side_offsets(app).get(k).copied().unwrap_or((0.0, 0.0));
+    let r = side_rects(app).get(k).copied().unwrap_or_default();
     let s = app.lay.sidebar;
-    Rect::new(s.x, s.y - app.side_scroll + oy, s.w, h).inset(INSET, 1.0)
+    Rect::new(s.x + r.x, s.y - app.side_scroll + r.y, r.w, r.h)
 }
 
 pub fn tab_rect(app: &App, k: usize) -> Option<Rect> {
@@ -384,116 +423,107 @@ fn drop_highlight(app: &App, c: &mut Canvas, t: &Theme) {
     }
 }
 
-pub fn side_row_at(app: &App, y: f32) -> Option<usize> {
-    let top = app.lay.sidebar.y - app.side_scroll;
-    side_offsets(app)
+pub fn side_row_at(app: &App, x: f32, y: f32) -> Option<usize> {
+    let s = app.lay.sidebar;
+    let (x, y) = (x - s.x, y - s.y + app.side_scroll);
+    side_rects(app)
         .iter()
-        .position(|(oy, h)| y >= top + oy && y < top + oy + h)
-        .filter(|&k| !matches!(app.side_rows[k], Row::Header(_)))
+        .position(|r| r.contains(x, y))
+        .filter(|&k| matches!(app.side_rows[k], Row::Item { .. } | Row::Tag(_)))
 }
 
 fn side_selected(app: &App, row: &Row) -> bool {
     match row {
         Row::Item { loc, .. } => &app.tab().loc == loc,
         Row::Tag(i) => app.tab().loc == Loc::Tag(*i),
-        Row::Header(_) => false,
+        Row::Divider | Row::Spacer => false,
+    }
+}
+
+/// The selected place: a quiet accent tint (the accent fill in high contrast).
+fn side_tint(t: &Theme) -> Color {
+    match t.mode {
+        Mode::HighContrast => t.accent,
+        _ => Color { a: if t.is_dark() { 0.20 } else { 0.14 }, ..t.accent_glyph },
     }
 }
 
 fn sidebar(app: &App, c: &mut Canvas, t: &Theme) {
+    use crate::phosphor::{Ico, Weight};
     let s = app.lay.sidebar;
+    let hc = t.mode == Mode::HighContrast;
     c.push_clip(s);
     let top = s.y - app.side_scroll;
-    for ((oy, h), (k, row)) in side_offsets(app)
-        .into_iter()
-        .zip(app.side_rows.iter().enumerate())
-    {
-        let r = Rect::new(s.x, top + oy, s.w, h);
+    let mut hover_tag = None;
+    for (rr, (k, row)) in side_rects(app).into_iter().zip(app.side_rows.iter().enumerate()) {
+        let r = Rect::new(s.x + rr.x, top + rr.y, rr.w, rr.h);
         if r.b() < s.y || r.y > s.b() {
             continue;
         }
+        let selected = side_selected(app, row);
+        let hover = app.hover == Hit::SideRow(k);
+        if selected {
+            c.round(r, 6.0, side_tint(t));
+        } else if hover && matches!(row, Row::Item { .. } | Row::Tag(_)) {
+            c.round(r, 6.0, t.hover);
+        }
+        let ink = if selected && hc { t.on_accent } else { t.ink };
         match row {
-            Row::Header(title) => {
-                c.text(
-                    title,
-                    Rect::new(r.x + 18.0, r.y + 6.0, r.w - 26.0, r.h - 6.0),
-                    Font::CaptionStrong,
-                    t.ink3,
-                    Align::Start,
-                );
-            }
-            _ => {
-                let pill = r.inset(INSET, 1.0);
-                let selected = side_selected(app, row);
-                if selected {
-                    c.round(
-                        pill,
-                        6.0,
-                        if t.mode == Mode::HighContrast {
-                            t.accent
-                        } else {
-                            t.pill
-                        },
-                    );
-                    // Fluent selection indicator.
-                    let ind = Rect::new(pill.x, pill.cy() - 8.0, 3.0, 16.0);
-                    c.round(ind, 1.5, t.accent_glyph);
-                } else if app.hover == Hit::SideRow(k) {
-                    c.round(pill, 6.0, t.hover);
+            Row::Spacer => {}
+            Row::Divider => c.hline(r.x + 16.0, r.r() - 16.0, c.px(r.cy()), t.edge),
+            Row::Tag(i) => {
+                c.circle(r.cx(), r.cy(), 7.0, Theme::tag(*i));
+                if hc {
+                    c.circle_stroke(r.cx(), r.cy(), 7.0, ink, 1.0);
                 }
-                let ink = if selected && t.mode == Mode::HighContrast {
-                    t.on_accent
-                } else {
-                    t.ink
+                if hover {
+                    hover_tag = Some((*i, r));
+                }
+            }
+            Row::Item { label, ico, eject, usage, .. } => {
+                let (weight, ic) = match (selected, hc) {
+                    (true, true) => (Weight::Fill, t.on_accent),
+                    (true, false) => (Weight::Fill, t.accent_glyph),
+                    (false, true) => (Weight::Bold, t.ink),
+                    (false, false) => (Weight::Bold, t.ink2),
                 };
-                let icon = Rect::new(pill.x + 8.0, pill.y, 20.0, pill.h);
-                let label_r = Rect::new(icon.r() + 8.0, pill.y, pill.r() - icon.r() - 16.0, pill.h);
-                match row {
-                    Row::Item {
-                        label,
-                        glyph,
-                        eject,
-                        ..
-                    } => {
-                        c.glyph(
-                            *glyph,
-                            icon,
-                            16,
-                            if t.mode == Mode::HighContrast {
-                                ink
-                            } else {
-                                t.accent_glyph
-                            },
-                        );
-                        let lr = if *eject {
-                            label_r.cut_right(20.0)
+                c.icon(*ico, weight, Rect::new(r.x + 8.0, r.y, 20.0, r.h), 18.0, ic);
+                let mut lr = Rect::new(r.x + 36.0, r.y, r.w - 44.0, r.h);
+                if *eject {
+                    c.icon(Ico::Eject, Weight::Bold, lr.right(20.0), 14.0, if selected && hc { ink } else { t.ink3 });
+                    lr = lr.cut_right(26.0);
+                }
+                let font = if selected { Font::SideStrong } else { Font::Side };
+                match usage {
+                    Some(u) => {
+                        // Name and bar as one centred block: 19 px line, 6 px gap, 3 px bar.
+                        c.text(label, Rect::new(lr.x, r.y + 6.0, lr.w, 19.0), font, ink, Align::Start);
+                        let bar = Rect::new(lr.x, r.y + 31.0, lr.w, 3.0);
+                        let (track, fill) = if hc {
+                            (with_alpha(ink, 0.35), if selected { ink } else { t.accent })
+                        } else if *u >= 0.9 {
+                            (with_alpha(t.ink, 0.10), crate::theme::rgb(0xD13438))
                         } else {
-                            label_r
+                            (with_alpha(t.ink, 0.10), t.accent_glyph)
                         };
-                        c.text(label, lr, Font::Body, ink, Align::Start);
-                        if *eject {
-                            c.glyph(
-                                crate::sidebar::glyph::EJECT,
-                                label_r.right(20.0),
-                                12,
-                                t.ink3,
-                            );
-                        }
+                        c.round(bar, 1.5, track);
+                        c.round(Rect::new(bar.x, bar.y, (bar.w * u).max(3.0), bar.h), 1.5, fill);
                     }
-                    Row::Tag(i) => {
-                        c.circle(icon.cx(), icon.cy(), 5.0, Theme::tag(*i));
-                        c.text(
-                            crate::theme::TAGS[*i].1,
-                            label_r,
-                            Font::Body,
-                            ink,
-                            Align::Start,
-                        );
-                    }
-                    Row::Header(_) => {}
+                    None => c.text(label, lr, font, ink, Align::Start),
                 }
             }
         }
+    }
+    // The tag's name while its dot is hovered (the dots carry no text).
+    if let Some((i, r)) = hover_tag {
+        let name = crate::theme::TAGS[i].1;
+        let w = c.measure(name, Font::Caption) + 16.0;
+        let x = (r.cx() - w / 2.0).clamp(s.x + 4.0, s.r() - w - 4.0);
+        let y = if r.b() + 26.0 <= s.b() { r.b() + 2.0 } else { r.y - 26.0 };
+        let tip = Rect::new(x, y, w, 24.0);
+        c.round(tip, 6.0, t.card);
+        c.round_stroke(tip, 6.0, t.edge, 1.0);
+        c.text(name, tip, Font::Caption, t.ink, Align::Center);
     }
     c.pop_clip();
     if app.hover == Hit::SideResize || matches!(app.drag, Drag::Sidebar { .. }) {
@@ -1417,4 +1447,41 @@ pub fn menu_point_for_focus(app: &App) -> POINT {
         .map(|f| app.item_rect(f))
         .unwrap_or(app.lay.body);
     crate::win::to_screen(app, r.x + 40.0, r.y + r.h.min(26.0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn places_and_tags_are_hit_where_they_are_drawn() {
+        let mut app = App::new(Loc::Computer);
+        for (w, h) in [(208.0, 900.0), (160.0, 900.0), (208.0, 300.0)] {
+            app.lay.sidebar = Rect::new(0.0, 52.0, w, h);
+            let n = app.side_rows.len();
+            for k in 0..n {
+                let r = side_row_rect(&app, k);
+                let hit = side_row_at(&app, r.cx(), r.cy());
+                match app.side_rows[k] {
+                    Row::Item { .. } => assert_eq!(hit, Some(k), "row {k} at {w}x{h}"),
+                    Row::Tag(_) => {
+                        assert_eq!(hit, Some(k), "tag {k} at {w}x{h}");
+                        assert!(r.w >= 24.0 && r.h >= 24.0 && r.r() <= w - INSET + 0.01, "tag {k} target {r:?}");
+                    }
+                    Row::Divider | Row::Spacer => assert_ne!(hit, Some(k)),
+                }
+            }
+            let last = side_row_rect(&app, n - 1);
+            if let Row::Item { label, .. } = &app.side_rows[n - 1] {
+                if label == "Koš" && h > 800.0 {
+                    // Everything fits: the bin sits at the bottom, nothing scrolls.
+                    assert!((app.lay.sidebar.b() - last.b() - SIDE_BOTTOM).abs() < 0.01);
+                    assert!((sidebar_height(&app) - h).abs() < 0.01);
+                }
+            }
+            if h < 400.0 {
+                assert!(sidebar_height(&app) > h, "a short sidebar scrolls");
+            }
+        }
+    }
 }

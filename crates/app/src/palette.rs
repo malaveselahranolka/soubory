@@ -94,7 +94,7 @@ fn items(app: &App) -> Vec<Item> {
                 keys: "",
                 act: Act::Go(Loc::Tag(*i)),
             }),
-            crate::sidebar::Row::Header(_) => {}
+            _ => {}
         }
     }
     v
