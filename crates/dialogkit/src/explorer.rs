@@ -276,6 +276,10 @@ fn replace(p: &Pending, app: &IWebBrowserApp, folder: Folder, selection: Option<
         Folder::Shell(target) => command_line(&fm, target, None),
         Folder::Other => return log("explorer: not a file-system folder, left alone"),
     };
+    // Before the deadline check, so the ping counts against it.
+    if fm_unresponsive() {
+        return log("explorer: fm is not responding, Explorer stays");
+    }
     if p.since.elapsed() >= TOO_LATE {
         return log("explorer: decided too late, left alone");
     }
@@ -296,6 +300,17 @@ fn replace(p: &Pending, app: &IWebBrowserApp, folder: Folder, selection: Option<
     match unsafe { app.Quit() } {
         Ok(()) => log(format!("explorer: replaced after {} ms ({} items)", p.since.elapsed().as_millis(), p.count)),
         Err(e) => log(format!("explorer: closing the window failed: {e}")),
+    }
+}
+
+/// The resident fm takes a hand-over on its door thread even while its UI thread is stuck (a
+/// dropped share), and would show nothing until it recovers: then Explorer stays. Its top-level
+/// FmHub lives on that UI thread; FindWindowExW(None, ..) skips the message-only FmHub every fm
+/// process has. No resident fm (a cold start) is no reason to wait. Needs a real fm to test.
+fn fm_unresponsive() -> bool {
+    unsafe {
+        let Ok(hub) = FindWindowExW(None, None, w!("FmHub"), None) else { return false };
+        SendMessageTimeoutW(hub, WM_NULL, WPARAM(0), LPARAM(0), SMTO_ABORTIFHUNG, 300, None).0 == 0
     }
 }
 

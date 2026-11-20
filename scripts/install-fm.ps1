@@ -5,12 +5,14 @@
   Copies dist\app to -InstallDir, adds a Start menu shortcut "Soubory", an App Paths entry
   (so "fm" works in Win+R; another program's entry under that name is left alone) and the HKCU
   Run value "Soubory" = "fm.exe" --background (fm stays resident: it starts at sign-in without a
-  window) and starts it that way right away unless -NoStart. A running fm is asked to quit first;
-  if it is still finishing a copy or move (or has a dialog open) after -QuitWait seconds, the
-  script stops without changing anything. Touches only HKCU and the user's own Start menu. It does
-  NOT make fm the default for folders; that is scripts\set-default-fm.ps1, a separate step. Run
-  scripts\build-release.ps1 first, from a normal (not elevated) 64-bit PowerShell. Tests pass
-  -RegRoot, -RunRoot, -InstallDir, -StartMenuDir, -SourceDir, -NoStart and -QuitWait.
+  window) and starts it that way right away unless -NoStart. A running fm is asked to quit first,
+  also one started from elsewhere (for example a build in dist or target); if it is still
+  finishing a copy or move (or has a dialog open) after -QuitWait seconds, the script stops
+  without changing anything. Each file is copied in full before the old one is replaced, so a
+  failed copy leaves the old fm.exe in place. Touches only HKCU and the user's own Start menu. It
+  does NOT make fm the default for folders; that is scripts\set-default-fm.ps1, a separate step.
+  Run scripts\build-release.ps1 first, from a normal (not elevated) 64-bit PowerShell. Tests pass
+  -RegRoot, -RunRoot, -InstallDir, -StartMenuDir, -SourceDir, -NoStart, -QuitWait and -Mutex.
 #>
 param(
     [string]$InstallDir = (Join-Path $env:LOCALAPPDATA 'Programs\fm\app'),
@@ -19,7 +21,8 @@ param(
     [string]$StartMenuDir = (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'),
     [string]$SourceDir = (Join-Path (Split-Path -Parent $PSScriptRoot) 'dist\app'),
     [switch]$NoStart,
-    [int]$QuitWait = 120
+    [int]$QuitWait = 120,
+    [string]$Mutex = 'Local\fm.main'
 )
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'lib\install-common.ps1')
@@ -32,15 +35,20 @@ if (-not (Test-Path -LiteralPath (Join-Path $SourceDir 'fm.exe'))) { throw "Chyb
 $InstallDir = Get-InstallDir $InstallDir
 Assert-OwnDir $InstallDir 'fm'
 
-Stop-Fm $InstallDir $QuitWait
+Stop-Fm $InstallDir $QuitWait $Mutex (Join-Path $SourceDir 'fm.exe')
 New-Item -ItemType Directory -Force $InstallDir | Out-Null
 Set-Content -LiteralPath (Join-Path $InstallDir $Marker) -Value 'fm' -Encoding ascii
 # Replaces a pending whole-folder delete from an earlier uninstall before anything is copied.
 Register-DelCleanup $RegRoot $InstallDir
-Get-ChildItem -LiteralPath $SourceDir -File | ForEach-Object {
-    $dest = Join-Path $InstallDir $_.Name
+# Everything is copied as *.new first; the old files go only once all copies are complete, so a
+# failed copy (disk full, antivirus, an offline cloud file) leaves the install as it was.
+Get-ChildItem -LiteralPath $InstallDir -File -Filter '*.new' | ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force }
+$files = @(Get-ChildItem -LiteralPath $SourceDir -File)
+foreach ($f in $files) { Copy-Item -LiteralPath $f.FullName (Join-Path $InstallDir "$($f.Name).new") -Force }
+foreach ($f in $files) {
+    $dest = Join-Path $InstallDir $f.Name
     Remove-OrSetAside $dest | Out-Null
-    Copy-Item -LiteralPath $_.FullName $dest -Force
+    Rename-Item -LiteralPath "$dest.new" -NewName $f.Name
 }
 # Old files still mapped somewhere go at the next sign-in; otherwise nothing stays pending.
 Get-ChildItem -LiteralPath $InstallDir -File -Filter '*.del' | ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }

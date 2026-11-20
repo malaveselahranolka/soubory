@@ -97,17 +97,29 @@ function Stop-FromDir([string]$dir, [string]$name) {
     foreach ($p in @(Get-FromDir $dir $name)) { Stop-Process -Id $p.Id -Force; $p.WaitForExit(3000) | Out-Null }
 }
 
-# "fm.exe --quit" asks a running fm to close its windows and exit once running copies and open
-# dialogs are done, saving its windows and index. fm is never killed: one still running after $wait
-# seconds stops the script here, so callers run this before they change anything.
-function Stop-Fm([string]$dir, [int]$wait = 120) {
-    if (-not (Get-FromDir $dir 'fm')) { return }
-    $exe = Join-Path $dir 'fm.exe'
-    if (Test-Path -LiteralPath $exe) {
-        (Start-Process -FilePath $exe -ArgumentList '--quit' -WorkingDirectory "$env:SystemRoot\System32" -PassThru).WaitForExit(5000) | Out-Null
+# True while some fm owns the hub mutex, wherever it runs from (a dev build too). The handle is
+# closed at once, or this PowerShell would keep the mutex alive. One we may not open is an fm too.
+function Test-Instance([string]$name) {
+    $m = $null
+    try { if ([Threading.Mutex]::TryOpenExisting($name, 'Synchronize', [ref]$m)) { $m.Dispose(); return $true } }
+    catch [UnauthorizedAccessException] { return $true }
+    $false
+}
+
+# "fm.exe --quit" asks the running fm to close its windows and exit once running copies and open
+# dialogs are done, saving its windows and index; it never starts one. That covers an fm in $dir
+# and the resident that owns $Mutex from anywhere else, which would otherwise take over the new one.
+# The installed fm.exe sends it, or $Quitter (the new one) on a first install. fm is never killed:
+# one still running after $wait seconds stops the script here, so callers run this before they
+# change anything.
+function Stop-Fm([string]$dir, [int]$wait = 120, [string]$Mutex = 'Local\fm.main', [string]$Quitter) {
+    if (-not (Get-FromDir $dir 'fm') -and -not (Test-Instance $Mutex)) { return }
+    $q = @((Join-Path $dir 'fm.exe'), $Quitter) | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 1
+    if ($q) {
+        (Start-Process -FilePath $q -ArgumentList '--quit' -WorkingDirectory "$env:SystemRoot\System32" -PassThru).WaitForExit(5000) | Out-Null
     }
     $sw = [Diagnostics.Stopwatch]::StartNew(); $next = 10
-    while (Get-FromDir $dir 'fm') {
+    while ((Get-FromDir $dir 'fm') -or (Test-Instance $Mutex)) {
         $s = [int]$sw.Elapsed.TotalSeconds
         if ($s -ge $wait) { throw 'Soubory pořád běží: dokončují kopírování nebo přesun, nebo mají otevřený dialog. Dokonči nebo zruš operaci (případně Soubory zavři) a spusť skript znovu. Nic jsem nezměnil.' }
         if ($s -ge $next) { Write-Host "Soubory ještě dokončují kopírování nebo přesun, nebo mají otevřený dialog; čekám ($s s z $wait s)…"; $next += 10 }

@@ -112,7 +112,7 @@ Coverage of "every dialog" in v1:
 - Per-user verbs (`scripts/set-default-fm.ps1`, HKCU only, per-entry backup): Directory and Drive `open`, Folder `explore`, Win+E (`{52205fd8…}`), This PC, Recycle Bin and Network. Every command key carries an empty `DelegateExecute`, or HKLM's leaks through the merged view.
 - `target.rs` reads Explorer's command line from the raw `GetCommandLineW` tail (std's argv rules turn the shell's `"C:\"` into `C:"`). What fm cannot show goes to `explorer.exe` with the event `Local\fm.explorer-allow` signalled for 8 s, so nothing loops.
 - Each window registers in the shell's window list (`shellwin.rs`, IShellWindows), which is where "Show in folder" looks first. Calls arrive from other processes, also inside modal loops, so they only post to the window.
-- `explorer.exe` started directly by an app cannot be redirected per user: the fm-dialogkit watcher closes such a window once fm has opened the same place (only while `HKCU\Software\fm\Redirect` exists).
+- `explorer.exe` started directly by an app cannot be redirected per user: the fm-dialogkit watcher closes such a window once fm has been started for the same place and fm's UI thread answers (only while `HKCU\Software\fm\Redirect` exists).
 - Resident like Explorer (old Q1: yes): instant opens and a warm index for ~450 MB. A hidden top-level window hears the session end and writes the index; "Ukončit Soubory" ends the process.
 - Plan and research: `docs/explorer-replacement-plan.md`.
 

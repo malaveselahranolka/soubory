@@ -104,6 +104,9 @@ impl IDropTarget_Impl for Target_Impl {
         pt: &POINTL,
         effect: *mut DROPEFFECT,
     ) -> Result<()> {
+        // OLE calls these from the message loop, outside wndproc: they count as one level of
+        // nested() so a close during the shell's menu or dialogs waits until they return.
+        let _busy = crate::win::Busy::new();
         let Some(app) = self.app() else { return Ok(()) };
         let data = data.cloned();
         let helper: Option<IDropTargetHelper> =
@@ -133,6 +136,7 @@ impl IDropTarget_Impl for Target_Impl {
     }
 
     fn DragOver(&self, keys: MODIFIERKEYS_FLAGS, pt: &POINTL, effect: *mut DROPEFFECT) -> Result<()> {
+        let _busy = crate::win::Busy::new();
         let Some(app) = self.app() else { return Ok(()) };
         let allowed = unsafe { effect.as_ref().map(|e| e.0).unwrap_or(0) };
         let e = over(app, keys.0, pt, allowed);
@@ -148,6 +152,7 @@ impl IDropTarget_Impl for Target_Impl {
     }
 
     fn DragLeave(&self) -> Result<()> {
+        let _busy = crate::win::Busy::new();
         let (cur, helper) = ST.with(|s| {
             let mut s = s.borrow_mut();
             s.data = None;
@@ -174,6 +179,7 @@ impl IDropTarget_Impl for Target_Impl {
         pt: &POINTL,
         effect: *mut DROPEFFECT,
     ) -> Result<()> {
+        let _busy = crate::win::Busy::new();
         let Some(app) = self.app() else { return Ok(()) };
         let allowed = unsafe { effect.as_ref().map(|e| e.0).unwrap_or(0) };
         // Make sure the target matches the drop point, then take everything out of the state:

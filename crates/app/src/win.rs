@@ -526,6 +526,22 @@ pub fn nested() -> bool {
     DEPTH.with(|d| d.get()) > 1
 }
 
+/// One level of DEPTH for a frame that holds an App: wndproc, the edit subclass, OLE's drop calls.
+pub struct Busy(());
+
+impl Busy {
+    pub fn new() -> Busy {
+        DEPTH.with(|d| d.set(d.get() + 1));
+        Busy(())
+    }
+}
+
+impl Drop for Busy {
+    fn drop(&mut self) {
+        DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
 static RESIDENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Command lines handed over by other launches (door thread), opened by WM_APP_OPEN on the UI
@@ -2017,7 +2033,14 @@ fn apply_rename(app: &mut App, i: usize, text: String) {
     }
 }
 
-unsafe extern "system" fn edit_proc(
+unsafe extern "system" fn edit_proc(h: HWND, m: u32, w: WPARAM, l: LPARAM, id: usize, d: usize) -> LRESULT {
+    // Reached from the message loop, not through wndproc: a dialog started from the field (the
+    // palette's commands) must see itself nested.
+    let _busy = Busy::new();
+    unsafe { edit_proc_inner(h, m, w, l, id, d) }
+}
+
+unsafe fn edit_proc_inner(
     h: HWND,
     m: u32,
     w: WPARAM,
@@ -2196,9 +2219,10 @@ fn frame_thickness(hwnd: HWND) -> (i32, i32) {
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    DEPTH.with(|d| d.set(d.get() + 1));
-    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { wndproc_inner(hwnd, msg, wparam, lparam) }));
-    DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    let r = {
+        let _busy = Busy::new();
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { wndproc_inner(hwnd, msg, wparam, lparam) }))
+    };
     match r {
         Ok(r) => r,
         Err(e) => {

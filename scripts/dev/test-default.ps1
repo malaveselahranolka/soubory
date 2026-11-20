@@ -15,8 +15,11 @@ $dir = Join-Path $Root 'inst\app'; $menu = Join-Path $Root 'menu'; $src = Join-P
 $exe = "$dir\fm.exe"
 # Every script call takes all of its roots from these two; a forgotten one would hit the real key.
 $def = @{ ClassesRoot = $cls; FmRoot = $fmr; BackupRoot = $bak }
-$inst = @{ InstallDir = $dir; RegRoot = $reg; RunRoot = $run; StartMenuDir = $menu }
+# The fake fm owns this mutex instead of fm's Local\fm.main, which no test may ever touch.
+$testMutex = 'Local\fm-test.main'
+$inst = @{ InstallDir = $dir; RegRoot = $reg; RunRoot = $run; StartMenuDir = $menu; Mutex = $testMutex }
 foreach ($r in @($def.Values) + $reg, $run) { if (-not $r.StartsWith("$t\")) { throw "Test root outside $t`: $r" } }
+if ($inst.Mutex -eq 'Local\fm.main') { throw 'The test must not use fm''s own mutex.' }
 $env:FM_FAKE_LOG = Join-Path $Root 'fake.log'
 
 $winE = '{52205fd8-5dfb-447d-801a-d0b52f2e83e1}'
@@ -105,7 +108,8 @@ function Emergency {
         & { $ErrorActionPreference = 'Continue'; & reg.exe delete $key @sw 2>&1 } | Out-Null
     }
 }
-# A fake fm.exe: --background waits for --quit (as fm does), "deaf" ignores it, "hold" just runs.
+# A fake fm.exe. --background owns the test mutex and waits for --quit, as fm does; a second one
+# hands over and exits. "deaf" ignores --quit, "hold" just runs; neither owns the mutex.
 $fake = @'
 using System; using System.IO; using System.Threading;
 public static class FakeFm {
@@ -117,12 +121,19 @@ public static class FakeFm {
         string mode = a.Length > 0 ? a[0] : "";
         using (EventWaitHandle quit = new EventWaitHandle(false, EventResetMode.ManualReset, "Local\\fm-test-fake-quit")) {
             if (mode == "--quit") { quit.Set(); Thread.Sleep(300); quit.Reset(); return; }
-            Log("start " + mode + " " + Environment.CurrentDirectory);
-            if (mode == "--background") { if (quit.WaitOne(60000)) Log("graceful"); } else Thread.Sleep(60000);
+            if (mode != "--background") { Log("start " + mode + " " + Environment.CurrentDirectory); Thread.Sleep(60000); return; }
+            bool first;
+            using (Mutex hub = new Mutex(false, "Local\\fm-test.main", out first)) {
+                if (!first) { Log("handover"); return; }
+                Log("start " + mode + " " + Environment.CurrentDirectory);
+                if (quit.WaitOne(60000)) Log("graceful");
+            }
         }
     }
 }
 '@
+function TestMutex { $m = $null; if ([Threading.Mutex]::TryOpenExisting($testMutex, [ref]$m)) { $m.Dispose(); $true } else { $false } }
+function FromDir([string]$d) { @(Get-Process -Name fm -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path.StartsWith("$d\", [StringComparison]::OrdinalIgnoreCase) }) }
 
 $before = RealState
 try {
@@ -160,6 +171,37 @@ try {
     & "$scripts\install-fm.ps1" @inst -SourceDir $src -NoStart | Out-Null
     Check 'running fm asked to quit and exited by itself' ((FakeLog) -contains 'graceful' -and -not (FakeProcs))
     Check 'clean copy: no cleanup pending' ((Val $runOnce 'Soubory.Cleanup') -eq '<none>')
+
+    '=== a failed copy leaves the installed fm.exe in place'
+    $oldHash = (Get-FileHash $exe).Hash
+    $src2 = Join-Path $Root 'src2'; New-Item -ItemType Directory -Force $src2 | Out-Null
+    [IO.File]::WriteAllBytes("$src2\fm.exe", [byte[]]([IO.File]::ReadAllBytes("$src\fm.exe") + [byte[]](1, 2, 3)))
+    $lock = [IO.File]::Open("$src2\fm.exe", 'Open', 'Read', 'None')
+    try { Check 'install with a source file it cannot read fails' (Refused 'install-fm.ps1' ($inst + @{ SourceDir = $src2; NoStart = $true }) '*src2\fm.exe*') }
+    finally { $lock.Close() }
+    Check 'old fm.exe still there, unchanged and registered' ((Get-FileHash $exe).Hash -eq $oldHash -and (Val $run 'Soubory') -eq "`"$exe`" --background" -and (Def "$reg\App Paths\fm.exe") -eq $exe)
+    Set-Content "$dir\gone.dll.new" 'x'
+    & "$scripts\install-fm.ps1" @inst -SourceDir $src2 -NoStart | Out-Null
+    Check 'the next install replaces it and leaves no *.new behind' ((Get-FileHash $exe).Hash -eq (Get-FileHash "$src2\fm.exe").Hash -and -not (Get-ChildItem $dir -Filter '*.new') -and
+        (Val $runOnce 'Soubory.Cleanup') -eq '<none>')
+    & "$scripts\install-fm.ps1" @inst -SourceDir $src -NoStart | Out-Null
+
+    '=== a resident fm from elsewhere (a dev build) is quit before a first install'
+    $dev = Join-Path $Root 'devbuild'; New-Item -ItemType Directory -Force $dev | Out-Null; Copy-Item "$src\fm.exe" "$dev\fm.exe"
+    $stray = Start-Process "$dev\fm.exe" -ArgumentList '--background' -PassThru
+    for ($i = 0; $i -lt 50 -and -not (TestMutex); $i++) { Start-Sleep -Milliseconds 100 }
+    $dir2 = Join-Path $Root 'inst2\app'
+    $graceful = @(FakeLog | Where-Object { $_ -eq 'graceful' }).Count
+    $a = $inst + @{ SourceDir = $src }; $a.InstallDir = $dir2
+    & "$scripts\install-fm.ps1" @a | Out-Null
+    for ($i = 0; $i -lt 50 -and -not (FromDir $dir2); $i++) { Start-Sleep -Milliseconds 100 }
+    Start-Sleep -Milliseconds 500
+    Check 'the stray resident (owner of the mutex) was asked to quit and did' ($stray.HasExited -and @(FakeLog | Where-Object { $_ -eq 'graceful' }).Count -eq $graceful + 1)
+    Check 'the new resident runs from the install folder and owns the mutex' ((FromDir $dir2).Count -eq 1 -and (TestMutex) -and (FakeLog) -notcontains 'handover')
+    $a = $inst + $def; $a.InstallDir = $dir2
+    & "$scripts\uninstall-fm.ps1" @a | Out-Null
+    Check 'its uninstall quits it again' (-not (Test-Path $dir2) -and -not (FakeProcs) -and -not (TestMutex))
+    & "$scripts\install-fm.ps1" @inst -SourceDir $src -NoStart | Out-Null
 
     '=== set default (clean)'
     $p1 = Dump $t
@@ -414,7 +456,7 @@ try {
         $p5 = Dump $t
         $runs = @{
             'set-default-fm.ps1' = @('-Exe', "$Root\foreign\keep.txt", '-ClassesRoot', $cls, '-FmRoot', $fmr, '-BackupRoot', $bak)
-            'install-fm.ps1'     = @('-InstallDir', $dir, '-RegRoot', $reg, '-RunRoot', $run, '-StartMenuDir', $menu, '-SourceDir', $src, '-NoStart')
+            'install-fm.ps1'     = @('-InstallDir', $dir, '-RegRoot', $reg, '-RunRoot', $run, '-StartMenuDir', $menu, '-SourceDir', $src, '-NoStart', '-Mutex', $testMutex)
         }
         foreach ($s in $runs.Keys) {
             $o = & { $ErrorActionPreference = 'Continue'; & $ps32 -NoProfile -ExecutionPolicy Bypass -File "$scripts\$s" @($runs[$s]) 2>&1 }

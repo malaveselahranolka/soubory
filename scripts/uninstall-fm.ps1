@@ -2,8 +2,9 @@
 .SYNOPSIS
   Removes Soubory (fm.exe) for the current user.
 .DESCRIPTION
-  First asks a running fm to quit; if it is still finishing a copy or move (or has a dialog open)
-  after -QuitWait seconds, the script stops without changing anything. Then gives folders back to
+  First asks a running fm to quit, also a resident one started from elsewhere; if it is still
+  finishing a copy or move (or has a dialog open) after -QuitWait seconds, the script stops
+  without changing anything. Tests pass -Mutex instead of fm's own. Then gives folders back to
   Explorer (scripts\restore-explorer.ps1) if fm was the default, and removes the Run value
   "Soubory", the Start menu shortcut, the App Paths entry (only while it points at this install)
   and the install directory (only a directory marked as fm's). Settings,
@@ -20,7 +21,8 @@ param(
     [string]$StartMenuDir = (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'),
     [string]$DataDir = (Join-Path $env:LOCALAPPDATA 'fm'),
     [switch]$RemoveData,
-    [int]$QuitWait = 120
+    [int]$QuitWait = 120,
+    [string]$Mutex = 'Local\fm.main'
 )
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'lib\install-common.ps1')
@@ -32,7 +34,7 @@ Assert-HkcuRoot $ClassesRoot
 $InstallDir = Get-InstallDir $InstallDir
 Assert-OwnDir $InstallDir 'fm' -Uninstall
 # First, so an fm still copying stops the script before anything changes.
-Stop-Fm $InstallDir $QuitWait
+Stop-Fm $InstallDir $QuitWait $Mutex
 
 & (Join-Path $PSScriptRoot 'restore-explorer.ps1') -ClassesRoot $ClassesRoot -FmRoot $FmRoot -BackupRoot $BackupRoot -Quiet
 
