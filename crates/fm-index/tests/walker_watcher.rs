@@ -2343,7 +2343,11 @@ fn streaming_walk_sends_every_entry_once_and_each_folder_after_its_parent() {
             "batch of {} reached the sink before its parent's",
             b.rel_path
         );
-        assert!(batched.insert(b.rel_path.clone()), "two batches of {}", b.rel_path);
+        assert!(
+            batched.insert(b.rel_path.clone()),
+            "two batches of {}",
+            b.rel_path
+        );
         for (name, _, descend) in &b.children {
             let rel = if b.rel_path.is_empty() {
                 name.clone()
@@ -2357,7 +2361,11 @@ fn streaming_walk_sends_every_entry_once_and_each_folder_after_its_parent() {
             sent_count += 1;
         }
     }
-    assert_eq!(batched.len(), 1 + announced.len(), "every descended folder sends a batch");
+    assert_eq!(
+        batched.len(),
+        1 + announced.len(),
+        "every descended folder sends a batch"
+    );
     assert_eq!(sent_count, entries.len(), "no entry is sent twice");
     let indexed: HashSet<String> = index_rel_triples(&idx, &root)
         .into_iter()

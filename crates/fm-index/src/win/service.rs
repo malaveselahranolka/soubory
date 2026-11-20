@@ -71,7 +71,8 @@ pub enum Event {
         /// Wall-clock scan duration in milliseconds.
         millis: u64,
     },
-    /// Live watcher changes or a background re-walk updated the index.
+    /// Live watcher changes, a background re-walk, or (every ~500 ms) listings of a first walk
+    /// still running updated the index.
     Changed,
     /// Non-fatal background error (e.g. watcher start or re-arm failure); watcher retries with backoff.
     Error {
@@ -508,8 +509,9 @@ impl Service {
     }
 
     /// Sizes of the folders at `paths`: bytes of every file below each, as far as the index has
-    /// seen them (`None` where no managed volume indexes the path). A folder it never walked
-    /// (a junction, access denied) counts 0. `None` if cancelled. The read lock is taken per
+    /// seen them (`None` where no managed volume indexes the path, or its first walk is still
+    /// running). A folder it never walked (a junction, access denied) counts 0. `None` if
+    /// cancelled. The read lock is taken per
     /// folder, so the watcher is never held up for a whole batch.
     #[must_use]
     pub fn folder_sizes(&self, paths: &[String], cancel: &CancelToken) -> Option<Vec<Option<u64>>> {
@@ -552,11 +554,16 @@ impl Service {
 
     /// Atomically saves snapshots for all volumes into `data_dir` using
     /// temp-file write + `FlushFileBuffers` + `MoveFileExW(REPLACE_EXISTING | WRITE_THROUGH)`.
+    /// A volume whose first walk has not finished is skipped (its index is partial).
     pub fn save(&self) {
         if fs::create_dir_all(&self.data_dir).is_err() {
             return;
         }
-        for vol in &self.volumes {
+        for vol in self
+            .volumes
+            .iter()
+            .filter(|v| !v.partial.load(Ordering::Acquire))
+        {
             let _ = save_volume_snapshot(&self.data_dir, vol.volume_serial, &vol.index, &vol.dirty);
         }
     }
@@ -619,7 +626,12 @@ impl Service {
         if fs::create_dir_all(&self.data_dir).is_err() {
             return;
         }
-        for vol in &self.volumes {
+        // A first walk stopped midway leaves a partial index: the next start walks again.
+        for vol in self
+            .volumes
+            .iter()
+            .filter(|v| !v.partial.load(Ordering::Acquire))
+        {
             let path = snapshot_path(&self.data_dir, vol.volume_serial);
             let ext = to_extended_path(&path.to_string_lossy());
             if !vol.dirty.load(Ordering::Acquire) && Path::new(&ext).exists() {
@@ -783,8 +795,7 @@ fn rewalk_worker<S: DirSource>(
                     root: root.to_owned(),
                     entries,
                 });
-                if progressive && last_insert.is_none_or(|t| t.elapsed() >= PROGRESSIVE_INTERVAL)
-                {
+                if progressive && last_insert.is_none_or(|t| t.elapsed() >= PROGRESSIVE_INTERVAL) {
                     last_insert = Some(Instant::now());
                     let listed = std::mem::take(&mut *lock_or_recover(&batches));
                     if insert_walk_batches(root, &index, &apply_mu, &denied_filter, listed) {
@@ -1867,17 +1878,28 @@ mod tests {
         let (dir, root, src) = gated_tree("progressive");
         let w = Walking::start(&src, &root, Index::new());
         let needle = join_child_path(&root, "sub\\needle_alpha.txt");
-        w.changed_until(|idx| finds(idx, "needle_alpha") == [needle.clone()]);
+        // Searchable before Ready; an empty folder shows with its own listing.
+        w.changed_until(|idx| {
+            let at = |rel: &str| idx.lookup(&join_child_path(&root, rel));
+            finds(idx, "needle_alpha") == [needle.clone()]
+                && at("empty").is_some()
+                && at("sub\\inner\\deep.txt").is_some()
+        });
         {
             let idx = w.index.read().unwrap();
             let at = |rel: &str| idx.lookup(&join_child_path(&root, rel));
-            assert!(at("empty").is_some(), "an empty folder shows with its own listing");
-            assert!(at("sub\\inner\\deep.txt").is_some());
             assert_eq!(at("gate\\late.txt"), None, "the walk is still gated");
             assert_eq!(at("gone"), None, "a folder that failed to list never shows");
-            assert_eq!(idx.volume_serial(), 0, "a partial index must not load as a snapshot");
+            assert_eq!(
+                idx.volume_serial(),
+                0,
+                "a partial index must not load as a snapshot"
+            );
         }
-        assert!(w.partial.load(Ordering::Acquire), "folder sizes wait for the merge");
+        assert!(
+            w.partial.load(Ordering::Acquire),
+            "folder sizes wait for the merge"
+        );
         src.release();
         w.wait_ready();
         assert!(!w.partial.load(Ordering::Acquire) && w.dirty.load(Ordering::Acquire));
@@ -1897,7 +1919,10 @@ mod tests {
         assert_eq!(live.len(), plain.len());
         assert_eq!(listing(&live), listing(&plain));
         assert_eq!(live.volume_serial(), plain.volume_serial());
-        assert!(live.lookup(&join_child_path(&root, "gate\\late.txt")).is_some());
+        assert!(
+            live.lookup(&join_child_path(&root, "gate\\late.txt"))
+                .is_some()
+        );
         assert_eq!(live.lookup(&join_child_path(&root, "gone")), None);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1937,15 +1962,14 @@ mod tests {
 
     #[test]
     fn walk_batches_show_denied_folders_filtered_and_never_failed_ones() {
-        let batch = |rel: &str, fid, failed, denied, children: Vec<(String, Meta, bool)>| {
-            WalkBatch {
+        let batch =
+            |rel: &str, fid, failed, denied, children: Vec<(String, Meta, bool)>| WalkBatch {
                 rel_path: rel.to_owned(),
                 meta: meta(DIRECTORY, fid),
                 failed,
                 denied,
                 children,
-            }
-        };
+            };
         let kid = |name: &str, attrs, fid, descend| (name.to_owned(), meta(attrs, fid), descend);
         let batches = vec![
             batch(
@@ -1964,11 +1988,21 @@ mod tests {
         ];
         let index = RwLock::new(Index::new());
         let denied = RwLock::new(DeniedFilter::default());
-        assert!(insert_walk_batches("R:\\", &index, &Mutex::new(()), &denied, batches));
+        assert!(insert_walk_batches(
+            "R:\\",
+            &index,
+            &Mutex::new(()),
+            &denied,
+            batches
+        ));
         let idx = index.into_inner().unwrap();
         assert!(idx.lookup("R:\\Secret").is_some_and(|s| idx.is_dir(s)));
         assert!(idx.lookup("R:\\a.txt").is_some());
-        assert_eq!(idx.lookup("R:\\Gone"), None, "a failed folder that listed nothing");
+        assert_eq!(
+            idx.lookup("R:\\Gone"),
+            None,
+            "a failed folder that listed nothing"
+        );
         assert_eq!(idx.len(), 3);
         let under = rec(NotifyAction::Added, "Secret\\leak.txt", 9, 2, ARC);
         let df = denied.into_inner().unwrap();
