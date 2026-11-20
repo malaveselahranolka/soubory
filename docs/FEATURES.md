@@ -15,7 +15,7 @@ Nothing here has been tried by hand in daily use yet; see "Not verified" at the 
 | Several windows (Ctrl+N), one process; a second launch opens a window in it | hub window, `WM_COPYDATA` | ✅ |
 | Views: details, icons (S–XL with slider), columns, gallery | Ctrl+1–4 | 🔶 |
 | Group by: name, kind, date modified/created, size, tags; Finder-style headers that stay on top while scrolling; a header click selects its group | `groups.rs`, View menus, palette | ✅ (geometry round-trip tests, harness hit-test over the real window, captures) |
-| Tiles view | | ⬜ |
+| Tiles view (Ctrl+5) | icon + name, kind, size in a grid; groups too | ✅ (harness hit-test, captures, UIA test) |
 | Sort by any column, folders first | header click, More menu | 🔶 |
 | Full shell context menu (Open with, Send to, Compress to ZIP, Extract all, 7-Zip, Git…) | `IContextMenu` of the folder | 🔶 |
 | New folder / New ▸ any type | shell New menu (same as the dialog helper) | 🔶 |
@@ -65,6 +65,6 @@ Nothing here has been tried by hand in daily use yet; see "Not verified" at the 
 
 ## Not verified
 - By hand: real drags from Explorer, the desktop and a browser; the Mica look on the user's machine; idle CPU over hours.
-- Screen readers: the custom-drawn views expose no UI Automation tree yet.
+- Screen readers: the UI Automation tree (toolbar buttons, sidebar places, items with Select / Open / Scroll into view, status bar; focus, selection and structure events) passes `scripts/dev/uia-test.ps1` in list, icons, tiles and columns, but nobody has used Narrator or NVDA with it. Not exposed yet: group headers, tabs, the path bar, the column view's other columns, the preview pane.
 - "Show in folder" from other apps and virtual folders opened from the desktop (Control Panel, Recycle Bin icon) still open Explorer; Windows offers no per-user hook for those.
 - Option 2 needs the user's gate run (`docs/ARCHITECTURE.md`, M9) before any picker is built.

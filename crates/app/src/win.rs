@@ -26,6 +26,8 @@ pub const WM_APP_THUMB: u32 = WM_APP + 11;
 pub const WM_APP_SEARCH: u32 = WM_APP + 12;
 /// Folder sizes from the index (search.rs).
 pub const WM_APP_SIZES: u32 = WM_APP + 18;
+/// An action a UI Automation client asked for (uia.rs).
+pub const WM_APP_UIA: u32 = WM_APP + 19;
 pub const WM_APP_INDEX: u32 = WM_APP + 13;
 pub const WM_APP_OPDONE: u32 = WM_APP + 14;
 pub const WM_APP_SHELLLIST: u32 = WM_APP + 15;
@@ -1830,6 +1832,12 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
             return r;
         }
         match msg {
+            // Screen readers: the window's own UI Automation tree (lParam is 32-bit).
+            WM_GETOBJECT if lparam.0 as i32 == crate::uia::ROOT_OBJECT_ID => crate::uia::get_object(hwnd, wparam, lparam),
+            WM_APP_UIA => {
+                crate::uia::act(app, lparam);
+                LRESULT(0)
+            }
             WM_NCCALCSIZE if wparam.0 != 0 => {
                 // Keep the side and bottom resize frames, drop the caption: the client area
                 // starts at the window top, where the toolbar draws its own caption buttons.
@@ -1906,6 +1914,7 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                 BeginPaint(hwnd, &mut ps);
                 paint_now(app);
                 let _ = EndPaint(hwnd, &ps);
+                crate::uia::after_paint(app);
                 LRESULT(0)
             }
             WM_ERASEBKGND => LRESULT(1),
@@ -2177,6 +2186,7 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                 LRESULT(0)
             }
             WM_DESTROY => {
+                crate::uia::forget(hwnd);
                 crate::droptarget::revoke(hwnd);
                 stop_watch(hwnd);
                 for k in [EditKind::Search, EditKind::Rename, EditKind::Path, EditKind::BatchA, EditKind::BatchB] {

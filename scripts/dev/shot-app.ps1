@@ -1,6 +1,6 @@
 ﻿# Captures ONLY the fm window itself (PrintWindow, full content) into a PNG. Never the screen.
 # Never synthesizes input (it could land in another window); drive fm with its --dev-* flags.
-param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Out, [int]$Wait = 1500, [string[]]$Dev = @(), [string]$Class = '', [switch]$Keep)
+param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Out, [int]$Wait = 1500, [string[]]$Dev = @(), [string]$Class = '', [switch]$Keep, [string]$Exe = 'C:\Users\adame\.fm-target\debug\fm.exe')
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing
 Add-Type @'
@@ -37,7 +37,7 @@ public static class Shot {
   }
 }
 '@ -ReferencedAssemblies System.Drawing
-$exe = 'C:\Users\adame\.fm-target\debug\fm.exe'
+$exe = $Exe
 $p = Start-Process $exe -ArgumentList (@("`"$Path`"", "--new-instance") + $Dev) -PassThru
 try {
   for ($i = 0; $i -lt 50 -and $p.MainWindowHandle -eq 0; $i++) { Start-Sleep -Milliseconds 100; $p.Refresh() }

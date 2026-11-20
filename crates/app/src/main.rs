@@ -24,6 +24,7 @@ mod shell;
 mod shellns;
 mod sidebar;
 mod tags;
+mod uia;
 mod undo;
 mod theme;
 mod thumbs;

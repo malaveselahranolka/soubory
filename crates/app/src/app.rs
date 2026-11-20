@@ -880,7 +880,16 @@ impl App {
 
     /// Scrolls so the focused item is visible.
     pub fn reveal_focus(&mut self) {
-        let Some(f) = self.tab().sel.focus else { return };
+        if let Some(f) = self.tab().sel.focus {
+            self.reveal(f);
+        }
+    }
+
+    /// Scrolls so item `f` is visible.
+    pub fn reveal(&mut self, f: usize) {
+        if f >= self.tab().entries.len() {
+            return;
+        }
         let r = self.item_rect(f);
         if self.tab().view == View::Gallery {
             let s = crate::views::gallery_parts(self).1;
@@ -1223,6 +1232,11 @@ impl App {
             self.invalidate();
             return;
         }
+        self.activate(h);
+    }
+
+    /// What a click on `h` does (also UI Automation's Invoke).
+    pub fn activate(&mut self, h: Hit) {
         match h {
             Hit::Caption(c) => crate::win::caption(self, c),
             Hit::SidebarBtn => {
