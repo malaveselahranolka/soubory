@@ -399,6 +399,9 @@ impl App {
 
     /// (Re)loads the current tab's location, keeping selection by name.
     pub fn reload(&mut self, select: Option<&str>) {
+        // Every caller set the place first: the title and the shell's window list follow it,
+        // also for searches and shell places, which return early below.
+        crate::win::set_title(self);
         crate::win::sync_search_field(self);
         // A shell listing sets it again; any other place never waits.
         self.tab_mut().loading = false;
@@ -501,7 +504,6 @@ impl App {
             self.reveal_focus();
         }
         crate::win::watch_current(self);
-        crate::win::set_title(self);
         crate::search::request_sizes(self);
     }
 
@@ -592,14 +594,11 @@ impl App {
         let t = self.tab();
         let Some(e) = t.entries.get(i) else { return };
         let path = t.path_of(i);
-        if e.is_dir {
-            if new_tab {
-                self.new_tab(Loc::Folder(path));
-            } else {
-                self.go(Loc::Folder(path));
-            }
-        } else {
-            crate::shell::open_path(self.hwnd, &path);
+        let dir = if e.is_dir { Some(path.clone()) } else { crate::shell::link_folder(&path) };
+        match dir {
+            Some(d) if new_tab => self.new_tab(Loc::Folder(d)),
+            Some(d) => self.go(Loc::Folder(d)),
+            None => crate::shell::open_path(self.hwnd, &path),
         }
     }
 
@@ -614,10 +613,10 @@ impl App {
                     continue;
                 }
                 let t = self.tab();
-                if t.entries[i].is_dir {
-                    self.new_tab(Loc::Folder(t.path_of(i)));
-                } else {
-                    crate::shell::open_path(self.hwnd, &t.path_of(i));
+                let path = t.path_of(i);
+                match if t.entries[i].is_dir { Some(path.clone()) } else { crate::shell::link_folder(&path) } {
+                    Some(d) => self.new_tab(Loc::Folder(d)),
+                    None => crate::shell::open_path(self.hwnd, &path),
                 }
             }
         }

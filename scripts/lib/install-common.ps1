@@ -2,17 +2,117 @@
 # that carries our marker file.
 $Marker = '.fm-install'
 $RunName = 'FinderWin.DialogKit'
+# Per component: fm and the shim set their own after dot-sourcing this file.
 $CleanupName = 'FinderWin.DialogKit.Cleanup'
+
+# A 32-bit PowerShell sees another view of HKCU\Software\Classes\CLSID and cannot read the Path of a
+# 64-bit fm, so it would write keys Explorer never reads and miss a running fm.
+if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) { throw 'Spusť 64bitový PowerShell.' }
 
 function Assert-HkcuRoot([string]$root) {
     if ($root -notmatch '^HKCU:\\') { throw "RegRoot musí být pod HKCU:\ (zadáno: $root)" }
 }
 
-function Stop-FromDir([string]$dir, [string]$name) {
-    $procs = Get-Process -Name $name -ErrorAction SilentlyContinue | Where-Object {
+# An elevated run would start an elevated fm (a second resident one, files opened as admin).
+# Only TokenElevationTypeFull (2) is refused, the elevated half of a split token, as fm.exe does:
+# with UAC off or as the built-in Administrator (Default, 1) there is no normal token to run with.
+function Assert-NotElevated {
+    if (-not ('FmScripts.Token' -as [type])) {
+        Add-Type -Namespace FmScripts -Name Token -MemberDefinition '[DllImport("advapi32.dll")] public static extern bool GetTokenInformation(IntPtr token, int cls, out int value, int size, out int returned);'
+    }
+    $type = 0; $len = 0
+    if (-not [FmScripts.Token]::GetTokenInformation([Security.Principal.WindowsIdentity]::GetCurrent().Token, 18, [ref]$type, 4, [ref]$len)) { throw 'Nelze zjistit, zda PowerShell běží jako správce.' }
+    if ($type -eq 2) { throw 'Spusť v obyčejném PowerShellu (bez práv správce): Soubory nesmí běžet jako správce.' }
+}
+
+# A relative path is taken from this PowerShell's location, not the folder the process started in.
+# Brackets are wildcards for -Path; refusing them keeps every later use of the folder literal.
+function Get-InstallDir([string]$dir) {
+    $provider = $null; $drive = $null
+    $full = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($dir, [ref]$provider, [ref]$drive)
+    if ($provider.Name -ne 'FileSystem') { throw "Cesta $dir není složka na disku." }
+    if ($full.IndexOfAny('[]'.ToCharArray()) -ge 0) { throw "Cesta $full nesmí obsahovat [ ]." }
+    $full
+}
+
+function Test-Marker([string]$dir, [string]$product) {
+    $m = Join-Path $dir $Marker
+    (Test-Path -LiteralPath $m) -and (Get-Content -LiteralPath $m -TotalCount 1) -eq $product
+}
+
+# The marker names the product. Install takes a missing, empty or own folder; uninstall only its own.
+function Assert-OwnDir([string]$dir, [string]$product, [switch]$Uninstall) {
+    if (-not (Test-Path -LiteralPath $dir)) { return }
+    $m = Join-Path $dir $Marker
+    if (Test-Path -LiteralPath $m) {
+        $owner = Get-Content -LiteralPath $m -TotalCount 1
+        if ($owner -ne $product) { throw "Složka $dir patří jiné části ($owner), ne $product; nic neměním." }
+    } elseif ($Uninstall -or (Get-ChildItem -LiteralPath $dir -Force | Select-Object -First 1)) {
+        throw "Složka $dir není naše (chybí značka $Marker); nic neměním."
+    }
+}
+
+# New-Item -Force on an existing key empties it (values and subkeys), so create only a missing one.
+function New-KeyIfMissing([string]$key) {
+    if (-not (Test-Path $key)) { New-Item -Force $key | Out-Null }
+}
+
+# Remove-ItemProperty cannot delete a key's default value; the registry API can (a missing one is fine).
+function Remove-RegValue([string]$key, [string]$name) {
+    $k = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey(($key -replace '^HKCU:\\', ''), $true)
+    if ($k) { try { $k.DeleteValue($name, $false) } finally { $k.Close() } }
+}
+
+# Copies a value keeping its kind and unexpanded text (GetValue expands REG_EXPAND_SZ by default).
+function Copy-RegValue([string]$fromKey, [string]$fromName, [string]$toKey, [string]$toName) {
+    $hk = [Microsoft.Win32.Registry]::CurrentUser
+    $s = $hk.OpenSubKey(($fromKey -replace '^HKCU:\\', ''))
+    $d = $hk.OpenSubKey(($toKey -replace '^HKCU:\\', ''), $true)
+    try { $d.SetValue($toName, $s.GetValue($fromName, $null, 'DoNotExpandEnvironmentNames'), $s.GetValueKind($fromName)) }
+    finally { $s.Close(); $d.Close() }
+}
+
+# Called only for a verb key with a verb: record. It stays ours only while its command is still
+# fm's: the one recorded, or any quoted ...\fm.exe. Without a working command it is ours only when
+# it holds nothing else: our interrupted run leaves an empty verb key, or an empty command key under
+# it (fm writes no value on the verb key itself). Anything more is another app's.
+function Test-FmVerb([string]$verbKey, [string]$recorded) {
+    $v = Get-Item $verbKey
+    $c = Get-Item "$verbKey\command" -ErrorAction SilentlyContinue
+    if (-not $c -or $c.ValueCount -eq 0) {
+        return $v.ValueCount -eq 0 -and $v.SubKeyCount -eq [int][bool]$c -and (-not $c -or $c.SubKeyCount -eq 0)
+    }
+    $cmd = $c.GetValue('', '', 'DoNotExpandEnvironmentNames')
+    ($recorded -and $cmd -eq $recorded) -or $cmd -like '*\fm.exe"*'
+}
+
+function Get-FromDir([string]$dir, [string]$name) {
+    Get-Process -Name $name -ErrorAction SilentlyContinue | Where-Object {
         $_.Path -and $_.Path.StartsWith($dir.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)
     }
-    foreach ($p in $procs) { Stop-Process -Id $p.Id -Force; $p.WaitForExit(3000) | Out-Null }
+}
+
+# Ends a process at once; nothing it holds in memory is saved.
+function Stop-FromDir([string]$dir, [string]$name) {
+    foreach ($p in @(Get-FromDir $dir $name)) { Stop-Process -Id $p.Id -Force; $p.WaitForExit(3000) | Out-Null }
+}
+
+# "fm.exe --quit" asks a running fm to close its windows and exit once running copies and open
+# dialogs are done, saving its windows and index. fm is never killed: one still running after $wait
+# seconds stops the script here, so callers run this before they change anything.
+function Stop-Fm([string]$dir, [int]$wait = 120) {
+    if (-not (Get-FromDir $dir 'fm')) { return }
+    $exe = Join-Path $dir 'fm.exe'
+    if (Test-Path -LiteralPath $exe) {
+        (Start-Process -FilePath $exe -ArgumentList '--quit' -WorkingDirectory "$env:SystemRoot\System32" -PassThru).WaitForExit(5000) | Out-Null
+    }
+    $sw = [Diagnostics.Stopwatch]::StartNew(); $next = 10
+    while (Get-FromDir $dir 'fm') {
+        $s = [int]$sw.Elapsed.TotalSeconds
+        if ($s -ge $wait) { throw 'Soubory pořád běží: dokončují kopírování nebo přesun, nebo mají otevřený dialog. Dokonči nebo zruš operaci (případně Soubory zavři) a spusť skript znovu. Nic jsem nezměnil.' }
+        if ($s -ge $next) { Write-Host "Soubory ještě dokončují kopírování nebo přesun, nebo mají otevřený dialog; čekám ($s s z $wait s)…"; $next += 10 }
+        Start-Sleep -Milliseconds 200
+    }
 }
 
 # Deletes a file, or renames it to *.N.del when it is mapped in another process. True when deleted.
@@ -33,9 +133,10 @@ function Grant-AppContainerRead([string]$dir) {
 }
 
 # Deletes the whole directory when it is gone, otherwise reports false (locked files set aside).
+# The marker goes last, with the folder, so leftovers still read as ours.
 function Remove-InstallDir([string]$dir) {
     $clean = $true
-    Get-ChildItem -LiteralPath $dir -Recurse -File -Force | ForEach-Object {
+    Get-ChildItem -LiteralPath $dir -Recurse -File -Force | Where-Object Name -ne $Marker | ForEach-Object {
         if ($_.Name -like '*.del') { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
         elseif (-not (Remove-OrSetAside $_.FullName)) { $clean = $false }
     }
@@ -44,11 +145,12 @@ function Remove-InstallDir([string]$dir) {
     return $clean
 }
 
-# One RunOnce value. Install passes no -WholeDir (delete *.del only); uninstall removes the directory.
-# Re-installing replaces the uninstall variant, so a pending cleanup never deletes a fresh install.
+# One RunOnce value per component ($CleanupName). Install passes no -WholeDir (delete *.del only);
+# uninstall removes the directory. Re-installing replaces the uninstall variant, so a pending
+# cleanup never deletes a fresh install.
 function Register-DelCleanup([string]$root, [string]$dir, [switch]$WholeDir) {
     $runOnce = Join-Path $root 'RunOnce'
-    New-Item -Force -ErrorAction SilentlyContinue $runOnce | Out-Null
+    New-KeyIfMissing $runOnce
     $cmd = if ($WholeDir) { "cmd.exe /d /c rd /s /q `"$dir`"" } else { "cmd.exe /d /c del /f /s /q `"$dir\*.del`"" }
     Set-ItemProperty -Path $runOnce -Name $CleanupName -Value $cmd
 }

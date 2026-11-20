@@ -3,7 +3,7 @@
 //! Re-entrancy rule: no `STATE` borrow is ever held across a call that can pump messages
 //! (TrackPopupMenu, the hook round-trip, shell invokes). WinEvent callbacks arriving meanwhile only
 //! mark the state dirty and are re-evaluated afterwards.
-use crate::{detect, detect::Kind, inject::Injector, newmenu, newmenu::NewMenu, pill, tray, util::*};
+use crate::{detect, detect::Kind, explorer, inject::Injector, newmenu, newmenu::NewMenu, pill, tray, util::*};
 use fm_dialog_hook::{CMD_QUERY, CMD_SELECT, FolderReply, parse_query_reply};
 use std::{cell::RefCell, collections::HashSet, path::Path, time::Duration};
 use windows::{
@@ -103,9 +103,11 @@ pub fn run() -> i32 {
         }
         tray::add(main, false);
         let flags = WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS;
-        // Only the foreground hook is global; the rest are scoped to the tracked dialog in attach().
-        let hooks = [SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, None, Some(on_event), 0, 0, flags)];
+        // The foreground hook and the Explorer watcher's show hook are global; the rest are scoped
+        // to the tracked dialog in attach().
+        let hooks = [SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, None, Some(on_event), 0, 0, flags), explorer::hook()];
         log("started");
+        explorer::spare_open_windows();
         on_foreground(GetForegroundWindow());
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -124,6 +126,9 @@ pub fn run() -> i32 {
 unsafe extern "system" fn on_event(_: HWINEVENTHOOK, event: u32, hwnd: HWND, id_object: i32, id_child: i32, _: u32, _: u32) {
     if id_object != OBJID_WINDOW.0 || id_child != CHILDID_SELF as i32 {
         return;
+    }
+    if event == EVENT_SYSTEM_FOREGROUND {
+        explorer::foreground(hwnd); // before the busy return, which drops events
     }
     let busy = with(|s| {
         if s.busy {

@@ -81,6 +81,25 @@ impl ShellId {
     }
 }
 
+/// The file-system path an ID list stands for, if any.
+pub fn fs_path(id: &ShellId) -> Option<PathBuf> {
+    let mut buf = vec![0u16; 32768];
+    unsafe { SHGetPathFromIDListEx(id.as_ptr(), &mut buf, GPFIDL_DEFAULT).as_bool() }.then(|| {
+        let n = buf.iter().position(|&c| c == 0).unwrap_or(0);
+        PathBuf::from(String::from_utf16_lossy(&buf[..n]))
+    })
+}
+
+/// The desktop-absolute parsing name (`::{CLSID}`, `\server`), which Explorer accepts.
+pub fn parsing_name(id: &ShellId) -> Option<String> {
+    unsafe {
+        let p = SHGetNameFromIDList(id.as_ptr(), SIGDN_DESKTOPABSOLUTEPARSING).ok()?;
+        let s = p.to_string().ok();
+        CoTaskMemFree(Some(p.0 as *const c_void));
+        s
+    }
+}
+
 pub fn recycle_bin() -> Option<Loc> {
     let id = ShellId::known(&FOLDERID_RecycleBinFolder)?;
     Some(Loc::Shell { name: id.name(), id })

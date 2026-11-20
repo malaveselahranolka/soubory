@@ -17,8 +17,9 @@ $CleanupName = 'FinderWin.Shim.Cleanup'
 
 Assert-HkcuRoot $ClassesRoot
 Assert-HkcuRoot $RegRoot
-if (-not [Environment]::Is64BitProcess) { throw 'Spusť 64bitový PowerShell.' }
-$InstallDir = [IO.Path]::GetFullPath($InstallDir)
+$InstallDir = Get-InstallDir $InstallDir
+# Checked first, so a refused uninstall changes nothing.
+Assert-OwnDir $InstallDir 'fm-dialog-shim' -Uninstall
 $key = Join-Path $ClassesRoot 'CLSID\{DC1C5A9C-E88A-4dde-A5A1-60F82A20AEF7}'
 
 if (Test-Path $key) {
@@ -34,10 +35,7 @@ if (Test-Path $key) {
     }
 }
 
-if (-not (Test-Path $InstallDir)) { Write-Host 'Nic k odinstalaci.'; return }
-if (-not (Test-Path (Join-Path $InstallDir $Marker))) {
-    throw "$InstallDir neobsahuje značku instalace ($Marker) — pro jistotu nic nemažu."
-}
+if (-not (Test-Path -LiteralPath $InstallDir)) { Write-Host 'Nic k odinstalaci.'; return }
 if (Remove-InstallDir $InstallDir) {
     Clear-DelCleanup $RegRoot
     Write-Host 'Odinstalováno.'

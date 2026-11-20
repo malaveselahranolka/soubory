@@ -13,17 +13,16 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'lib\install-common.ps1')
 
 Assert-HkcuRoot $RegRoot
-$InstallDir = [IO.Path]::GetFullPath($InstallDir)
+$InstallDir = Get-InstallDir $InstallDir
+# Checked first, so a refused uninstall changes nothing.
+Assert-OwnDir $InstallDir 'fm-dialogkit' -Uninstall
 $run = Join-Path $RegRoot 'Run'
 if (Get-ItemProperty -Path $run -Name $RunName -ErrorAction SilentlyContinue) {
     Remove-ItemProperty -Path $run -Name $RunName
 }
 Stop-FromDir $InstallDir 'fm-dialogkit'
 
-if (-not (Test-Path $InstallDir)) { Write-Host 'Nic k odinstalaci.'; return }
-if (-not (Test-Path (Join-Path $InstallDir $Marker))) {
-    throw "$InstallDir neobsahuje značku instalace ($Marker) — pro jistotu nic nemažu."
-}
+if (-not (Test-Path -LiteralPath $InstallDir)) { Write-Host 'Nic k odinstalaci.'; return }
 if (Remove-InstallDir $InstallDir) {
     Clear-DelCleanup $RegRoot
     Write-Host 'Odinstalováno.'

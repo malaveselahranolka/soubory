@@ -15,13 +15,15 @@ param(
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'lib\install-common.ps1')
 
+Assert-NotElevated
 Assert-HkcuRoot $RegRoot
-if (-not (Test-Path (Join-Path $SourceDir 'fm-dialogkit.exe'))) { throw "Chybí $SourceDir\fm-dialogkit.exe — nejdřív spusť scripts\build-release.ps1." }
-$InstallDir = [IO.Path]::GetFullPath($InstallDir)
+if (-not (Test-Path -LiteralPath (Join-Path $SourceDir 'fm-dialogkit.exe'))) { throw "Chybí $SourceDir\fm-dialogkit.exe — nejdřív spusť scripts\build-release.ps1." }
+$InstallDir = Get-InstallDir $InstallDir
+Assert-OwnDir $InstallDir 'fm-dialogkit'
 
 Stop-FromDir $InstallDir 'fm-dialogkit'
 New-Item -ItemType Directory -Force $InstallDir | Out-Null
-Set-Content -Path (Join-Path $InstallDir $Marker) -Value 'fm-dialogkit' -Encoding ascii
+Set-Content -LiteralPath (Join-Path $InstallDir $Marker) -Value 'fm-dialogkit' -Encoding ascii
 
 $locked = $false
 Get-ChildItem $SourceDir -Recurse -File | ForEach-Object {
@@ -35,7 +37,7 @@ Grant-AppContainerRead $InstallDir
 
 $exe = Join-Path $InstallDir 'fm-dialogkit.exe'
 $run = Join-Path $RegRoot 'Run'
-New-Item -Force -ErrorAction SilentlyContinue $run | Out-Null
+New-KeyIfMissing $run
 Set-ItemProperty -Path $run -Name $RunName -Value "`"$exe`""
 
 # Old DLLs still mapped in some dialog: delete them at the next sign-in. This also replaces a
@@ -44,6 +46,7 @@ Get-ChildItem $InstallDir -Recurse -File -Filter '*.del' | ForEach-Object { Remo
 $stale = @(Get-ChildItem $InstallDir -Recurse -File | Where-Object { $_.Name -like '*.del' })
 if ($locked -or $stale.Count) { Register-DelCleanup $RegRoot $InstallDir } else { Clear-DelCleanup $RegRoot }
 
-if (-not $NoStart) { Start-Process $exe }
-Write-Host "Nainstalováno do $InstallDir. Tlačítko „Nový“ se objeví v každém dialogu Otevřít/Uložit."
+# A neutral working folder, as at sign-in; an fm it starts later inherits it.
+if (-not $NoStart) { Start-Process -FilePath $exe -WorkingDirectory "$env:SystemRoot\System32" }
+Write-Host "Nainstalováno do $InstallDir. Tlačítko `„Nový`“ se objeví v každém dialogu Otevřít/Uložit."
 Write-Host "Odinstalace: scripts\uninstall-dialogkit.ps1"

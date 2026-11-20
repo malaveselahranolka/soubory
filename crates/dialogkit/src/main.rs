@@ -1,4 +1,5 @@
-//! fm-dialogkit: adds "+ Nový ⌄" (Explorer's own New menu) to every Windows Open/Save dialog.
+//! fm-dialogkit: adds "+ Nový ⌄" (Explorer's own New menu) to every Windows Open/Save dialog,
+//! and while the Explorer redirect is on, hands File Explorer windows to fm (explorer.rs).
 //!
 //! Modes: no arguments = background helper with a tray icon; `--inject` = one hook round-trip
 //! (used by the 64-bit helper to reach 32-bit dialogs); `--act` / `--dump` = diagnostics.
@@ -6,6 +7,7 @@
 
 mod app;
 mod detect;
+mod explorer;
 mod inject;
 mod newmenu;
 mod pill;

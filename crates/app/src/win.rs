@@ -34,6 +34,10 @@ pub const WM_APP_SHELLLIST: u32 = WM_APP + 15;
 pub const WM_APP_DRIVES: u32 = WM_APP + 16;
 /// The last running file operation finished (see [`OpGuard`]).
 const WM_APP_OPS_IDLE: u32 = WM_APP + 17;
+/// Open the command lines other launches handed over (PENDING).
+const WM_APP_OPEN: u32 = WM_APP + 20;
+/// `fm --quit` from another process (hub).
+const WM_APP_QUIT: u32 = WM_APP + 22;
 
 /// Work still running off the windows: fm's own copy/move/delete threads ([`OpGuard`]) and the
 /// shell's (a drop from Explorer, Properties, Extract All) through the process reference below.
@@ -126,8 +130,12 @@ fn register_proc_ref() {
 
 /// Hub timer that coalesces a burst of drive notifications (one USB stick sends several).
 const TIMER_DRIVES: usize = 0xD1;
+/// Ends the window in which fm's own Explorer launch is let through (hub).
+const TIMER_EXPLORER: usize = 0xE1;
 const TIMER_FS: usize = 1;
 const TIMER_NOTE: usize = 2;
+/// A close that came during a menu, drag or shell dialog, tried again (nested()).
+const TIMER_CLOSE: usize = 3;
 const EDIT_SEARCH: usize = 100;
 const EDIT_RENAME: usize = 101;
 const EDIT_PATH: usize = 102;
@@ -177,7 +185,11 @@ thread_local! {
 
 const MAIN_CLASS: PCWSTR = w!("FmMainWindow");
 const HUB_CLASS: PCWSTR = w!("FmHub");
+/// The resident fm's door for other launches (open_door); solo test runs have none.
+const DOOR_CLASS: PCWSTR = w!("FmDoor");
 const COPY_OPEN: usize = 0x666D_0001;
+/// `fm --quit`: close every window and end the process (installers, instead of a hard kill).
+const COPY_QUIT: usize = 0x666D_0003;
 
 /// The App behind one of our main windows; null for any other window.
 pub fn app_of(hwnd: HWND) -> *mut App {
@@ -217,46 +229,189 @@ pub fn hub() -> HWND {
     HUB.with(|h| HWND(h.get() as *mut c_void))
 }
 
-/// Single instance (`Local\fm.main`): a second launch hands its folder to the running process,
-/// which opens a window for it. Returns true when handed over (this process should exit).
-pub fn hand_over(path: Option<&Path>) -> bool {
-    use std::os::windows::ffi::OsStrExt;
+/// The user's environment as it is now (Explorer does the same): programs fm starts get today's
+/// PATH, not the one from sign-in or from the terminal that started fm.
+pub fn refresh_env() {
+    use windows::Win32::Security::{TOKEN_DUPLICATE, TOKEN_QUERY};
+    use windows::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock, SetEnvironmentStringsW};
     unsafe {
-        // The handle stays open for the life of the process; that is what marks the instance.
-        let _ = CreateMutexW(None, false, w!("Local\\fm.main"));
-        if GetLastError() != ERROR_ALREADY_EXISTS {
-            return false;
+        let mut token = HANDLE::default();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_DUPLICATE, &mut token).is_err() {
+            return;
         }
-        for _ in 0..30 {
-            if let Ok(hub) = FindWindowExW(Some(HWND_MESSAGE), None, HUB_CLASS, None) {
-                let mut pid = 0u32;
-                GetWindowThreadProcessId(hub, Some(&mut pid));
-                let _ = AllowSetForegroundWindow(pid);
-                let s: Vec<u16> = path.map(|p| p.as_os_str().encode_wide().collect()).unwrap_or_default();
-                let cds = COPYDATASTRUCT {
-                    dwData: COPY_OPEN,
-                    cbData: (s.len() * 2) as u32,
-                    lpData: s.as_ptr() as *mut c_void,
-                };
-                let mut res = 0usize;
-                let ok = SendMessageTimeoutW(
-                    hub,
-                    WM_COPYDATA,
-                    WPARAM(0),
-                    LPARAM(&cds as *const COPYDATASTRUCT as isize),
-                    SMTO_ABORTIFHUNG,
-                    5000,
-                    Some(&mut res),
-                );
-                return ok.0 != 0 && res != 0;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
+        let mut block = std::ptr::null_mut();
+        if CreateEnvironmentBlock(&mut block, Some(token), false).is_ok() {
+            let _ = SetEnvironmentStringsW(PCWSTR(block as *const u16));
+            let _ = DestroyEnvironmentBlock(block);
         }
-        false
+        let _ = CloseHandle(token);
     }
 }
 
-pub fn run(start: Loc) -> i32 {
+/// `fm --quit`: asks a running fm to close its windows and exit (it finishes running copies and
+/// saves prefs and the index first). Never starts one; returns at once.
+pub fn ask_quit() {
+    unsafe {
+        let Ok(m) = OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, w!("Local\\fm.main")) else { return };
+        let _ = CloseHandle(m);
+        let Ok(door) = FindWindowExW(Some(HWND_MESSAGE), None, DOOR_CLASS, None) else { return };
+        let cds = COPYDATASTRUCT { dwData: COPY_QUIT, cbData: 0, lpData: std::ptr::null_mut() };
+        let mut res = 0usize;
+        let _ = SendMessageTimeoutW(door, WM_COPYDATA, WPARAM(0), LPARAM(&cds as *const COPYDATASTRUCT as isize), SMTO_ABORTIFHUNG, 5000, Some(&mut res));
+    }
+}
+
+/// How a launch joins the single instance (`Local\fm.main`).
+pub enum Join {
+    /// No fm runs: this process becomes the resident one.
+    Owner,
+    /// The running fm got the command line (or, for `--background`, simply runs).
+    HandedOver,
+    /// One runs but cannot be reached (elevated, quitting, hung): this process runs on its own,
+    /// for its window only.
+    Unjoinable,
+}
+
+/// A second launch hands its command line and folder to the resident fm, which opens what it
+/// names. An elevated launch never becomes the resident one (a normal launch could not reach
+/// it): it hands over to a normal fm or runs alone.
+pub fn hand_over(cwd: &Path, raw: &str, background: bool, elevated: bool) -> Join {
+    join(cwd, raw, background, elevated, false)
+}
+
+fn join(cwd: &Path, raw: &str, background: bool, elevated: bool, retried: bool) -> Join {
+    use std::os::windows::ffi::OsStrExt;
+    unsafe {
+        let name = w!("Local\\fm.main");
+        if elevated {
+            match OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, name) {
+                Ok(m) => {
+                    let _ = CloseHandle(m);
+                }
+                Err(_) => return Join::Unjoinable,
+            }
+        } else {
+            match CreateMutexW(None, false, name) {
+                Err(_) => return Join::Unjoinable,
+                // The owner's handle stays open for the life of the process: it marks the instance.
+                Ok(_) if GetLastError() != ERROR_ALREADY_EXISTS => return Join::Owner,
+                // Others let go, so a new resident can start once this one has ended.
+                Ok(m) => {
+                    let _ = CloseHandle(m);
+                }
+            }
+        }
+        if background {
+            return Join::HandedOver;
+        }
+        // The resident fm answers on its own thread, so a busy window never makes this wait.
+        for _ in 0..30 {
+            if let Ok(door) = FindWindowExW(Some(HWND_MESSAGE), None, DOOR_CLASS, None) {
+                let mut pid = 0u32;
+                GetWindowThreadProcessId(door, Some(&mut pid));
+                let _ = AllowSetForegroundWindow(pid);
+                // "<cwd>\0<raw>": relative paths resolve against the sender's folder.
+                let s: Vec<u16> = cwd.as_os_str().encode_wide().chain([0]).chain(raw.encode_utf16()).collect();
+                let cds = COPYDATASTRUCT { dwData: COPY_OPEN, cbData: (s.len() * 2) as u32, lpData: s.as_ptr() as *mut c_void };
+                let mut res = 0usize;
+                let ok = SendMessageTimeoutW(door, WM_COPYDATA, WPARAM(0), LPARAM(&cds as *const COPYDATASTRUCT as isize), SMTO_ABORTIFHUNG, 5000, Some(&mut res));
+                if ok.0 != 0 && res != 0 {
+                    return Join::HandedOver;
+                }
+                if ok.0 != 0 && !retried {
+                    // Turned away: that fm is quitting. Once it is gone, this launch is the new one.
+                    if let Ok(h) = OpenProcess(PROCESS_SYNCHRONIZE, false, pid) {
+                        let _ = WaitForSingleObject(h, 15000);
+                        let _ = CloseHandle(h);
+                    }
+                    return join(cwd, raw, background, elevated, true);
+                }
+                return Join::Unjoinable;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        Join::Unjoinable
+    }
+}
+
+/// Run as administrator over a normal session (the full half of a split token). With UAC off
+/// or as the built-in Administrator every process has that token, and that is the normal one.
+pub fn is_elevated() -> bool {
+    use windows::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION_TYPE, TOKEN_QUERY, TokenElevationType, TokenElevationTypeFull};
+    unsafe {
+        let mut token = HANDLE::default();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
+            return false;
+        }
+        let mut t = TOKEN_ELEVATION_TYPE::default();
+        let mut n = 0u32;
+        let ok = GetTokenInformation(token, TokenElevationType, Some(&mut t as *mut _ as *mut c_void), std::mem::size_of::<TOKEN_ELEVATION_TYPE>() as u32, &mut n).is_ok();
+        let _ = CloseHandle(token);
+        ok && t == TokenElevationTypeFull
+    }
+}
+
+/// The resident fm's door: a message-only window on its own thread that takes handed-over
+/// command lines and `--quit`, answers at once and passes them to the UI thread (the hub). A
+/// window stuck on a slow share then never makes a launch time out and start a second fm.
+fn open_door() {
+    std::thread::spawn(|| unsafe {
+        let hinst = GetModuleHandleW(None).unwrap_or_default();
+        let wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(door_proc),
+            hInstance: hinst.into(),
+            lpszClassName: DOOR_CLASS,
+            ..Default::default()
+        };
+        RegisterClassExW(&wc);
+        if CreateWindowExW(WINDOW_EX_STYLE(0), DOOR_CLASS, None, WINDOW_STYLE(0), 0, 0, 0, 0, Some(HWND_MESSAGE), None, Some(hinst.into()), None).is_err() {
+            return;
+        }
+        let mut msg = MSG::default();
+        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            DispatchMessageW(&msg);
+        }
+    });
+}
+
+unsafe extern "system" fn door_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    unsafe {
+        if msg != WM_COPYDATA || l.0 == 0 {
+            return DefWindowProcW(hwnd, msg, w, l);
+        }
+        let cds = &*(l.0 as *const COPYDATASTRUCT);
+        let hub = Some(HWND(HUB_ANY.load(std::sync::atomic::Ordering::SeqCst) as *mut c_void));
+        match cds.dwData {
+            COPY_QUIT => {
+                let _ = PostMessageW(hub, WM_APP_QUIT, WPARAM(0), LPARAM(0));
+                LRESULT(1)
+            }
+            COPY_OPEN => {
+                let n = cds.cbData as usize / 2;
+                let text = if n == 0 || cds.lpData.is_null() {
+                    String::new()
+                } else {
+                    String::from_utf16_lossy(std::slice::from_raw_parts(cds.lpData as *const u16, n))
+                };
+                let (cwd, raw) = text.split_once('\0').unwrap_or(("", &text));
+                let Ok(mut p) = PENDING.lock() else { return LRESULT(0) };
+                if QUITTING.load(std::sync::atomic::Ordering::SeqCst) {
+                    return LRESULT(0);
+                }
+                p.push((PathBuf::from(cwd), raw.to_string()));
+                let _ = PostMessageW(hub, WM_APP_OPEN, WPARAM(0), LPARAM(0));
+                LRESULT(1)
+            }
+            _ => LRESULT(0),
+        }
+    }
+}
+
+/// The message loop of the process. `resident`: it stays when the last window closes, as Explorer
+/// does (folder opens are instant and the index stays warm); "Ukončit Soubory" ends it.
+pub fn run(raw: &str, cwd: &Path, background: bool, resident: bool) -> i32 {
+    RESIDENT.store(resident, std::sync::atomic::Ordering::SeqCst);
     unsafe {
         crate::gfx::prewarm();
         let _ = windows::Win32::System::Ole::OleInitialize(None);
@@ -304,10 +459,32 @@ pub fn run(start: Loc) -> i32 {
             register_proc_ref();
             watch_drives(h);
         }
+        if resident {
+            open_door();
+            // Message-only windows get no broadcasts: this hidden one hears the session end.
+            let _ = CreateWindowExW(
+                WS_EX_TOOLWINDOW,
+                HUB_CLASS,
+                None,
+                WS_POPUP,
+                0,
+                0,
+                0,
+                0,
+                None,
+                None,
+                Some(hinst.into()),
+                None,
+            );
+        }
 
-        let Some(first) = open_window(start, None) else { return 1 };
+        // After OleInitialize: shell places (`::{…}`, `shell:`) parse through COM.
+        let first = if background { None } else { open_target(crate::target::parse(raw, cwd), None) };
+        if first.is_none() && !resident {
+            return 1;
+        }
         crate::search::start();
-        if let Some(app) = app_of(first).as_mut() {
+        if let Some(app) = first.and_then(|h| app_of(h).as_mut()) {
             dev_flags(app);
         }
 
@@ -328,6 +505,137 @@ pub fn run(start: Loc) -> i32 {
         crate::search::stop();
         msg.wParam.0 as i32
     }
+}
+
+fn taskbar_created() -> u32 {
+    static ID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *ID.get_or_init(|| unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) })
+}
+
+thread_local! {
+    /// How many fm window messages are being handled on this thread, one inside another.
+    static DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// A message handled inside another fm window message: a menu, dialog, drag or COM call is
+/// running its own message loop with some window's App up the stack. Whatever would free or
+/// rework an App (a close, a selection from outside) waits until that loop is over.
+pub fn nested() -> bool {
+    DEPTH.with(|d| d.get()) > 1
+}
+
+static RESIDENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Command lines handed over by other launches (door thread), opened by WM_APP_OPEN on the UI
+/// thread: (sender's folder, line).
+static PENDING: std::sync::Mutex<Vec<(PathBuf, String)>> = std::sync::Mutex::new(Vec::new());
+
+/// The process ends once no window is left, unless resident; a copy or move still running keeps
+/// it (windowless) until it ends.
+fn quit_if_done() {
+    if windows().is_empty()
+        && OPS.load(std::sync::atomic::Ordering::SeqCst) == 0
+        && !RESIDENT.load(std::sync::atomic::Ordering::SeqCst)
+    {
+        // A handed-over line not opened yet opens first (its window then ends the process).
+        let Ok(p) = PENDING.lock() else { return };
+        if !p.is_empty() {
+            return;
+        }
+        QUITTING.store(true, std::sync::atomic::Ordering::SeqCst);
+        drop(p);
+        unsafe { PostQuitMessage(0) };
+    }
+}
+
+/// Set (under the PENDING lock) once the message loop is ending: the door turns launches away.
+static QUITTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// "Ukončit Soubory": every window closes and the process ends (a resident one too).
+pub fn quit_all(_: &mut App) {
+    quit_everything();
+}
+
+fn quit_everything() {
+    RESIDENT.store(false, std::sync::atomic::Ordering::SeqCst);
+    let open = windows();
+    for &h in &open {
+        unsafe {
+            let _ = PostMessageW(Some(h), WM_CLOSE, WPARAM(0), LPARAM(0));
+        }
+    }
+    // No window to close: the last-window check never runs, so end here (or when copies end).
+    if open.is_empty() {
+        quit_if_done();
+    }
+}
+
+/// What a command line names: a window on it, Explorer for places only Explorer shows, or a
+/// message when nothing is there.
+pub fn open_target(t: crate::target::Target, near: Option<HWND>) -> Option<HWND> {
+    use crate::target::Target;
+    match t {
+        Target::Open { loc, select } => {
+            let h = open_window(loc, near)?;
+            if let Some(app) = unsafe { app_of(h).as_mut() } {
+                if select.is_some() {
+                    app.reload(select.as_deref());
+                }
+            }
+            unsafe {
+                let _ = SetForegroundWindow(h);
+            }
+            Some(h)
+        }
+        Target::Explorer(args) => {
+            launch_explorer(&args);
+            None
+        }
+        Target::Missing(text) => {
+            unsafe {
+                MessageBoxW(None, &HSTRING::from(text), w!("Soubory"), MB_ICONWARNING | MB_SETFOREGROUND);
+            }
+            None
+        }
+    }
+}
+
+/// Signalled for a few seconds while fm itself starts Explorer, so the dialogkit watcher (which
+/// replaces new Explorer windows by fm) leaves that one alone.
+fn explorer_event() -> Option<HANDLE> {
+    thread_local! {
+        static EV: std::cell::Cell<Option<HANDLE>> = const { std::cell::Cell::new(None) };
+    }
+    EV.with(|c| {
+        if c.get().is_none() {
+            c.set(unsafe { CreateEventW(None, true, false, w!("Local\\fm.explorer-allow")) }.ok());
+        }
+        c.get()
+    })
+}
+
+/// Starts Explorer itself (never a folder verb, which would come back to fm) with `args`.
+pub fn launch_explorer(args: &str) {
+    if let Some(e) = explorer_event() {
+        unsafe {
+            let _ = SetEvent(e);
+            SetTimer(Some(hub()), TIMER_EXPLORER, 8000, None);
+        }
+    }
+    let exe = std::env::var_os("WINDIR").map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from).join("explorer.exe");
+    let mut cmd = std::process::Command::new(exe);
+    // Explorer reads its own command line (no escapes): pass it verbatim.
+    std::os::windows::process::CommandExt::raw_arg(&mut cmd, args);
+    if cmd.spawn().is_err() {
+        crate::prefs::log("explorer.exe could not be started");
+    }
+}
+
+/// "Otevřít v Průzkumníkovi": the escape hatch to Explorer for what this window shows.
+pub fn open_in_explorer(app: &mut App) {
+    let t = app.tab();
+    let focused = t.sel.focus.filter(|&f| t.sel.is(f) && f < t.entries.len()).map(|f| t.path_of(f));
+    launch_explorer(&crate::target::explorer_args(&t.loc, focused.as_deref()));
 }
 
 /// Opens a main window on `loc`. `near`: cascade from that window (Ctrl+N, a second launch);
@@ -486,7 +794,50 @@ unsafe extern "system" fn hub_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
                 Some(LRESULT(0))
             }
             WM_APP_OPS_IDLE => {
-                if windows().is_empty() && OPS.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                quit_if_done();
+                Some(LRESULT(0))
+            }
+            WM_APP_OPEN => {
+                let near = GetForegroundWindow();
+                let near = if app_of(near).is_null() { windows().last().copied() } else { Some(near) };
+                let pending = PENDING.lock().map(|mut p| std::mem::take(&mut *p)).unwrap_or_default();
+                for (cwd, raw) in pending {
+                    open_target(crate::target::parse(&raw, &cwd), near);
+                }
+                Some(LRESULT(0))
+            }
+            WM_TIMER if w.0 == TIMER_EXPLORER => {
+                let _ = KillTimer(Some(hwnd), TIMER_EXPLORER);
+                if let Some(e) = explorer_event() {
+                    let _ = windows::Win32::System::Threading::ResetEvent(e);
+                }
+                Some(LRESULT(0))
+            }
+            WM_APP_QUIT => {
+                quit_everything();
+                Some(LRESULT(0))
+            }
+            // Restart Manager (an installer) asks to close the app: not while a copy runs.
+            // Environment variables changed (System settings, an installer): only the session
+            // window gets this broadcast, so it runs once.
+            WM_SETTINGCHANGE if l.0 != 0 && PCWSTR(l.0 as *const u16).to_string().is_ok_and(|s| s == "Environment") => {
+                refresh_env();
+                None
+            }
+            WM_QUERYENDSESSION => Some(LRESULT(
+                (l.0 as u32 & ENDSESSION_CLOSEAPP == 0 || OPS.load(std::sync::atomic::Ordering::SeqCst) == 0) as isize,
+            )),
+            WM_ENDSESSION => {
+                // Logging off, shutting down, or Restart Manager closing the app: save, then end
+                // (a logoff ends the process anyway; Restart Manager may not).
+                if w.0 != 0 {
+                    for_each_app(|a| {
+                        if !dev_run() {
+                            crate::prefs::save(a);
+                        }
+                    });
+                    crate::search::stop();
+                    QUITTING.store(true, std::sync::atomic::Ordering::SeqCst);
                     PostQuitMessage(0);
                 }
                 Some(LRESULT(0))
@@ -507,25 +858,6 @@ unsafe extern "system" fn hub_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
             WM_APP_OPDONE => {
                 crate::undo::done(Box::from_raw(l.0 as *mut crate::undo::Done));
                 Some(LRESULT(0))
-            }
-            WM_COPYDATA => {
-                let cds = &*(l.0 as *const COPYDATASTRUCT);
-                if cds.dwData != COPY_OPEN {
-                    return Some(LRESULT(0));
-                }
-                let n = cds.cbData as usize / 2;
-                let text = if n == 0 || cds.lpData.is_null() {
-                    String::new()
-                } else {
-                    String::from_utf16_lossy(std::slice::from_raw_parts(cds.lpData as *const u16, n))
-                };
-                let loc = crate::start_loc(&text);
-                let near = GetForegroundWindow();
-                let near = if app_of(near).is_null() { windows().last().copied() } else { Some(near) };
-                if let Some(h) = open_window(loc, near) {
-                    let _ = SetForegroundWindow(h);
-                }
-                Some(LRESULT(1))
             }
             _ => None,
         }
@@ -739,6 +1071,11 @@ fn dev_keys(app: &mut App, script: &str, out: Option<String>) {
             }
             log += &format!("close with ops={}\n", OPS.load(std::sync::atomic::Ordering::SeqCst));
             break;
+        } else if step == "sel" {
+            let t = app.tab();
+            let names: Vec<&str> = t.sel.indices().into_iter().filter_map(|i| t.entries.get(i)).map(|e| e.name.as_str()).collect();
+            log += &format!("sel {:?} [{}] focus {:?}
+", t.loc, names.join(" ; "), t.sel.focus.and_then(|f| t.entries.get(f)).map(|e| e.name.clone()));
         } else if step == "dump" {
             app.reload(None);
             let names: Vec<String> = app.tab().entries.iter().map(|e| e.name.clone()).collect();
@@ -746,6 +1083,7 @@ fn dev_keys(app: &mut App, script: &str, out: Option<String>) {
         } else {
             let vk = match key {
                 "del" => VK_DELETE,
+                "enter" => VK_RETURN,
                 k if k.len() == 1 => VIRTUAL_KEY(k.to_ascii_uppercase().as_bytes()[0] as u16),
                 _ => continue,
             };
@@ -885,6 +1223,8 @@ pub fn set_title(app: &App) {
     if app.offscreen || app.hwnd.is_invalid() {
         return;
     }
+    // Every navigation and tab switch passes here.
+    crate::shellwin::sync(app);
     let t = wide(&app.tab().loc.title());
     unsafe {
         let _ = SetWindowTextW(app.hwnd, PCWSTR(t.as_ptr()));
@@ -945,7 +1285,7 @@ pub fn to_screen(app: &App, x: f32, y: f32) -> POINT {
 /// Ctrl+N: a new window on the same folder (Explorer), in this process.
 pub fn new_window(app: &App) {
     let loc = match &app.tab().loc {
-        Loc::Search { .. } => crate::start_loc(""),
+        Loc::Search { .. } => crate::fsys::known_folder(&FOLDERID_Profile).map_or(Loc::Computer, Loc::Folder),
         other => other.clone(),
     };
     if let Some(h) = open_window(loc, Some(app.hwnd)) {
@@ -1560,7 +1900,7 @@ fn path_entered(app: &mut App, text: &str) {
     }
 }
 
-fn expand_env(s: &str) -> String {
+pub fn expand_env(s: &str) -> String {
     let w = wide(s);
     let mut buf = vec![0u16; 4096];
     let n = unsafe {
@@ -1854,7 +2194,10 @@ fn frame_thickness(hwnd: HWND) -> (i32, i32) {
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { wndproc_inner(hwnd, msg, wparam, lparam) })) {
+    DEPTH.with(|d| d.set(d.get() + 1));
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { wndproc_inner(hwnd, msg, wparam, lparam) }));
+    DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    match r {
         Ok(r) => r,
         Err(e) => {
             crate::prefs::log(&format!("panic in wndproc (msg {msg:#x}): {}", panic_text(&e)));
@@ -1887,10 +2230,7 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
             if !p.is_null() {
                 drop(Box::from_raw(p));
             }
-            // With a copy or move still running the process stays (windowless) until it ends.
-            if windows().is_empty() && OPS.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-                PostQuitMessage(0);
-            }
+            quit_if_done();
             return DefWindowProcW(hwnd, msg, wparam, lparam);
         }
         let ptr = app_of(hwnd);
@@ -1907,6 +2247,15 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
             WM_APP_UIA => {
                 crate::uia::act(app, lparam);
                 LRESULT(0)
+            }
+            crate::shellwin::WM_APP_SHELLWIN => {
+                crate::shellwin::handle(app, wparam, lparam);
+                LRESULT(0)
+            }
+            m if m == taskbar_created() => {
+                // Explorer restarted: its window list is new.
+                crate::shellwin::explorer_restarted(app);
+                DefWindowProcW(hwnd, msg, wparam, lparam)
             }
             WM_NCCALCSIZE if wparam.0 != 0 => {
                 // Keep the side and bottom resize frames, drop the caption: the client area
@@ -2259,6 +2608,11 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                         let _ = KillTimer(Some(hwnd), TIMER_NOTE);
                         app.invalidate();
                     }
+                    crate::shellwin::TIMER => crate::shellwin::replay(app),
+                    TIMER_CLOSE => {
+                        let _ = KillTimer(Some(hwnd), TIMER_CLOSE);
+                        let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+                    }
                     crate::droptarget::TIMER => crate::droptarget::tick(app),
                     _ => crate::shell::timer(app, wparam.0),
                 }
@@ -2291,7 +2645,19 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                 app.invalidate();
                 DefWindowProcW(hwnd, msg, wparam, lparam)
             }
+            // Alt+F4, the system and taskbar menus: closed from the message loop, never from
+            // inside this call (DefWindowProc would send WM_CLOSE right here).
+            WM_SYSCOMMAND if wparam.0 & 0xFFF0 == SC_CLOSE as usize => {
+                let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+                LRESULT(0)
+            }
             WM_CLOSE => {
+                if nested() {
+                    // Quit from a script, "Ukončit Soubory" or fm --quit during a menu, drag or
+                    // dialog: the App must outlive that loop. Tried again shortly.
+                    SetTimer(Some(hwnd), TIMER_CLOSE, 200, None);
+                    return LRESULT(0);
+                }
                 crate::quicklook::close();
                 if !dev_run() {
                     crate::prefs::save(app);
@@ -2300,6 +2666,7 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                 LRESULT(0)
             }
             WM_DESTROY => {
+                crate::shellwin::destroyed(hwnd);
                 crate::uia::forget(hwnd);
                 crate::droptarget::revoke(hwnd);
                 stop_watch(hwnd);

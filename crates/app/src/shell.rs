@@ -51,6 +51,7 @@ pub(crate) const C_PREVIEW: u32 = OWN + 11;
 pub(crate) const C_SIDEBAR: u32 = OWN + 12;
 pub(crate) const C_GOTO: u32 = OWN + 13;
 pub(crate) const C_NEW_WINDOW: u32 = OWN + 14;
+pub(crate) const C_EXPLORER: u32 = OWN + 15;
 pub(crate) const C_VIEW0: u32 = OWN + 20; // +0..4: icons, list, columns, gallery, tiles
 pub(crate) const C_SORT0: u32 = OWN + 30; // +0..4
 pub(crate) const C_TAG0: u32 = OWN + 40; // +0..6
@@ -744,6 +745,7 @@ fn more_menu_at(app: &mut App, pt: POINT) {
         }
         append(m, C_GOTO, "Přejít na složku…\tCtrl+L", false, true);
         append(m, C_TERMINAL, "Otevřít v Terminálu", false, in_folder);
+        append(m, C_EXPLORER, "Otevřít v Průzkumníkovi", false, true);
         append(m, C_PROPS, "Vlastnosti složky", false, in_folder);
         sep(m);
         append(m, C_MAP_DRIVE, "Připojit síťovou jednotku…", false, true);
@@ -778,6 +780,7 @@ fn own_command(app: &mut App, cmd: u32) {
         C_NEW_WINDOW => crate::win::new_window(app),
         C_PASTE => paste(app),
         C_TERMINAL => open_terminal(app),
+        C_EXPLORER => crate::win::open_in_explorer(app),
         C_PROPS => {
             if let Some(d) = app.tab().loc.folder() {
                 show_properties(app.hwnd, d);
@@ -1465,6 +1468,23 @@ pub fn drag_out(app: &mut App, i: usize) {
 }
 
 pub fn timer(_app: &mut App, _id: usize) {}
+
+/// The folder a shortcut points to: Explorer opens it in the same window (a folder verb would
+/// start a new one). Not resolved (no search for a moved target), only read.
+pub fn link_folder(lnk: &Path) -> Option<PathBuf> {
+    if !lnk.extension().is_some_and(|x| x.eq_ignore_ascii_case("lnk")) {
+        return None;
+    }
+    unsafe {
+        let sl = CoCreateInstance::<_, IShellLinkW>(&ShellLink, None, CLSCTX_INPROC_SERVER).ok()?;
+        let w = wide(&lnk.to_string_lossy());
+        sl.cast::<IPersistFile>().ok()?.Load(PCWSTR(w.as_ptr()), STGM_READ).ok()?;
+        let mut buf = [0u16; 1024];
+        sl.GetPath(&mut buf, std::ptr::null_mut(), 0).ok()?;
+        let n = buf.iter().position(|&c| c == 0).unwrap_or(0);
+        Some(PathBuf::from(String::from_utf16_lossy(&buf[..n]))).filter(|p| n > 0 && p.is_dir())
+    }
+}
 
 // ---- Recents -------------------------------------------------------------------------------------------------
 

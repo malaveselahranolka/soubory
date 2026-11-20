@@ -75,6 +75,8 @@ const COMMANDS: &[(&str, &str, Act)] = &[
     ("O úroveň výš", "Alt+↑", Act::F(App::up)),
     ("Obnovit", "F5", Act::Own(cmd::REFRESH)),
     ("Otevřít v Terminálu", "", Act::Own(cmd::TERMINAL)),
+    ("Otevřít v Průzkumníkovi", "", Act::F(crate::win::open_in_explorer)),
+    ("Ukončit Soubory", "", Act::F(crate::win::quit_all)),
     ("Vlastnosti složky", "", Act::Own(cmd::PROPS)),
     ("Připojit síťovou jednotku…", "", Act::Own(cmd::MAP_DRIVE)),
     ("Odpojit síťovou jednotku…", "", Act::Own(cmd::UNMAP_DRIVE)),

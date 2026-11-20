@@ -2,41 +2,61 @@
 .SYNOPSIS
   Installs Soubory (fm.exe) for the current user.
 .DESCRIPTION
-  Copies dist\app to -InstallDir, adds a Start menu shortcut "Soubory" and an App Paths entry
-  (so "fm" works in Win+R). Touches only HKCU and the user's own Start menu. It does NOT make fm
-  the default for folders; that is scripts\set-default-fm.ps1, a separate step.
-  Run scripts\build-release.ps1 first. Tests pass -RegRoot, -InstallDir and -StartMenuDir.
+  Copies dist\app to -InstallDir, adds a Start menu shortcut "Soubory", an App Paths entry
+  (so "fm" works in Win+R; another program's entry under that name is left alone) and the HKCU
+  Run value "Soubory" = "fm.exe" --background (fm stays resident: it starts at sign-in without a
+  window) and starts it that way right away unless -NoStart. A running fm is asked to quit first;
+  if it is still finishing a copy or move (or has a dialog open) after -QuitWait seconds, the
+  script stops without changing anything. Touches only HKCU and the user's own Start menu. It does
+  NOT make fm the default for folders; that is scripts\set-default-fm.ps1, a separate step. Run
+  scripts\build-release.ps1 first, from a normal (not elevated) 64-bit PowerShell. Tests pass
+  -RegRoot, -RunRoot, -InstallDir, -StartMenuDir, -SourceDir, -NoStart and -QuitWait.
 #>
 param(
     [string]$InstallDir = (Join-Path $env:LOCALAPPDATA 'Programs\fm\app'),
     [string]$RegRoot = 'HKCU:\Software\Microsoft\Windows\CurrentVersion',
+    [string]$RunRoot = (Join-Path $RegRoot 'Run'),
     [string]$StartMenuDir = (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'),
-    [string]$SourceDir = (Join-Path (Split-Path -Parent $PSScriptRoot) 'dist\app')
+    [string]$SourceDir = (Join-Path (Split-Path -Parent $PSScriptRoot) 'dist\app'),
+    [switch]$NoStart,
+    [int]$QuitWait = 120
 )
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'lib\install-common.ps1')
+$CleanupName = 'Soubory.Cleanup'
 
+Assert-NotElevated
 Assert-HkcuRoot $RegRoot
-if (-not (Test-Path (Join-Path $SourceDir 'fm.exe'))) { throw "Chybí $SourceDir\fm.exe — nejdřív spusť scripts\build-release.ps1." }
-$InstallDir = [IO.Path]::GetFullPath($InstallDir)
-if ((Test-Path $InstallDir) -and (Get-ChildItem $InstallDir -Force | Select-Object -First 1) -and -not (Test-Path (Join-Path $InstallDir $Marker))) {
-    throw "Složka $InstallDir existuje a není naše (chybí $Marker). Zvol jinou -InstallDir."
-}
+Assert-HkcuRoot $RunRoot
+if (-not (Test-Path -LiteralPath (Join-Path $SourceDir 'fm.exe'))) { throw "Chybí $SourceDir\fm.exe — nejdřív spusť scripts\build-release.ps1." }
+$InstallDir = Get-InstallDir $InstallDir
+Assert-OwnDir $InstallDir 'fm'
 
-# A running fm holds the exe; it is closed (it saves its windows and index on exit).
-Stop-FromDir $InstallDir 'fm'
+Stop-Fm $InstallDir $QuitWait
 New-Item -ItemType Directory -Force $InstallDir | Out-Null
-Set-Content -Path (Join-Path $InstallDir $Marker) -Value 'fm' -Encoding ascii
-Get-ChildItem $SourceDir -File | ForEach-Object {
+Set-Content -LiteralPath (Join-Path $InstallDir $Marker) -Value 'fm' -Encoding ascii
+# Replaces a pending whole-folder delete from an earlier uninstall before anything is copied.
+Register-DelCleanup $RegRoot $InstallDir
+Get-ChildItem -LiteralPath $SourceDir -File | ForEach-Object {
     $dest = Join-Path $InstallDir $_.Name
     Remove-OrSetAside $dest | Out-Null
-    Copy-Item $_.FullName $dest -Force
+    Copy-Item -LiteralPath $_.FullName $dest -Force
 }
+# Old files still mapped somewhere go at the next sign-in; otherwise nothing stays pending.
+Get-ChildItem -LiteralPath $InstallDir -File -Filter '*.del' | ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
+if (-not (Get-ChildItem -LiteralPath $InstallDir -File -Filter '*.del')) { Clear-DelCleanup $RegRoot }
 $exe = Join-Path $InstallDir 'fm.exe'
 
+# "fm" is a generic name: an entry of another program is never replaced.
 $appPaths = Join-Path $RegRoot 'App Paths\fm.exe'
-New-Item -Force $appPaths | Out-Null
-Set-ItemProperty -Path $appPaths -Name '(default)' -Value $exe
+$cur = if (Test-Path -LiteralPath $appPaths) { "$((Get-Item -LiteralPath $appPaths).GetValue(''))".Trim('"', ' ') } else { '' }
+$ours = -not $cur -or $cur -eq $exe -or $(try { Test-Marker (Split-Path $cur) 'fm' } catch { $false })
+if ($ours) {
+    New-KeyIfMissing $appPaths
+    Set-ItemProperty -LiteralPath $appPaths -Name '(default)' -Value $exe
+} else {
+    Write-Warning "App Paths\fm.exe patří jiné aplikaci ($cur); příkaz `„fm`“ ve Win+R nenastavuji."
+}
 
 New-Item -ItemType Directory -Force $StartMenuDir | Out-Null
 $lnk = Join-Path $StartMenuDir 'Soubory.lnk'
@@ -47,6 +67,12 @@ $s.WorkingDirectory = $InstallDir
 $s.Description = 'Soubory — správce souborů'
 $s.Save()
 
+New-KeyIfMissing $RunRoot
+Set-ItemProperty -Path $RunRoot -Name 'Soubory' -Value "`"$exe`" --background"
+# A neutral working folder, as at sign-in: fm would otherwise keep this shell's folder in use.
+if (-not $NoStart) { Start-Process -FilePath $exe -ArgumentList '--background' -WorkingDirectory "$env:SystemRoot\System32" }
+
 "Nainstalováno do $InstallDir"
 "Zástupce: $lnk"
+"Soubory běží na pozadí a spustí se při každém přihlášení."
 "Aby se složky otevíraly v Souborech místo Průzkumníka, spusť scripts\set-default-fm.ps1."
