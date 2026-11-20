@@ -234,6 +234,8 @@ pub fn hub() -> HWND {
 pub fn refresh_env() {
     use windows::Win32::Security::{TOKEN_DUPLICATE, TOKEN_QUERY};
     use windows::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock, SetEnvironmentStringsW};
+    // fm's own data stays where this process started it.
+    let _ = crate::prefs::data_dir();
     unsafe {
         let mut token = HANDLE::default();
         if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_DUPLICATE, &mut token).is_err() {

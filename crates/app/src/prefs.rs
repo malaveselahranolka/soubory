@@ -2,11 +2,10 @@
 use crate::app::{App, View};
 use std::path::PathBuf;
 
+/// Fixed at first use: a refreshed environment (win::refresh_env) never moves it mid-run.
 pub fn data_dir() -> PathBuf {
-    std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
-        .join("fm")
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir).join("fm")).clone()
 }
 
 /// Appends a line to `%LOCALAPPDATA%\\fm\\fm.log` (kept under 1 MB).
