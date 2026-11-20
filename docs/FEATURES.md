@@ -59,7 +59,7 @@ Nothing here has been tried by hand in daily use yet; see "Not verified" at the 
 | Instant whole-disk search with Czech diacritics folding (`kun` finds `kůň`), live as files change | ✅ (C: 4.2 M entries, 30 s walk, queries 3–8 ms: `docs/search-bench.md`; index reviewed twice, see `26ad376`) |
 | New file/folder from any Open/Save dialog | ✅ |
 | Cold start ≈ 200 ms (D3D device built in parallel, power-saving GPU) | ✅ (`--dev-startup`) |
-| Folder sizes in list, tiles and column views, live from the index (an empty folder shows 0 bajtů, an unindexed one —); sort by size moves folders too; in the selection total and the inspector | ✅ (scratch-index harness and capture; the whole C: sums in 15 ms) |
+| Folder sizes in list, tiles and column views, live from the index (an empty folder shows 0 bajtů; — while unknown: not indexed, a junction or link, access denied, a cloud placeholder, which is never opened); sort by size moves folders too; in the selection total and the inspector | ✅ (scratch-index harness and capture; the whole C: sums in 15 ms) |
 | Filter the current folder as you type | 🔶 (search scoped to the folder) |
 | Command palette (Ctrl+K): every command plus every sidebar place, diacritics-insensitive | 🔶 (filtering tested and captured; running uses the menu handlers) |
 
@@ -68,3 +68,5 @@ Nothing here has been tried by hand in daily use yet; see "Not verified" at the 
 - Screen readers: the UI Automation tree (toolbar buttons, sidebar places, items with Select / Open / Scroll into view, status bar; focus, selection and structure events) passes `scripts/dev/uia-test.ps1` in list, icons, tiles and columns, but nobody has used Narrator or NVDA with it. Not exposed yet: group headers, tabs, the path bar, the column view's other columns, the preview pane.
 - "Show in folder" from other apps and virtual folders opened from the desktop (Control Panel, Recycle Bin icon) still open Explorer; Windows offers no per-user hook for those.
 - Option 2 needs the user's gate run (`docs/ARCHITECTURE.md`, M9) before any picker is built.
+- Busy rule (a row press, a drag in or out, an open rename): live search results, file-change and shell reloads, size re-sorts and UI Automation actions wait until it ends. Traced by four review rounds, not exercised with real mouse timing.
+- Known limits: a folder holding only empty folders shows — (its 0 is not trusted, because a folder of unreadable folders also sums to 0); a tag place lists its items again on every tab switch (a stat per tagged file on the UI thread; an offline share in a tag can stall that switch).

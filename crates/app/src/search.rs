@@ -205,7 +205,18 @@ pub fn request_sizes(app: &App) {
 /// Folder sizes for a window: every tab still showing that place takes them.
 pub fn sizes_message(app: &mut App, l: LPARAM) {
     let r = unsafe { Box::from_raw(l.0 as *mut Sizes) };
-    let fresh: HashMap<PathBuf, u64> = r.paths.into_iter().zip(r.sizes).filter_map(|(p, n)| Some((p, n?))).collect();
+    // Unknown now (emptied down to empty folders, gone from the index): an older size must not stay.
+    let (mut fresh, mut gone) = (HashMap::new(), HashSet::new());
+    for (p, n) in r.paths.into_iter().zip(r.sizes) {
+        match n {
+            Some(n) => {
+                fresh.insert(p, n);
+            }
+            None => {
+                gone.insert(p);
+            }
+        }
+    }
     ST.with(|s| {
         let mut s = s.borrow_mut();
         // shortcut: the cache is dropped wholesale past 100k folders; an LRU would keep the hot ones.
@@ -213,6 +224,9 @@ pub fn sizes_message(app: &mut App, l: LPARAM) {
             s.sizes.clear();
         }
         s.sizes.extend(fresh.iter().map(|(p, n)| (p.clone(), *n)));
+        for p in &gone {
+            s.sizes.remove(p);
+        }
     });
     let folders_first = app.prefs.folders_first;
     let cur = app.cur;
@@ -225,10 +239,15 @@ pub fn sizes_message(app: &mut App, l: LPARAM) {
         let dir = t.dir();
         let mut changed = false;
         for e in t.entries.iter_mut().filter(|e| e.is_dir) {
-            if let Some(&n) = fresh.get(&e.path_in(&dir)) {
+            let p = e.path_in(&dir);
+            if let Some(&n) = fresh.get(&p) {
                 changed |= e.size != n || !e.sized;
                 e.size = n;
                 e.sized = true;
+            } else if gone.contains(&p) && (e.sized || e.size != 0) {
+                changed = true;
+                e.size = 0;
+                e.sized = false;
             }
         }
         repaint |= changed && k == cur;
