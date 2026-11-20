@@ -667,6 +667,24 @@ fn header(app: &App, c: &mut Canvas, t: &Theme, h: Rect) {
     c.hline(h.x, h.r(), h.b() - 1.0 / c.scale, t.edge);
 }
 
+/// fm's own icon for `e` in the current tab, or None where the shell's icon stays: programs,
+/// custom folders, drives, and virtual places other than the Recycle Bin.
+pub fn own_icon(app: &App, e: &fsys::Entry) -> Option<crate::fileicons::Own> {
+    let virtual_place = match &app.tab().loc {
+        Loc::Computer => true,
+        Loc::Shell { id, .. } => !crate::shellns::is_recycle_bin(id),
+        _ => false,
+    };
+    crate::fileicons::own_at(e, &app.tab().dir(), virtual_place)
+}
+
+/// The colour a small icon glyph takes on a selected item: the selection's text colour where the
+/// fill is the accent, its own colour on the quiet inactive fill.
+fn sel_glyph(app: &App, t: &Theme) -> Option<Color> {
+    let focused = app.active && app.focus == Focus::Content;
+    (focused || t.mode == Mode::HighContrast).then_some(t.on_accent)
+}
+
 fn ensure_icon(app: &mut App, i: usize) -> i32 {
     let tab = &app.tabs[app.cur];
     if tab.icon_idx[i] != i32::MIN {
@@ -687,6 +705,27 @@ fn ensure_icon(app: &mut App, i: usize) -> i32 {
     };
     app.tabs[app.cur].icon_idx[i] = idx;
     idx
+}
+
+/// The thumbnail for an item at `px` DIPs. Items fm draws itself only take a real thumbnail (fm's
+/// folders never do); the rest fall back to the shell's large icon.
+pub fn thumb(app: &App, c: &Canvas, path: &std::path::Path, e: &fsys::Entry, own: Option<crate::fileicons::Own>, px: f32) -> Option<(windows::Win32::Graphics::Direct2D::ID2D1Bitmap, f32, f32, bool)> {
+    if matches!(own, Some(crate::fileicons::Own::Folder(_))) {
+        return None;
+    }
+    crate::thumbs::image(app, c, path, e.modified, e.attrs, px, own.is_some())
+}
+
+/// Entry `i`'s icon in `r`: fm's own, or the shell's.
+#[allow(clippy::too_many_arguments)]
+fn item_icon(app: &mut App, c: &mut Canvas, t: &Theme, i: usize, e: &fsys::Entry, own: Option<crate::fileicons::Own>, r: Rect, on: Option<Color>, dim: f32) {
+    match own {
+        Some(o) => crate::fileicons::draw(c, t, o, e, r, on, dim),
+        None => {
+            let idx = ensure_icon(app, i);
+            app.icons.draw(c, idx, r, dim);
+        }
+    }
 }
 
 fn sel_colors(app: &App, t: &Theme) -> (Color, Color) {
@@ -747,17 +786,20 @@ fn list_view(app: &mut App, c: &mut Canvas, t: &Theme) {
         let dim = if e.is_hidden() { 0.55 } else { 1.0 };
         let ink = if selected { sel_ink } else { t.ink };
         let ink2 = if selected { sel_ink } else { t.ink2 };
-        let idx = ensure_icon(app, i);
+        let own = own_icon(app, &e);
+        let on = if selected { sel_glyph(app, t) } else { None };
         for (col, cx, cw) in &cols {
             let cell = Rect::new(*cx, r.y, *cw, r.h);
             match col {
                 Col::Name => {
-                    app.icons.draw(
-                        c,
-                        idx,
-                        Rect::new(cell.x + 6.0, r.cy() - 8.0, 16.0, 16.0),
-                        dim,
-                    );
+                    let ir = Rect::new(cell.x + 6.0, r.cy() - 8.0, 16.0, 16.0);
+                    match own {
+                        Some(o) => crate::fileicons::draw(c, t, o, &e, ir, on, dim),
+                        None => {
+                            let idx = ensure_icon(app, i);
+                            app.icons.draw(c, idx, ir, dim);
+                        }
+                    }
                     let mut nr = Rect::new(cell.x + 28.0, r.y, cell.w - 36.0, r.h);
                     let status = cloud_glyph(&e);
                     if let Some(gl) = status {
@@ -995,9 +1037,9 @@ fn tiles_view(app: &mut App, c: &mut Canvas, t: &Theme) {
         let e = app.tab().entries[i].clone();
         let dim = if e.is_hidden() { 0.55 } else { 1.0 };
         let (icon, name) = tiles_parts(app, i);
-        let idx = ensure_icon(app, i);
+        let own = own_icon(app, &e);
         let path = app.tab().path_of(i);
-        match crate::thumbs::image(app, c, &path, e.modified, e.attrs, icon.w) {
+        match thumb(app, c, &path, &e, own, icon.w) {
             Some((bmp, w, h, is_thumb)) => {
                 let is_thumb = is_thumb && !e.is_dir;
                 let k = (icon.w / w).min(icon.h / h);
@@ -1008,7 +1050,7 @@ fn tiles_view(app: &mut App, c: &mut Canvas, t: &Theme) {
                     c.round_stroke(dst, 2.0, t.edge, 0.0);
                 }
             }
-            None => app.icons.draw(c, idx, icon, dim),
+            None => item_icon(app, c, t, i, &e, own, icon, if selected { sel_glyph(app, t) } else { None }, dim),
         }
         let (ink, ink2) = if selected { (sel_ink, sel_ink) } else { (t.ink, t.ink2) };
         let mut name_r = name;
@@ -1089,10 +1131,10 @@ fn icon_view(app: &mut App, c: &mut Canvas, t: &Theme) {
         if app.kb && app.tab().sel.focus == Some(i) && app.focus == Focus::Content && !selected {
             c.round_stroke(icon.inset(-6.0, -6.0), 8.0, t.focus, 1.5);
         }
-        let idx = ensure_icon(app, i);
+        let own = own_icon(app, &e);
         let dim = if e.is_hidden() { 0.55 } else { 1.0 };
         let path = app.tab().path_of(i);
-        match crate::thumbs::image(app, c, &path, e.modified, e.attrs, icon.w) {
+        match thumb(app, c, &path, &e, own, icon.w) {
             Some((bmp, w, h, is_thumb)) => {
                 let is_thumb = is_thumb && !e.is_dir;
                 let k = (icon.w / w).min(icon.h / h);
@@ -1104,7 +1146,7 @@ fn icon_view(app: &mut App, c: &mut Canvas, t: &Theme) {
                     c.round_stroke(r, 2.0, t.edge, 0.0);
                 }
             }
-            None => app.icons.draw(c, idx, icon, dim),
+            None => item_icon(app, c, t, i, &e, own, icon, None, dim),
         }
         if renaming == Some(i) {
             continue;

@@ -61,6 +61,8 @@ struct Ql {
     hover_open: bool,
     theme: Theme,
     previewing: bool,
+    /// fm draws this item's icon (decided where it was opened).
+    own: Option<crate::fileicons::Own>,
 }
 
 thread_local! {
@@ -162,6 +164,7 @@ fn open(app: &mut App) {
             hover_open: false,
             theme: app.theme.clone(),
             previewing: false,
+            own: None,
         });
         QL.with(|q| *q.borrow_mut() = Some(ql));
         load(app, path, entry, index);
@@ -234,8 +237,9 @@ fn is_image(ext: &str) -> bool {
     matches!(ext, "jpg" | "jpeg" | "jfif" | "png" | "gif" | "bmp" | "dib" | "tif" | "tiff" | "ico" | "webp" | "heic" | "heif" | "avif" | "jxr" | "wdp" | "dds")
 }
 
-fn load(_app: &mut App, path: PathBuf, entry: Entry, index: (usize, usize)) {
+fn load(app: &mut App, path: PathBuf, entry: Entry, index: (usize, usize)) {
     let ext = entry.ext().to_ascii_lowercase();
+    let own = crate::paint::own_icon(app, &entry);
     with_ql(|ql| {
         unsafe {
             if let Some(h) = ql.handler.take() {
@@ -252,6 +256,7 @@ fn load(_app: &mut App, path: PathBuf, entry: Entry, index: (usize, usize)) {
         }
         ql.path = path.clone();
         ql.entry = entry.clone();
+        ql.own = own;
         ql.index = index;
         ql.bmp = None;
         ql.previewing = false;
@@ -547,12 +552,17 @@ fn draw(ql: &mut Ql, c: &mut Canvas, t: &Theme, w: f32, h: f32) {
             let cloud = matches!(ql.content, Content::Cloud);
             let mid = area.center(area.w.min(420.0), 260.0);
             let s = 128.0;
-            match crate::thumbs::image_blocking(c, &ql.path, &ql.entry, s) {
-                Some((bmp, bw, bh)) => {
+            let img = match ql.own {
+                Some(crate::fileicons::Own::Folder(_)) => None,
+                own => crate::thumbs::image_blocking(c, &ql.path, &ql.entry, s, own.is_some()),
+            };
+            match (img, ql.own) {
+                (Some((bmp, bw, bh)), _) => {
                     let k = (s / bw).min(s / bh);
                     c.bitmap(&bmp, mid.top(s).center(bw * k, bh * k).snap(c.scale), 1.0);
                 }
-                None => {}
+                (None, Some(o)) => crate::fileicons::draw(c, t, o, &ql.entry, mid.top(s).center(s, s), None, 1.0),
+                (None, None) => {}
             }
             c.text(&ql.entry.name, Rect::new(mid.x, mid.y + s + 16.0, mid.w, 24.0), Font::BodyStrong, t.ink, Align::Center);
             let note = if cloud {

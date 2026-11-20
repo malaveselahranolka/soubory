@@ -30,6 +30,8 @@ pub struct Key {
     pub path: PathBuf,
     pub px: u32,
     pub mtime: u64,
+    /// The shell's icon stands in when there is no thumbnail; false where fm draws its own.
+    pub icon: bool,
 }
 
 struct Req {
@@ -95,7 +97,7 @@ fn start(hwnd: HWND, queue: Arc<Queue>) {
                     }
                     items.pop().unwrap() // newest first: what is on screen now
                 };
-                let img = load(&req.key.path, req.key.px, req.placeholder);
+                let img = load(&req.key.path, req.key.px, req.placeholder, req.key.icon);
                 let res = Box::into_raw(Box::new(Res { key: req.key, img }));
                 if PostMessageW(Some(HWND(h as *mut c_void)), crate::win::WM_APP_THUMB, WPARAM(0), LPARAM(res as isize)).is_err() {
                     drop(Box::from_raw(res));
@@ -112,11 +114,12 @@ pub fn bucket(px: f32) -> u32 {
 }
 
 /// The image for `path` at `dip` size, or None while it loads (the caller draws the icon).
+/// `own`: fm draws this item's icon, so only a real thumbnail is wanted.
 /// Returns (bitmap, width DIP, height DIP, is_thumbnail).
-pub fn image(app: &App, c: &crate::gfx::Canvas, path: &std::path::Path, mtime: u64, attrs: u32, dip: f32) -> Option<(ID2D1Bitmap, f32, f32, bool)> {
+pub fn image(app: &App, c: &crate::gfx::Canvas, path: &std::path::Path, mtime: u64, attrs: u32, dip: f32, own: bool) -> Option<(ID2D1Bitmap, f32, f32, bool)> {
     if app.offscreen && app.hwnd.is_invalid() {
         // Offscreen renders load synchronously so the PNG shows the final state.
-        let key = Key { path: path.to_path_buf(), px: bucket(dip * c.scale), mtime };
+        let key = Key { path: path.to_path_buf(), px: bucket(dip * c.scale), mtime, icon: !own };
         let img = S.with(|s| match s.borrow().slots.get(&key) {
             Some(Slot::Ready(img, _)) => Some(img.clone()),
             _ => None,
@@ -124,7 +127,7 @@ pub fn image(app: &App, c: &crate::gfx::Canvas, path: &std::path::Path, mtime: u
         let img = match img {
             Some(i) => i,
             None => {
-                let i = Rc::new(load(path, key.px, fm_fs::attrs::is_cloud_placeholder(attrs))?);
+                let i = Rc::new(load(path, key.px, fm_fs::attrs::is_cloud_placeholder(attrs), key.icon)?);
                 S.with(|s| s.borrow_mut().slots.insert(key.clone(), Slot::Ready(i.clone(), 0)));
                 i
             }
@@ -132,7 +135,7 @@ pub fn image(app: &App, c: &crate::gfx::Canvas, path: &std::path::Path, mtime: u
         let bmp = c.bitmap_from_bgra(img.w, img.h, &img.data)?;
         return Some((bmp, img.w as f32 / c.scale, img.h as f32 / c.scale, img.thumb));
     }
-    let key = Key { path: path.to_path_buf(), px: bucket(dip * c.scale), mtime };
+    let key = Key { path: path.to_path_buf(), px: bucket(dip * c.scale), mtime, icon: !own };
     let dc = c.dc.as_raw() as usize;
     S.with(|s| {
         let mut s = s.borrow_mut();
@@ -217,8 +220,8 @@ fn evict(s: &mut State) {
 }
 
 /// Synchronous variant for Quick Look's fallback image (cached; placeholder-safe).
-pub fn image_blocking(c: &crate::gfx::Canvas, path: &std::path::Path, e: &crate::fsys::Entry, dip: f32) -> Option<(ID2D1Bitmap, f32, f32)> {
-    let key = Key { path: path.to_path_buf(), px: bucket(dip * c.scale), mtime: e.modified };
+pub fn image_blocking(c: &crate::gfx::Canvas, path: &std::path::Path, e: &crate::fsys::Entry, dip: f32, own: bool) -> Option<(ID2D1Bitmap, f32, f32)> {
+    let key = Key { path: path.to_path_buf(), px: bucket(dip * c.scale), mtime: e.modified, icon: !own };
     let img = S.with(|s| match s.borrow().slots.get(&key) {
         Some(Slot::Ready(img, _)) => Some(img.clone()),
         _ => None,
@@ -226,7 +229,7 @@ pub fn image_blocking(c: &crate::gfx::Canvas, path: &std::path::Path, e: &crate:
     let img = match img {
         Some(i) => i,
         None => {
-            let i = Rc::new(load(path, key.px, e.is_placeholder())?);
+            let i = Rc::new(load(path, key.px, e.is_placeholder(), key.icon)?);
             S.with(|s| {
                 let mut s = s.borrow_mut();
                 s.bytes += i.data.len();
@@ -253,7 +256,7 @@ pub fn forget_dc(dc: usize) {
     S.with(|s| s.borrow_mut().bitmaps.retain(|k, _| k.0 != dc));
 }
 
-fn load(path: &std::path::Path, px: u32, placeholder: bool) -> Option<Img> {
+fn load(path: &std::path::Path, px: u32, placeholder: bool, icon: bool) -> Option<Img> {
     unsafe {
         let w = wide(&path.to_string_lossy());
         let item: IShellItemImageFactory = SHCreateItemFromParsingName(PCWSTR(w.as_ptr()), None).ok()?;
@@ -265,6 +268,9 @@ fn load(path: &std::path::Path, px: u32, placeholder: bool) -> Option<Img> {
             if img.is_some() {
                 return img;
             }
+        }
+        if !icon {
+            return None;
         }
         let h = item.GetImage(size, SIIGBF_ICONONLY).ok()?;
         let img = pixels(h, false);

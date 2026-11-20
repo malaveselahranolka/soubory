@@ -277,7 +277,7 @@ pub fn paint_columns(app: &mut App, c: &mut Canvas, t: &Theme) {
             let e = app.tab().cols_left[k].entries[i].clone();
             let selected = app.tab().cols_left[k].sel.is(i);
             let dir = app.tab().cols_left[k].dir.clone();
-            let idx = cached_icon(app, &dir, &e, Slot::Left(k, i));
+            let idx = crate::fileicons::own_at(&e, &dir, false).ok_or_else(|| cached_icon(app, &dir, &e, Slot::Left(k, i)));
             let mask = crate::tags::mask(&e.path_in(&dir));
             column_row(app, c, t, r, &e, idx, mask, if selected { Some((t.sel_inactive, t.ink)) } else { None });
         }
@@ -296,7 +296,7 @@ pub fn paint_columns(app: &mut App, c: &mut Canvas, t: &Theme) {
         let r = app.row_rect(i);
         let e = app.tab().entries[i].clone();
         let dir = app.tab().dir();
-        let idx = cached_icon(app, &dir, &e, Slot::Active(i));
+        let idx = crate::fileicons::own_at(&e, &dir, false).ok_or_else(|| cached_icon(app, &dir, &e, Slot::Active(i)));
         let selected = app.tab().sel.is(i);
         if app.kb && app.tab().sel.focus == Some(i) && !selected && app.focus == Focus::Content {
             c.round_stroke(r.inset(INSET / 2.0, 1.0), 6.0, t.focus, 1.5);
@@ -320,7 +320,7 @@ pub fn paint_columns(app: &mut App, c: &mut Canvas, t: &Theme) {
             let r = Rect::new(rx, b.y + 4.0 + i as f32 * ROW_H - scroll, COL_W, ROW_H);
             let p = app.tab().col_right.as_ref().unwrap();
             let (e, dir) = (p.entries[i].clone(), p.dir.clone());
-            let idx = cached_icon(app, &dir, &e, Slot::Right(i));
+            let idx = crate::fileicons::own_at(&e, &dir, false).ok_or_else(|| cached_icon(app, &dir, &e, Slot::Right(i)));
             let mask = crate::tags::mask(&e.path_in(&dir));
             column_row(app, c, t, r, &e, idx, mask, None);
         }
@@ -365,7 +365,7 @@ fn visible(scroll: f32, n: usize, h: f32) -> std::ops::Range<usize> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn column_row(app: &mut App, c: &mut Canvas, t: &Theme, r: Rect, e: &Entry, idx: i32, tags: u8, sel: Option<(Color, Color)>) {
+fn column_row(app: &mut App, c: &mut Canvas, t: &Theme, r: Rect, e: &Entry, icon: Result<crate::fileicons::Own, i32>, tags: u8, sel: Option<(Color, Color)>) {
     let cap = r.inset(INSET / 2.0, 1.0);
     let (ink, bg) = match sel {
         Some((fill, ink)) => {
@@ -375,7 +375,12 @@ fn column_row(app: &mut App, c: &mut Canvas, t: &Theme, r: Rect, e: &Entry, idx:
         None => (t.ink, t.card),
     };
     let dim = if e.is_hidden() { 0.55 } else { 1.0 };
-    app.icons.draw(c, idx, Rect::new(cap.x + 6.0, r.cy() - 8.0, 16.0, 16.0), dim);
+    let ir = Rect::new(cap.x + 6.0, r.cy() - 8.0, 16.0, 16.0);
+    match icon {
+        // Glyphs take the text colour on the accent fill, keep their own on the inactive one.
+        Ok(o) => crate::fileicons::draw(c, t, o, e, ir, sel.filter(|s| s.0 == t.accent).map(|s| s.1), dim),
+        Err(idx) => app.icons.draw(c, idx, ir, dim),
+    }
     let mut name_r = Rect::new(cap.x + 28.0, r.y, cap.w - 28.0 - if e.is_dir { 20.0 } else { 6.0 }, r.h);
     if tags != 0 {
         let w = crate::paint::tag_dots(c, tags, name_r.r() - 2.0, r.cy(), bg);
@@ -429,16 +434,20 @@ pub fn paint_gallery(app: &mut App, c: &mut Canvas, t: &Theme) {
         let e = app.tab().entries[i].clone();
         let selected = app.tab().sel.is(i);
         let path = app.tab().path_of(i);
-        match crate::thumbs::image(app, c, &path, e.modified, e.attrs, TILE) {
+        let own = crate::paint::own_icon(app, &e);
+        match crate::paint::thumb(app, c, &path, &e, own, TILE) {
             Some((bmp, w, h, _)) => {
                 let k = (TILE / w).min(TILE / h);
                 c.bitmap(&bmp, r.center(w * k, h * k).snap(c.scale), 1.0);
             }
-            None => {
-                let dir = app.tab().dir();
-                let idx = app.icons.index(&dir, &e);
-                app.icons.draw(c, idx, r.center(48.0, 48.0), 1.0);
-            }
+            None => match own {
+                Some(o) => crate::fileicons::draw(c, t, o, &e, r.center(48.0, 48.0), None, 1.0),
+                None => {
+                    let dir = app.tab().dir();
+                    let idx = app.icons.index(&dir, &e);
+                    app.icons.draw(c, idx, r.center(48.0, 48.0), 1.0);
+                }
+            },
         }
         if selected {
             let (fill, _) = sel_colors(app, t);
@@ -455,7 +464,8 @@ fn kind_and_size(e: &Entry) -> String {
 /// Large image (thumbnail or icon) fitted into `r`.
 fn big_preview(app: &mut App, c: &mut Canvas, t: &Theme, r: Rect, path: &Path, e: &Entry) {
     let side = r.w.min(r.h).max(32.0);
-    match crate::thumbs::image(app, c, path, e.modified, e.attrs, side.min(1600.0 / c.scale)) {
+    let own = crate::paint::own_icon(app, e);
+    match crate::paint::thumb(app, c, path, e, own, side.min(1600.0 / c.scale)) {
         Some((bmp, w, h, is_thumb)) => {
             let is_thumb = is_thumb && !e.is_dir;
             let k = if is_thumb { (r.w / w).min(r.h / h).min(4.0) } else { (side.min(256.0) / w.max(h)).min(r.w / w) };
@@ -466,9 +476,13 @@ fn big_preview(app: &mut App, c: &mut Canvas, t: &Theme, r: Rect, path: &Path, e
             }
         }
         None => {
+            let s = side.min(128.0);
+            if let Some(o) = own {
+                crate::fileicons::draw(c, t, o, e, r.center(s, s), None, 1.0);
+                return;
+            }
             let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
             let idx = if e.full.is_some() && e.is_dir { app.icons.index_for_path(path) } else { app.icons.index(&dir, e) };
-            let s = side.min(128.0);
             app.icons.draw(c, idx, r.center(s, s), 1.0);
         }
     }

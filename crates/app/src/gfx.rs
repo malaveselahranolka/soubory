@@ -43,6 +43,12 @@ pub enum Font {
     Glyph(u8),
     /// 12 px Cascadia Mono for text previews.
     Mono,
+    /// 14 px: sidebar places.
+    Side,
+    /// 14 px semibold: the selected sidebar place.
+    SideStrong,
+    /// Semibold at the given px: the extension on a file icon.
+    Label(u8),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -63,6 +69,9 @@ pub struct Gfx {
     glyph_family: String,
     mono_family: String,
     dev: Option<Device>,
+    /// SVG path data (keyed by its static address) as geometry; factory resources, so they
+    /// outlive a lost device.
+    geos: RefCell<HashMap<usize, Option<ID2D1PathGeometry1>>>,
 }
 
 struct Device {
@@ -111,6 +120,7 @@ impl Gfx {
                 formats: RefCell::new(HashMap::new()),
                 ellipsis: RefCell::new(HashMap::new()),
                 dev: None,
+                geos: RefCell::new(HashMap::new()),
             })
         }
     }
@@ -132,6 +142,9 @@ impl Gfx {
             Font::Display => (&self.display_family, 28.0, DWRITE_FONT_WEIGHT_SEMI_BOLD),
             Font::Glyph(px) => (&self.glyph_family, px as f32, DWRITE_FONT_WEIGHT_NORMAL),
             Font::Mono => (&self.mono_family, 12.0, DWRITE_FONT_WEIGHT_NORMAL),
+            Font::Side => (&self.text_family, 14.0, DWRITE_FONT_WEIGHT_NORMAL),
+            Font::SideStrong => (&self.text_family, 14.0, DWRITE_FONT_WEIGHT_SEMI_BOLD),
+            Font::Label(px) => (&self.display_family, px as f32, DWRITE_FONT_WEIGHT_SEMI_BOLD),
         };
         let fam: Vec<u16> = family.encode_utf16().chain([0]).collect();
         let f = unsafe {
@@ -693,6 +706,58 @@ impl Canvas<'_> {
                 DWRITE_MEASURING_MODE_NATURAL,
             );
         }
+    }
+
+    fn geometry(&self, d: &'static str) -> Option<ID2D1PathGeometry1> {
+        let key = d.as_ptr() as usize;
+        if let Some(g) = self.g.geos.borrow().get(&key) {
+            return g.clone();
+        }
+        let geo = match crate::svgpath::parse(d) {
+            Ok(segs) => unsafe {
+                let geo = self.g.d2d.CreatePathGeometry().ok();
+                geo.filter(|g| {
+                    g.Open().is_ok_and(|sink| {
+                        crate::svgpath::build(&sink, &segs);
+                        sink.Close().is_ok()
+                    })
+                })
+            },
+            Err(e) => {
+                crate::prefs::log(&format!("svg path: {e}"));
+                None
+            }
+        };
+        self.g.geos.borrow_mut().insert(key, geo.clone());
+        geo
+    }
+
+    /// SVG path data `d`, drawn in a `vb`-unit square scaled onto `r` (square): filled, and
+    /// outlined with `stroke` (colour, width in DIPs).
+    pub fn path(&mut self, d: &'static str, vb: f32, r: Rect, fill: Color, stroke: Option<(Color, f32)>) {
+        let Some(geo) = self.geometry(d) else { return };
+        let k = r.w / vb;
+        unsafe {
+            let mut old = Matrix3x2::identity();
+            self.dc.GetTransform(&mut old);
+            self.dc.SetTransform(&(Matrix3x2::scale(k, k) * Matrix3x2::translation(r.x, r.y) * old));
+            if fill.a > 0.0 {
+                self.dc.FillGeometry(&geo, self.b(fill), None);
+            }
+            if let Some((c, w)) = stroke {
+                self.dc.DrawGeometry(&geo, self.b(c), w / k, None);
+            }
+            self.dc.SetTransform(&old);
+        }
+    }
+
+    /// A Phosphor icon `px` DIPs square, centred in `r` on whole pixels.
+    pub fn icon(&mut self, ico: crate::phosphor::Ico, w: crate::phosphor::Weight, r: Rect, px: f32, c: Color) {
+        if c.a <= 0.0 {
+            return;
+        }
+        let b = Rect::new(self.px(r.x + (r.w - px) / 2.0), self.px(r.y + (r.h - px) / 2.0), px, px);
+        self.path(ico.path(w), 256.0, b, c, None);
     }
 
     pub fn bitmap(&mut self, bmp: &ID2D1Bitmap, r: Rect, opacity: f32) {
