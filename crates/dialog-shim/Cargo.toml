@@ -1,0 +1,13 @@
+[package]
+name = "fm-dialog-shim"
+version.workspace = true
+edition.workspace = true
+description = "Option 2 gate: HKCU server for CLSID_FileOpenDialog that logs and hands back comdlg32's own factory."
+
+[lib]
+name = "fm_dialog_shim"
+# cdylib: the COM server. rlib: tests call the routing logic directly.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+windows = { workspace = true }

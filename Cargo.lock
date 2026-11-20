@@ -52,6 +52,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "fm-dialog-shim"
+version = "0.1.0"
+dependencies = [
+ "windows",
+]
+
+[[package]]
 name = "fm-dialogkit"
 version = "0.1.0"
 dependencies = [

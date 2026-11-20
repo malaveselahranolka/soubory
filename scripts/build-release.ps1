@@ -5,6 +5,7 @@
   dist\dialogkit\            fm-dialogkit.exe, fm_dialog_hook.dll
   dist\dialogkit\x86\        32-bit helper and hook (reaches 32-bit Open/Save dialogs)
   dist\app\                  fm.exe (when the app crate exists)
+  dist\shim\                 fm_dialog_shim.dll (Option 2 gate, 64-bit only)
 #>
 param([switch]$SkipX86)
 $ErrorActionPreference = 'Stop'
@@ -19,7 +20,7 @@ Push-Location $root
 # cargo writes progress to stderr; with 'Stop' Windows PowerShell would treat that as a failure.
 $ErrorActionPreference = 'Continue'
 try {
-    cargo build --release -p fm-dialogkit -p fm-dialog-hook
+    cargo build --release -p fm-dialogkit -p fm-dialog-hook -p fm-dialog-shim
     if ($LASTEXITCODE) { throw 'x64 build failed' }
     if (-not $SkipX86) {
         cargo build --release --target i686-pc-windows-msvc -p fm-dialogkit -p fm-dialog-hook
@@ -38,6 +39,9 @@ if (-not $SkipX86) {
     New-Item -ItemType Directory -Force "$dk\x86" | Out-Null
     Copy-Item "$target\i686-pc-windows-msvc\release\fm-dialogkit.exe", "$target\i686-pc-windows-msvc\release\fm_dialog_hook.dll" "$dk\x86" -Force
 }
+$shim = Join-Path $root 'dist\shim'
+New-Item -ItemType Directory -Force $shim | Out-Null
+Copy-Item "$target\release\fm_dialog_shim.dll" $shim -Force
 if (Test-Path "$target\release\fm.exe") {
     $app = Join-Path $root 'dist\app'
     New-Item -ItemType Directory -Force $app | Out-Null

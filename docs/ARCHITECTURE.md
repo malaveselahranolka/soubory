@@ -338,6 +338,11 @@ Preconditions:
   - [A] Sandbox only: after install, `InprocServer32` under the sandbox root points to an existing file in the temp `shim\` directory. After uninstall, nothing is left under the sandbox root. Installing dialogkit and the shim, then uninstalling dialogkit, leaves the shim DLL in place. The real-keys guard passes.
   - [M] Notepad, Chrome, Paint and Office are unchanged.
   - [M] The log shows the processes, methods, integrity level and AppContainer status, and whether legacy `GetOpenFileName` is routed through the shim.
+- Status (gate build, 2026-11-20): `crates/dialog-shim`, `scripts/install-shim.ps1`, `scripts/uninstall-shim.ps1`.
+  - The shim always returns comdlg32's own factory (from the HKLM `InprocServer32`, never through COM). It logs one line per `DllGetClassObject` to `%LOCALAPPDATA%\fm\shim.log`: process, interface, integrity level, AppContainer, the routing decision for `shim-allow.txt` (empty by default), and the modules on the call stack, which shows whether `comdlg32` (legacy `GetOpenFileName`) or the app itself created the dialog. No paths are logged.
+  - The per-method wrapper is deliberately not built: it is the risky part and only makes sense if the gate passes.
+  - [A] passed: routing unit test; `tests/harness.rs` loads a temp copy of the DLL with no registry and creates a real `IFileOpenDialog` through it, with the kill switch off (one log line) and on (none); `scripts/dev/test-shim.ps1` (21 checks: key written last and removed first, ThreadingModel copied from HKLM, a locked DLL set aside with its own RunOnce cleanup, another app's override neither replaced nor removed, dialogkit uninstall leaves the shim, real-keys guard).
+  - Gate run (user, own 64-bit PowerShell): `scripts\build-release.ps1 -SkipX86`, `scripts\install-shim.ps1`, open File → Open in Notepad, Chrome, Paint and Office, then read `%LOCALAPPDATA%\fm\shim.log` and `scripts\uninstall-shim.ps1`. Recovery: `reg delete "HKCU\Software\Classes\CLSID\{DC1C5A9C-E88A-4dde-A5A1-60F82A20AEF7}" /f`.
 
 **M10: Option 2 picker**
 - Scope: `fm.exe --pick`, built on the M6 and M7 views including the New menu, plus the `Show()` integration (§2).
