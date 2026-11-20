@@ -27,6 +27,9 @@ pub const WM_APP_SEARCH: u32 = WM_APP + 12;
 pub const WM_APP_INDEX: u32 = WM_APP + 13;
 pub const WM_APP_OPDONE: u32 = WM_APP + 14;
 pub const WM_APP_SHELLLIST: u32 = WM_APP + 15;
+pub const WM_APP_DRIVES: u32 = WM_APP + 16;
+/// Hub timer that coalesces a burst of drive notifications (one USB stick sends several).
+const TIMER_DRIVES: usize = 0xD1;
 const TIMER_FS: usize = 1;
 const TIMER_NOTE: usize = 2;
 const EDIT_SEARCH: usize = 100;
@@ -188,6 +191,7 @@ pub fn run(start: Loc) -> i32 {
             None,
         ) {
             HUB.with(|c| c.set(h.0 as isize));
+            watch_drives(h);
         }
 
         let Some(first) = open_window(start, None) else { return 1 };
@@ -285,6 +289,36 @@ pub fn open_window(loc: Loc, near: Option<HWND>) -> Option<HWND> {
     }
 }
 
+/// Drives and media come and go (USB sticks, mapped network drives, eject, a disc): every
+/// sidebar and "Tento počítač" follows, as in Explorer.
+fn watch_drives(hub: HWND) {
+    let Some(pc) = crate::shellns::ShellId::known(&FOLDERID_ComputerFolder) else { return };
+    let entry = SHChangeNotifyEntry { pidl: pc.as_ptr() as *mut windows::Win32::UI::Shell::Common::ITEMIDLIST, fRecursive: false.into() };
+    let events = SHCNE_DRIVEADD.0 | SHCNE_DRIVEREMOVED.0 | SHCNE_MEDIAINSERTED.0 | SHCNE_MEDIAREMOVED.0;
+    let reg = unsafe { SHChangeNotifyRegister(hub, SHCNRF_ShellLevel | SHCNRF_InterruptLevel, events as i32, WM_APP_DRIVES, 1, &entry) };
+    trace(if reg != 0 { "drive_watch" } else { "drive_watch_failed" });
+    // The registration lives as long as the process; keep its ID list alive with it.
+    std::mem::forget(pc);
+}
+
+fn drives_changed() {
+    crate::fsys::forget_volume_names();
+    let roots: Vec<PathBuf> = crate::fsys::volumes().into_iter().map(|v| v.root).collect();
+    for_each_app(|a| {
+        a.side_rows = crate::sidebar::build(&a.prefs.favorites);
+        // A tab on a drive that went away goes to "Tento počítač", like Explorer.
+        let gone = a.tab().loc.folder().and_then(|p| p.ancestors().last()).is_some_and(|root| {
+            root.to_string_lossy().len() == 3 && !roots.iter().any(|r| r.as_os_str().eq_ignore_ascii_case(root.as_os_str()))
+        });
+        if gone {
+            a.go(Loc::Computer);
+        } else if matches!(a.tab().loc, Loc::Computer) {
+            a.reload(None);
+        }
+        a.invalidate();
+    });
+}
+
 unsafe extern "system" fn hub_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
         match msg {
@@ -295,6 +329,15 @@ unsafe extern "system" fn hub_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
             }
             WM_APP_INDEX => {
                 crate::search::index_event(w, l);
+                Some(LRESULT(0))
+            }
+            WM_APP_DRIVES => {
+                SetTimer(Some(hwnd), TIMER_DRIVES, 300, None);
+                Some(LRESULT(0))
+            }
+            WM_TIMER if w.0 == TIMER_DRIVES => {
+                let _ = KillTimer(Some(hwnd), TIMER_DRIVES);
+                drives_changed();
                 Some(LRESULT(0))
             }
             WM_TIMER => {

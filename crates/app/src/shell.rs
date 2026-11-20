@@ -62,6 +62,8 @@ const C_DUPLICATE: u32 = OWN + 53;
 const C_NEW_FOLDER_WITH: u32 = OWN + 54;
 const C_SELECT_ALL: u32 = OWN + 55;
 const C_REFRESH: u32 = OWN + 56;
+const C_MAP_DRIVE: u32 = OWN + 57;
+const C_UNMAP_DRIVE: u32 = OWN + 58;
 
 thread_local! {
     /// Context menus that are being tracked; their owner-draw/init messages are forwarded.
@@ -631,6 +633,52 @@ fn view_items(app: &App, m: HMENU) {
 }
 
 /// Toolbar "⋯" menu.
+/// Explorer's address-bar chevron: the subfolders of crumb `k` (drives for "Tento počítač"),
+/// the one on the current path checked. Opens upward from the path bar.
+pub fn crumb_menu(app: &mut App, k: usize) {
+    let Some(loc) = crate::paint::crumb_path(app, k) else { return };
+    let here = crate::paint::crumb_path(app, k + 1);
+    let mut items: Vec<(String, Loc)> = match &loc {
+        Loc::Computer => fsys::volumes().into_iter().map(|v| (v.label, Loc::Folder(v.root))).collect(),
+        Loc::Folder(p) => subfolders(p, app.prefs.show_hidden),
+        _ => return,
+    };
+    if !matches!(loc, Loc::Computer) {
+        items.sort_by(|a, b| fsys::name_cmp(&a.0, &b.0));
+    }
+    // shortcut: a native menu stays usable up to about a thousand items; Explorer scrolls further.
+    items.truncate(1000);
+    let Some((x, y)) = crate::paint::chevron_anchor(app, k) else { return };
+    let pt = crate::win::to_screen(app, x, y);
+    unsafe {
+        let Ok(m) = CreatePopupMenu() else { return };
+        if items.is_empty() {
+            append(m, 0, "Žádné podsložky", false, false);
+        }
+        for (i, (name, l)) in items.iter().enumerate() {
+            append(m, i as u32 + 1, &name.replace('&', "&&"), here.as_ref() == Some(l), true);
+        }
+        let _ = SetForegroundWindow(app.hwnd);
+        let r = TrackPopupMenuEx(m, (TPM_RETURNCMD | TPM_BOTTOMALIGN | TPM_LEFTALIGN).0, pt.x, pt.y, app.hwnd, None);
+        let _ = PostMessageW(Some(app.hwnd), WM_NULL, WPARAM(0), LPARAM(0));
+        let _ = DestroyMenu(m);
+        if let Some((_, l)) = (r.0 as usize).checked_sub(1).and_then(|i| items.get(i)) {
+            app.go(l.clone());
+        }
+    }
+}
+
+/// Subfolders by name, without opening any of them (no OneDrive hydration).
+fn subfolders(dir: &Path, hidden: bool) -> Vec<(String, Loc)> {
+    use std::os::windows::fs::MetadataExt;
+    let Ok(rd) = std::fs::read_dir(dir) else { return Vec::new() };
+    rd.flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .filter(|e| hidden || e.metadata().is_ok_and(|m| m.file_attributes() & (FILE_ATTRIBUTE_HIDDEN.0 | FILE_ATTRIBUTE_SYSTEM.0) == 0))
+        .map(|e| (e.file_name().to_string_lossy().into_owned(), Loc::Folder(e.path())))
+        .collect()
+}
+
 pub fn more_menu(app: &mut App) {
     let r = app.lay.more;
     let pt = crate::win::to_screen(app, r.x, r.b() + 4.0);
@@ -677,6 +725,9 @@ fn more_menu_at(app: &mut App, pt: POINT) {
         append(m, C_GOTO, "Přejít na složku…\tCtrl+L", false, true);
         append(m, C_TERMINAL, "Otevřít v Terminálu", false, in_folder);
         append(m, C_PROPS, "Vlastnosti složky", false, in_folder);
+        sep(m);
+        append(m, C_MAP_DRIVE, "Připojit síťovou jednotku…", false, true);
+        append(m, C_UNMAP_DRIVE, "Odpojit síťovou jednotku…", false, true);
         let cmd = track(app, m, pt);
         let _ = DestroyMenu(m);
         own_command(app, cmd);
@@ -715,6 +766,13 @@ fn own_command(app: &mut App, cmd: u32) {
             app.invalidate();
         }
         C_GOTO => crate::win::go_to_folder(app),
+        // Windows' own dialogs; the drive watcher updates every sidebar when a drive appears.
+        C_MAP_DRIVE => unsafe {
+            let _ = windows::Win32::NetworkManagement::WNet::WNetConnectionDialog(app.hwnd, windows::Win32::NetworkManagement::WNet::RESOURCETYPE_DISK.0);
+        },
+        C_UNMAP_DRIVE => unsafe {
+            let _ = windows::Win32::NetworkManagement::WNet::WNetDisconnectDialog(Some(app.hwnd), windows::Win32::NetworkManagement::WNet::RESOURCETYPE_DISK.0);
+        },
         C_REFRESH => {
             app.reload(None);
             app.invalidate();
@@ -1416,4 +1474,30 @@ pub fn created_since(dir: &Path, before: &HashSet<String>) -> Option<String> {
         .filter(|e| !before.contains(&e.name.to_lowercase()))
         .max_by_key(|e| e.created)
         .map(|e| e.name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subfolders_lists_only_visible_folders() {
+        let d = std::env::temp_dir().join(format!("fm-subfolders-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        for f in ["Beta", "alfa", "Skrytá"] {
+            std::fs::create_dir_all(d.join(f)).unwrap();
+        }
+        std::fs::write(d.join("soubor.txt"), "x").unwrap();
+        let w = wide(&d.join("Skrytá").to_string_lossy());
+        unsafe { SetFileAttributesW(PCWSTR(w.as_ptr()), FILE_ATTRIBUTE_HIDDEN).unwrap() };
+        let names = |hidden| {
+            let mut v: Vec<String> = subfolders(&d, hidden).into_iter().map(|(n, _)| n).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(names(false), ["Beta", "alfa"]);
+        assert_eq!(names(true), ["Beta", "Skrytá", "alfa"]);
+        assert!(subfolders(&d.join("chybí"), true).is_empty());
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }

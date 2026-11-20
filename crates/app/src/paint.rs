@@ -1080,11 +1080,26 @@ pub fn status_hit(app: &App, x: f32, y: f32) -> Hit {
     if app.tab().view == View::Icons && slider_rect(app).inset(-4.0, 0.0).contains(x, y) {
         return Hit::IconSlider;
     }
-    crumb_layout(app)
-        .iter()
-        .position(|(r, ..)| r.contains(x, y))
-        .map(Hit::Crumb)
-        .unwrap_or(Hit::None)
+    let crumbs = crumb_layout(app);
+    if let Some(k) = crumbs.iter().position(|(r, ..)| r.contains(x, y)) {
+        return Hit::Crumb(k);
+    }
+    (0..crumbs.len().saturating_sub(1))
+        .find(|&k| chevron_rect(crumbs[k].0).contains(x, y))
+        .map_or(Hit::None, Hit::CrumbMenu)
+}
+
+/// The chevron after a crumb; it opens the folder's subfolders.
+pub fn chevron_rect(crumb: Rect) -> Rect {
+    Rect::new(crumb.r(), crumb.y, 14.0, crumb.h)
+}
+
+/// Screen point under chevron `k` for a menu that opens upward from the path bar.
+pub fn chevron_anchor(app: &App, k: usize) -> Option<(f32, f32)> {
+    crumb_layout(app).get(k).map(|(r, ..)| {
+        let c = chevron_rect(*r);
+        (c.x, c.y)
+    })
 }
 
 fn status(app: &App, c: &mut Canvas, t: &Theme) {
@@ -1104,7 +1119,11 @@ fn status(app: &App, c: &mut Canvas, t: &Theme) {
             Align::Start,
         );
         if k < last {
-            c.glyph(g::RIGHT, Rect::new(r.r(), r.y, 14.0, r.h), 8, t.ink3);
+            let ch = chevron_rect(*r);
+            if app.hover == Hit::CrumbMenu(k) {
+                c.round(ch, 4.0, t.hover);
+            }
+            c.glyph(g::RIGHT, ch, 8, t.ink3);
         }
     }
     let tab = app.tab();

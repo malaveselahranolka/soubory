@@ -266,6 +266,11 @@ pub fn kind_name(e: &Entry) -> String {
 }
 
 /// Explorer's display name for a folder ("Dokumenty" for ...\Documents), cached.
+/// Drive labels change when media changes (another USB stick on the same letter).
+pub fn forget_volume_names() {
+    DISPLAY.with(|m| m.borrow_mut().retain(|p, _| p.parent().is_some()));
+}
+
 pub fn display_name(p: &Path) -> String {
     if let Some(n) = DISPLAY.with(|m| m.borrow().get(p).cloned()) {
         return n;

@@ -152,6 +152,8 @@ pub enum Hit {
     Row(usize),
     Empty,
     Crumb(usize),
+    /// The chevron after crumb k: a menu of that folder's subfolders (Explorer's address bar).
+    CrumbMenu(usize),
     IconSlider,
     /// Column view: (column index, row) outside the active column.
     ColRow(usize, usize),
@@ -1026,6 +1028,7 @@ impl App {
                     self.go(p);
                 }
             }
+            Hit::CrumbMenu(k) => crate::shell::crumb_menu(self, k),
             _ => {}
         }
         self.invalidate();
