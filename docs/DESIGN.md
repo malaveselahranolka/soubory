@@ -12,14 +12,17 @@ Brief: "sleek, modern, mainly like macOS Finder, with a Windows touch". Finder g
 ┌──────────────── Mica (chrome) ─────────────────────────────────────── _ □ × ┐
 │ [▤] [‹][›]  Dokumenty                 [▦ ☰ ▥ ▭] [⋯]   [⌕ Hledat        ]  │  52 px unified toolbar
 │┌ sidebar (Mica) ┐╭─────────────── content card (opaque) ───────────────────╮│
-││ Oblíbené       ││ Název                  Změněno         Velikost  Druh   ││
-││ ▌◷ Nedávné     ││ ▸ 📁 Faktury           Dnes 9:41          —     Složka   ││
-││  ⌂ Domů        ││ ███ 📄 Smlouva.pdf ███ Včera 18:02    1,2 MB  PDF       ││  selection = accent capsule
-││  ▭ Plocha      ││                                                          ││
-││ Umístění       ││                                                          ││
-││  ◫ Místní (C:) ││                                                          ││
-││ Štítky         │├──────────────────────────────────────────────────────────┤│
-││  ● Červená     ││ C: › Uživatelé › Dokumenty            12 položek, 34 GB volných ││  28 px path + status
+││ ◷ Nedávné      ││ Název                  Změněno         Velikost  Druh   ││
+││ ⌂ adame        ││ ▸ 📁 Faktury           Dnes 9:41          —     Složka   ││
+││░▤ Dokumenty░░░░││ ███ 📄 Smlouva.pdf ███ Včera 18:02    1,2 MB  PDF       ││  selection = accent capsule
+││ ───────────    ││                                                          ││
+││ ☁ OneDrive     ││                                                          ││
+││ ▭ Místní (C:)  ││                                                          ││
+││   ▬▬▬▬▬▬▬▬──   ││                                                          ││
+││ ───────────    ││                                                          ││
+││ ● ● ● ● ● ● ●  │├──────────────────────────────────────────────────────────┤│
+││ ───────────    ││ C: › Uživatelé › Dokumenty            12 položek, 34 GB volných ││  28 px path + status
+││ 🗑 Koš          ││                                                          ││
 │└────────────────┘╰──────────────────────────────────────────────────────────╯│
 ```
 - L-shaped chrome on Mica (toolbar + sidebar); content sits on an opaque card with an 8 px top-left radius and a hairline edge — the Windows 11 Explorer material, Finder's proportions.
@@ -27,7 +30,9 @@ Brief: "sleek, modern, mainly like macOS Finder, with a Windows touch". Finder g
 - Tabs appear between toolbar and card only with ≥2 tabs (Finder).
 
 ## Signature
-Finder's inset rounded selection capsule, combined with the Fluent accent indicator: the sidebar's selected row is a translucent pill with a 3×16 px accent bar at its leading edge; content rows select as a solid accent capsule with white text (grey when the window is inactive). Colour tags are Finder's seven colours as 8 px dots.
+Colour moves from the chrome into the content ("Vlastní tvář", chosen 2026-11-20). The sidebar is neutral: Phosphor bold icons in `ink2`, no section headers, three groups (places · storage · tags) set apart by hairline dividers, Koš at the bottom. The selected place is a quiet accent tint (14 % light, 20 % dark, radius 6) with a semibold label and its icon switched to Phosphor fill in `accent_glyph`. Drives show how full they are as a 3 px bar (accent; #D13438 from 90 %). Tags are a row of 14 px dots (24 px targets, name on hover). Content rows select as a solid accent capsule with white text (grey when the window is inactive); small type glyphs turn white on it.
+
+**File icons (fm draws them):** a type-coloured Phosphor bold glyph at ≤ 24 px; above that a page (96-unit template, 10 radius, folded corner) tinted with the type colour (fill 14 % light / 22 % dark, outline 34 %, fold 40 %) carrying the type glyph and, from 72 px, the extension. Folders are amber (light #DB9A26 back / #F4B740 front, dark #C08420 / #E3A93A); the user's known folders (home, Plocha, Dokumenty, Stažené, Obrázky, Hudba, Videa, OneDrive) carry their sidebar glyph pressed into the front. The shell keeps what only it knows: programs and shortcuts (exe, lnk, ico, url, msi…), folders with their own icon (desktop.ini, read-only or system), drives, virtual places other than Koš, and real thumbnails (photos, videos, documents with a preview).
 
 ## Tokens (`crates/app/src/theme.rs` is the source of truth)
 | Token | Light | Dark | Why |
@@ -46,12 +51,13 @@ Finder's inset rounded selection capsule, combined with the Fluent accent indica
 | `sel_inactive` | #DCDCDC | #3A3A3A | Finder's unfocused selection |
 | `field` search/rename | rgba(0,0,0,.05) + edge | rgba(255,255,255,.06) + edge | inset, darker than surround |
 | tags | #FF453A #FF9F0A #FFD60A #32D74B #0A84FF #BF5AF2 #8E8E93 | same | Finder's tag colours |
+| type colours (`fileicons.rs`) | text #5B6B82 · pdf #D93A40 · doc #2F6FED · sheet #1E8E4E · slides #D9591E · archive #A86D14 · image #0B8584 · audio #9B47EC · video #D63C7C · code/data #6E56CF · disk #475569 · other #7A808A | each mixed 22 % toward white | ≥ 3:1 on the card in both modes (tested) |
 
 High contrast: system colours (`COLOR_WINDOW`, `COLOR_WINDOWTEXT`, `COLOR_HIGHLIGHT`, `COLOR_HIGHLIGHTTEXT`, `COLOR_BTNFACE`, `COLOR_GRAYTEXT`), no Mica, 2 px focus rings.
 
-**Type:** Segoe UI Variable (Text ≤ 14 px, Display above), fallback Segoe UI; Segoe Fluent Icons for glyphs; Cascadia Mono for text previews. Scale (≈1.2): 11 caption · 12 small · 13 body · 15 title · 20 heading · 28 display. Weights 400 / 600 only. Grayscale antialiasing everywhere (Finder-like, works on Mica).
+**Type:** Segoe UI Variable (Text ≤ 14 px, Display above), fallback Segoe UI; Phosphor Icons 2.1.1 (MIT, bold; fill for the selected place) for every glyph except the caption buttons, which stay Segoe Fluent; Cascadia Mono for text previews. Scale (≈1.2): 11 caption · 12 small · 13 body · 14 sidebar · 15 title · 20 heading · 28 display; page labels 12/96 of the icon, semibold. Weights 400 / 600 only. Grayscale antialiasing everywhere (Finder-like, works on Mica).
 
-**Metrics (at 100 %):** spacing base 4. Toolbar 52. Sidebar 208 (180–320, resizable), rows 28, pill radius 6, inset 8. List rows 26, icon 16, capsule inset 8, radius 6. Column header 28. Path/status bar 28. Icon view tiles 64/96/128 px icons. Card radius 8. Buttons 32×28, radius 6. Hit areas ≥ 28 × 28.
+**Metrics (at 100 %):** spacing base 4. Toolbar 52. Sidebar 208 (160–320, resizable), rows 32 (drives 40), icons 18, text 14, dividers 17 (1 px line, 16 px side margins), pill radius 6, inset 8. Toolbar glyphs 16, search 14. List rows 26, icon 16, capsule inset 8, radius 6. Column header 28. Path/status bar 28. Icon view tiles 64/96/128 px icons. Card radius 8. Buttons 32×28, radius 6. Hit areas ≥ 28 × 28.
 
 **Depth:** borders-only plus tonal surfaces (Windows 11). No drop shadows inside the window; DWM supplies window and Quick Look shadows.
 

@@ -4,7 +4,7 @@
 .DESCRIPTION
   dist\dialogkit\            fm-dialogkit.exe, fm_dialog_hook.dll
   dist\dialogkit\x86\        32-bit helper and hook (reaches 32-bit Open/Save dialogs)
-  dist\app\                  fm.exe (when the app crate exists)
+  dist\app\                  fm.exe and THIRD-PARTY-NOTICES.txt (when the app crate exists)
   dist\shim\                 fm_dialog_shim.dll (Option 2 gate, 64-bit only)
 #>
 param([switch]$SkipX86)
@@ -45,6 +45,6 @@ Copy-Item "$target\release\fm_dialog_shim.dll" $shim -Force
 if (Test-Path "$target\release\fm.exe") {
     $app = Join-Path $root 'dist\app'
     New-Item -ItemType Directory -Force $app | Out-Null
-    Copy-Item "$target\release\fm.exe" $app -Force
+    Copy-Item "$target\release\fm.exe", "$root\THIRD-PARTY-NOTICES.txt" $app -Force
 }
 Get-ChildItem -Recurse (Join-Path $root 'dist') -File | ForEach-Object { '{0,10:N0}  {1}' -f $_.Length, $_.FullName.Substring($root.Length + 1) }

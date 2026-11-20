@@ -46,6 +46,7 @@ Nothing here has been tried by hand in daily use yet; see "Not verified" at the 
 | Quick Look (Space): images, text, PDF/Office via preview handlers | 🔶 |
 | Get Info (Ctrl+I) | 🔶 (Windows Properties) |
 | Colour tags, tag dots, tag sidebar, tag by dropping on a tag | ✅ |
+| fm's own icons (Phosphor, MIT): type-coloured glyphs and tinted pages for every ordinary file type, amber folders with emblems on known folders; the shell keeps programs, shortcuts, custom folders, drives and thumbnails. Sidebar with drive fill bars, tag dots, Koš at the bottom | ✅ (unit tests, offscreen renders at 100/125/150 % in light, dark, high contrast; UIA test; sidebar click and tag drop through the dev hooks) |
 | Recents | 🔶 |
 | Go to Folder (Ctrl+Shift+G) | 🔶 |
 | Spring-loaded folders while dragging | ✅ (harness) |
