@@ -5,6 +5,7 @@
 //! (visual tests; see `render.rs`).
 
 mod app;
+mod batch;
 mod droptarget;
 mod fsys;
 mod geom;

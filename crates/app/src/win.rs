@@ -32,12 +32,16 @@ const TIMER_NOTE: usize = 2;
 const EDIT_SEARCH: usize = 100;
 const EDIT_RENAME: usize = 101;
 const EDIT_PATH: usize = 102;
+const EDIT_BATCH_A: usize = 103;
+const EDIT_BATCH_B: usize = 104;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum EditKind {
     Search,
     Rename,
     Path,
+    BatchA,
+    BatchB,
 }
 
 struct Edit {
@@ -405,6 +409,28 @@ fn dev_keys(app: &mut App, script: &str, out: Option<String>) {
             if let Some(l) = loc {
                 app.go(l);
             }
+        } else if let Some(spec) = step.strip_prefix("batch:") {
+            // batch:Mode:a:b — opens the sheet on the selection and fills it.
+            let mut it = spec.splitn(3, ':');
+            let mode = match it.next() {
+                Some("Add") => crate::batch::Mode::Add,
+                Some("Format") => crate::batch::Mode::Format,
+                _ => crate::batch::Mode::Replace,
+            };
+            if app.batch.is_none() {
+                crate::batch::open(app);
+            }
+            crate::batch::set_mode(app, mode);
+            if let Some(b) = app.batch.as_mut() {
+                b.a = it.next().unwrap_or("").to_string();
+                b.b = it.next().unwrap_or("").to_string();
+            }
+            batch_fields(app);
+            app.invalidate();
+        } else if step == "batchok" {
+            crate::batch::apply(app);
+        } else if step == "selall" {
+            app.tab_mut().sel.select_all();
         } else if step == "dumpshell" {
             // Counts only, plus items that came from the scratch folder: never the user's own.
             let t = app.tab();
@@ -734,6 +760,8 @@ fn ui_font(app: &App, px: f32) -> HFONT {
 fn edit_rect(app: &App, kind: EditKind, index: usize) -> crate::geom::Rect {
     use crate::geom::Rect;
     match kind {
+        EditKind::BatchA => crate::batch::edit_rect(app, 0),
+        EditKind::BatchB => crate::batch::edit_rect(app, 1),
         EditKind::Search => app
             .lay
             .search
@@ -771,12 +799,15 @@ fn create_edit(
     let (bg, fg) = match kind {
         EditKind::Search | EditKind::Path => (paint::over(t.field, t.chrome), t.ink),
         EditKind::Rename => (t.card, t.ink),
+        EditKind::BatchA | EditKind::BatchB => (paint::over(t.field, t.card), t.ink),
     };
     let r = edit_rect(app, kind, index);
     let id = match kind {
         EditKind::Search => EDIT_SEARCH,
         EditKind::Rename => EDIT_RENAME,
         EditKind::Path => EDIT_PATH,
+        EditKind::BatchA => EDIT_BATCH_A,
+        EditKind::BatchB => EDIT_BATCH_B,
     };
     let w = wide(text);
     unsafe {
@@ -893,6 +924,25 @@ fn position_edits(app: &App) {
             );
         }
     }
+}
+
+/// (Re)creates the batch rename sheet's fields for its current mode, or removes them.
+pub fn batch_fields(app: &mut App) {
+    destroy_edit(app.hwnd, EditKind::BatchA);
+    destroy_edit(app.hwnd, EditKind::BatchB);
+    let Some(b) = &app.batch else {
+        unsafe {
+            let _ = SetFocus(Some(app.hwnd));
+        }
+        return;
+    };
+    let (a, bt, mode) = (b.a.clone(), b.b.clone(), b.mode);
+    if crate::batch::has_b(mode) {
+        let n = bt.encode_utf16().count() as i32;
+        create_edit(app, EditKind::BatchB, 0, &bt, (n, n));
+    }
+    let n = a.encode_utf16().count() as i32;
+    create_edit(app, EditKind::BatchA, 0, &a, (0, n));
 }
 
 pub fn search_active(app: &App) -> bool {
@@ -1049,6 +1099,10 @@ fn expand_env(s: &str) -> String {
 }
 
 pub fn begin_rename(app: &mut App) {
+    if app.tab().sel.count() > 1 {
+        crate::batch::open(app);
+        return;
+    }
     let t = app.tab();
     if !matches!(t.loc, Loc::Folder(_) | Loc::Search { .. } | Loc::Recents) {
         return;
@@ -1168,6 +1222,29 @@ unsafe extern "system" fn edit_proc(
                         return LRESULT(0);
                     }
                     if is_char && (w.0 == 13 || w.0 == 27) {
+                        return LRESULT(0);
+                    }
+                }
+                EDIT_BATCH_A | EDIT_BATCH_B => {
+                    if !is_char && vk == VK_RETURN {
+                        crate::batch::apply(app);
+                        return LRESULT(0);
+                    }
+                    if !is_char && vk == VK_ESCAPE {
+                        crate::batch::close(app);
+                        return LRESULT(0);
+                    }
+                    if !is_char && vk == VK_TAB {
+                        let other = if id == EDIT_BATCH_A { EditKind::BatchB } else { EditKind::BatchA };
+                        if let Some((o, _)) = edit_of(app.hwnd, other) {
+                            unsafe {
+                                let _ = SetFocus(Some(o));
+                                SendMessageW(o, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1)));
+                            }
+                        }
+                        return LRESULT(0);
+                    }
+                    if is_char && (w.0 == 13 || w.0 == 27 || w.0 == 9) {
                         return LRESULT(0);
                     }
                 }
@@ -1550,6 +1627,16 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
             WM_COMMAND => {
                 let code = ((wparam.0 >> 16) & 0xFFFF) as u32;
                 let id = wparam.0 & 0xFFFF;
+                if (id == EDIT_BATCH_A || id == EDIT_BATCH_B) && code == EN_CHANGE {
+                    let kind = if id == EDIT_BATCH_A { EditKind::BatchA } else { EditKind::BatchB };
+                    if let Some((h, _)) = edit_of(app.hwnd, kind) {
+                        let t = edit_text(h);
+                        if let Some(b) = app.batch.as_mut() {
+                            if id == EDIT_BATCH_A { b.a = t } else { b.b = t }
+                        }
+                        app.invalidate();
+                    }
+                }
                 if id == EDIT_SEARCH && code == EN_CHANGE {
                     if let Some((h, _)) = edit_of(app.hwnd, EditKind::Search) {
                         let t = edit_text(h);
@@ -1632,7 +1719,7 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
             WM_DESTROY => {
                 crate::droptarget::revoke(hwnd);
                 stop_watch(hwnd);
-                for k in [EditKind::Search, EditKind::Rename, EditKind::Path] {
+                for k in [EditKind::Search, EditKind::Rename, EditKind::Path, EditKind::BatchA, EditKind::BatchB] {
                     destroy_edit(hwnd, k);
                 }
                 crate::search::forget(hwnd);

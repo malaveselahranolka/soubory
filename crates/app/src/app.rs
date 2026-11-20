@@ -159,6 +159,8 @@ pub enum Hit {
     ColEmpty(usize),
     /// Search scope bar: 0 = the whole computer, 1 = the folder the search started in.
     Scope(usize),
+    /// Batch rename sheet controls (see batch.rs codes).
+    Batch(u8),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -218,6 +220,8 @@ pub struct App {
     pub drop_hl: Option<(Rect, bool)>,
     /// Where the tab was before typing into search (Esc goes back there).
     pub search_prev: Option<Loc>,
+    /// Open "Rename N items" sheet.
+    pub batch: Option<crate::batch::Batch>,
     /// Scope pill rects from the last frame, for hit testing.
     pub scope_rects: std::cell::RefCell<Vec<Rect>>,
     pub pressed: Hit,
@@ -268,6 +272,7 @@ impl App {
             hover: Hit::None,
             drop_hl: None,
             search_prev: None,
+            batch: None,
             scope_rects: std::cell::RefCell::new(Vec::new()),
             pressed: Hit::None,
             focus: Focus::Content,
@@ -751,6 +756,14 @@ impl App {
                 return Hit::Caption([Cap::Min, Cap::Max, Cap::Close][k]);
             }
         }
+        if self.batch.is_some() {
+            // The sheet is modal for the window, as in Finder; the title bar still moves it.
+            let h = crate::batch::hit(self, x, y);
+            if h != Hit::None {
+                return h;
+            }
+            return if l.toolbar.contains(x, y) { Hit::Drag } else { Hit::None };
+        }
         if l.toolbar.contains(x, y) {
             if l.sidebar_btn.contains(x, y) {
                 return Hit::SidebarBtn;
@@ -999,6 +1012,7 @@ impl App {
                 Col::Kind => self.set_sort(SortKey::Kind),
                 Col::Location => {}
             },
+            Hit::Batch(code) => crate::batch::click(self, code),
             Hit::Scope(k) => {
                 let folder = self.search_prev.as_ref().and_then(|l| l.folder()).map(Path::to_path_buf);
                 if let Loc::Search { scope, .. } = &mut self.tab_mut().loc {
@@ -1098,6 +1112,14 @@ impl App {
     // ---- keyboard -----------------------------------------------------------------------------
 
     pub fn key(&mut self, vk: VIRTUAL_KEY, ctrl: bool, shift: bool, alt: bool) -> bool {
+        if self.batch.is_some() {
+            match vk {
+                VK_ESCAPE => crate::batch::close(self),
+                VK_RETURN => crate::batch::apply(self),
+                _ => {}
+            }
+            return true;
+        }
         self.kb = true;
         let n = self.tab().entries.len();
         let view = self.tab().view;
