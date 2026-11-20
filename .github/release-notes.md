@@ -4,7 +4,7 @@ Testovací verze Souborů pro 64bitová Windows 10 a 11.
 
 **Než začnete**
 - Instalátor zatím není digitálně podepsaný. Windows SmartScreen proto může ukázat „Systém Windows ochránil váš počítač“: klikněte na **Další informace** a pak **Přesto spustit**.
-- Zkušební doplněk (tlačítko „Nový“) instalují skryté skripty Windows PowerShellu, jen ve vašem účtu. Některé antiviry nebo firemní zásady je mohou zablokovat; Soubory se pak nainstalují bez tohoto doplňku.
+- Zkušební doplňky (okno Souborů místo dialogu Otevřít v Claudovi a Chrome, tlačítko „Nový“) instalují skryté skripty Windows PowerShellu, jen ve vašem účtu. Některé antiviry nebo firemní zásady je mohou zablokovat; Soubory se pak nainstalují bez nich. Okno Otevřít vrátíte Windows tak, že instalátor spustíte znovu a volbu zrušíte.
 - Je to testovací verze. Chyby prosím hlaste v [Issues](https://github.com/malaveselahranolka/soubory/issues).
 
 **Zpět na Průzkumník souborů:** odinstalujte Soubory v Nastavení › Aplikace › Nainstalované aplikace, nebo spusťte instalátor znovu a volbu „Otevírat složky … v Souborech“ zrušte.

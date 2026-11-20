@@ -2,7 +2,7 @@
 //!
 //! `scripts/install-shim.ps1` registers it in HKCU as the in-process server of
 //! CLSID_FileOpenDialog. Outside the allowlist ([`route`]) every call hands back **comdlg32's own
-//! class factory**, untouched. An allowlisted host (Claude.exe, plus `shim-allow.txt`) gets a
+//! class factory**, untouched. An allowlisted host (Claude.exe, chrome.exe, plus `shim-allow.txt`) gets a
 //! factory whose dialogs forward every call to the real one and, in `Show()`, open fm's picker
 //! instead when the dialog asks nothing the picker cannot do (`wrap.rs`, `pick.rs`).
 //!
@@ -21,9 +21,9 @@ pub mod pick;
 #[cfg(windows)]
 mod wrap;
 
-/// Hosts that get the picker without being listed in `shim-allow.txt`: the M9 gate saw Claude's
-/// dialog come through the override; nothing is known about other apps yet.
-pub const DEFAULT_ALLOW: &[&str] = &["Claude.exe"];
+/// Hosts that get the picker without being listed in `shim-allow.txt`: the ones tried on the
+/// user's machine (2026-11-20). Others pass until someone tries them.
+pub const DEFAULT_ALLOW: &[&str] = &["Claude.exe", "chrome.exe"];
 
 /// Where a host's Open dialogs go.
 #[derive(Debug, PartialEq, Eq)]
@@ -419,15 +419,16 @@ mod tests {
         assert_eq!(allow, ["Notepad.exe", "mspaint.exe"]);
         assert_eq!(route(&host("notepad.exe"), &allow), Route::Picker);
         assert_eq!(
-            route(&host("chrome.exe"), &allow),
+            route(&host("msedge.exe"), &allow),
             Route::Pass("not allowlisted")
         );
         assert_eq!(
             route(&host("notepad.exe"), &[]),
             Route::Pass("not allowlisted")
         );
-        // Claude.exe needs no line in shim-allow.txt.
+        // Claude.exe and chrome.exe need no line in shim-allow.txt.
         assert_eq!(route(&host("claude.exe"), &[]), Route::Picker);
+        assert_eq!(route(&host("chrome.exe"), &[]), Route::Picker);
         assert_eq!(
             route(&Host { elevated: true, ..host("Claude.exe") }, &[]),
             Route::Pass("elevated")

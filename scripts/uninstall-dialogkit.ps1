@@ -24,7 +24,7 @@ Stop-FromDir $InstallDir 'fm-dialogkit'
 
 if (-not (Test-Path -LiteralPath $InstallDir)) { Write-Host 'Nic k odinstalaci.'; return }
 if (Remove-InstallDir $InstallDir) {
-    Clear-DelCleanup $RegRoot
+    Clear-DelCleanup $RegRoot $InstallDir
     Write-Host 'Odinstalováno.'
 } else {
     Register-DelCleanup $RegRoot $InstallDir -WholeDir

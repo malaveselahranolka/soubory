@@ -168,6 +168,13 @@ function Register-DelCleanup([string]$root, [string]$dir, [switch]$WholeDir) {
     Set-ItemProperty -Path $runOnce -Name $CleanupName -Value $cmd
 }
 
-function Clear-DelCleanup([string]$root) {
-    Remove-ItemProperty -Path (Join-Path $root 'RunOnce') -Name $CleanupName -ErrorAction SilentlyContinue
+# With $dir only the cleanup registered for that folder goes: the installer moves an old install's
+# shim or dialogkit aside (its cleanup pending) and installs the new folder right after.
+function Clear-DelCleanup([string]$root, [string]$dir) {
+    $runOnce = Join-Path $root 'RunOnce'
+    if ($dir) {
+        $cmd = (Get-ItemProperty -Path $runOnce -Name $CleanupName -ErrorAction SilentlyContinue).$CleanupName
+        if (-not $cmd -or ($cmd.IndexOf("`"$dir`"", [StringComparison]::OrdinalIgnoreCase) -lt 0 -and $cmd.IndexOf("`"$dir\", [StringComparison]::OrdinalIgnoreCase) -lt 0)) { return }
+    }
+    Remove-ItemProperty -Path $runOnce -Name $CleanupName -ErrorAction SilentlyContinue
 }

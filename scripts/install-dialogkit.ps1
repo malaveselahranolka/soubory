@@ -44,7 +44,7 @@ Set-ItemProperty -Path $run -Name $RunName -Value "`"$exe`""
 # pending whole-directory cleanup from an earlier uninstall.
 Get-ChildItem $InstallDir -Recurse -File -Filter '*.del' | ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
 $stale = @(Get-ChildItem $InstallDir -Recurse -File | Where-Object { $_.Name -like '*.del' })
-if ($locked -or $stale.Count) { Register-DelCleanup $RegRoot $InstallDir } else { Clear-DelCleanup $RegRoot }
+if ($locked -or $stale.Count) { Register-DelCleanup $RegRoot $InstallDir } else { Clear-DelCleanup $RegRoot $InstallDir }
 
 # A neutral working folder, as at sign-in; an fm it starts later inherits it.
 if (-not $NoStart) { Start-Process -FilePath $exe -WorkingDirectory "$env:SystemRoot\System32" }

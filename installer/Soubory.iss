@@ -10,6 +10,8 @@
 ;               bez PowerShellu, takže ho antivirus ani zásady blokující skripty nezastaví
 ;   dialogkit   PowerShell skripty ze scripts\, nainstalované do {app}\setup:
 ;               install-dialogkit.ps1 / uninstall-dialogkit.ps1 (do {app}\dialogkit)
+;   shim        okno Souborů místo dialogu Otevřít (Claude, Chrome), stejně přes skripty:
+;               install-shim.ps1 / uninstall-shim.ps1 (do {app}\shim)
 ; Každá instalace i aktualizace nastaví přesně to, co je zaškrtnuté. Odinstalace vrátí Průzkumník
 ; a pak ověří, že na tento fm.exe už nevede žádné sloveso (když fm.exe nejde spustit, smaže je sama).
 
@@ -80,7 +82,8 @@ FinishedHeadingLabel=Soubory jsou nainstalované
 [CustomMessages]
 GroupDefault=Výchozí správce souborů:
 TaskDefault=Otevírat složky, disky a Win+E v Souborech místo Průzkumníka souborů
-GroupAddon=Doplněk (zkušební):
+GroupAddon=Doplňky (zkušební):
+TaskShim=Okno Otevřít v Claudovi a Chrome: vybírat soubory v Souborech
 TaskDialogkit=Tlačítko „Nový“ v oknech Otevřít a Uložit ostatních aplikací; složky, které jiné aplikace otevírají v Průzkumníkovi (třeba „Zobrazit ve složce“), otevírat v Souborech
 OpenNow=Otevřít Soubory
 Elevated=Instalátor běží s právy správce. Soubory se instalují jen pro váš účet a jako správce běžet nesmějí.%n%nZavřete ho a spusťte znovu obyčejně: dvojklikem, bez „Spustit jako správce“.
@@ -90,6 +93,8 @@ DoDefault=nastavit Soubory jako výchozí pro složky
 DoRestore=vrátit složky Průzkumníku souborů
 DoKit=nainstalovat tlačítko „Nový“
 DoUnkit=odebrat tlačítko „Nový“
+DoShim=zapnout okno Souborů v dialogu Otevřít
+DoUnshim=vypnout okno Souborů v dialogu Otevřít
 FinishedDefault=Soubory najdete v nabídce Start. Složky, disky a Win+E se teď otevírají v Souborech.%n%nPrůzkumník souborů vrátíte tak, že Soubory odinstalujete (Nastavení › Aplikace), nebo instalátor spustíte znovu a volbu zrušíte.
 FinishedPlain=Soubory najdete v nabídce Start. Složky se dál otevírají v Průzkumníkovi souborů; změníte to tak, že instalátor spustíte znovu.
 UninstBusy=Soubory ještě dokončují kopírování nebo přesun, nebo mají otevřený dialog. Dokončete nebo zrušte operaci, případně Soubory zavřete, a odinstalaci spusťte znovu.
@@ -97,6 +102,7 @@ UninstData=Smazat také nastavení, štítky a vyhledávací index Souborů?%n%n
 
 [Tasks]
 Name: "defaultfm"; Description: "{cm:TaskDefault}"; GroupDescription: "{cm:GroupDefault}"
+Name: "shim"; Description: "{cm:TaskShim}"; GroupDescription: "{cm:GroupAddon}"
 Name: "dialogkit"; Description: "{cm:TaskDialogkit}"; GroupDescription: "{cm:GroupAddon}"; Flags: unchecked
 
 [Files]
@@ -109,6 +115,10 @@ Source: "..\scripts\lib\install-common.ps1"; DestDir: "{app}\setup\lib"; Flags: 
 ; install-dialogkit.ps1 copies these on to {app}\dialogkit; a hook DLL still loaded in some open
 ; dialog is set aside there instead of failing the install.
 Source: "..\dist\dialogkit\*"; DestDir: "{app}\setup\dialogkit"; Excludes: "*.pdb"; Flags: ignoreversion recursesubdirs
+; The same for the Open-dialog shim: install-shim.ps1 copies it on to {app}\shim.
+Source: "..\scripts\install-shim.ps1"; DestDir: "{app}\setup"; Flags: ignoreversion
+Source: "..\scripts\uninstall-shim.ps1"; DestDir: "{app}\setup"; Flags: ignoreversion
+Source: "..\dist\shim\fm_dialog_shim.dll"; DestDir: "{app}\setup\shim"; Flags: ignoreversion
 
 [InstallDelete]
 ; 0.1.0-beta.1 installed these; fm.exe --set-default / --restore-explorer replaced them.
@@ -285,18 +295,21 @@ end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
 var
-  Err, Exe, Kit: String;
+  Err, Exe, Kit, Shim: String;
   Code: Integer;
 begin
   if CurStep <> ssPostInstall then
     Exit;
   Exe := ExpandConstant('{app}\fm.exe');
   Kit := ExpandConstant('{app}\dialogkit');
-  { An install by the old scripts (%LOCALAPPDATA%\Programs\fm): its dialogkit is uninstalled and its
-    folder deleted; Run, App Paths and the Start menu shortcut were just rewritten for this one,
-    and fm --set-default below moves the verbs over. }
+  Shim := ExpandConstant('{app}\shim');
+  { An install by the old scripts (%LOCALAPPDATA%\Programs\fm): its dialogkit and shim are
+    uninstalled and its folder deleted; Run, App Paths and the Start menu shortcut were just
+    rewritten for this one, and fm --set-default below moves the verbs over. }
   if HasMarker(OldDir('dialogkit'), 'fm-dialogkit') and not RunScript('uninstall-dialogkit.ps1', '-InstallDir ' + PsQuote(OldDir('dialogkit')), Err) then
     Report('DoUnkit', Err);
+  if HasMarker(OldDir('shim'), 'fm-dialog-shim') and not RunScript('uninstall-shim.ps1', '-InstallDir ' + PsQuote(OldDir('shim')), Err) then
+    Report('DoUnshim', Err);
   if HasMarker(OldDir('app'), 'fm') then
     DelTree(OldDir('app'), True, True, True);
   RemoveDir(ExpandConstant('{localappdata}\Programs\fm'));
@@ -313,6 +326,12 @@ begin
       Report('DoKit', Err);
   end else if DirExists(Kit) and not RunScript('uninstall-dialogkit.ps1', '-InstallDir ' + PsQuote(Kit), Err) then
     Report('DoUnkit', Err);
+
+  if WizardIsTaskSelected('shim') then begin
+    if not RunScript('install-shim.ps1', '-SourceDir ' + PsQuote(ExpandConstant('{app}\setup\shim')) + ' -InstallDir ' + PsQuote(Shim), Err) then
+      Report('DoShim', Err);
+  end else if DirExists(Shim) and not RunScript('uninstall-shim.ps1', '-InstallDir ' + PsQuote(Shim), Err) then
+    Report('DoUnshim', Err);
 
   { Resident from now on, as after each sign-in (the Run value). Not SW_HIDE: Windows would apply
     it to the first window this process shows later. }
@@ -394,6 +413,10 @@ begin
     Kit := ExpandConstant('{app}\dialogkit');
     if DirExists(Kit) and not RunScript('uninstall-dialogkit.ps1', '-InstallDir ' + PsQuote(Kit), Err) then
       Log('uninstall-dialogkit.ps1 failed: ' + Err);
+    { The Open dialog goes back to Windows before fm.exe, its picker, is deleted. }
+    Kit := ExpandConstant('{app}\shim');
+    if DirExists(Kit) and not RunScript('uninstall-shim.ps1', '-InstallDir ' + PsQuote(Kit), Err) then
+      Log('uninstall-shim.ps1 failed: ' + Err);
   end;
   if CurUninstallStep = usPostUninstall then
     DeleteData;

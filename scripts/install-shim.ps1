@@ -2,7 +2,7 @@
 .SYNOPSIS
   Option 2: puts fm_dialog_shim.dll in front of the system Open dialog, for the current user.
 .DESCRIPTION
-  Claude.exe (and the apps listed in %LOCALAPPDATA%\fm\shim-allow.txt, one per line) get fm's own
+  Claude.exe, chrome.exe and the apps listed in %LOCALAPPDATA%\fm\shim-allow.txt (one per line) get fm's own
   picker for their Open dialog: from the running fm, or from an installed fm.exe new enough for
   --pick. Whatever the picker cannot do, and every other app, goes straight to Windows (comdlg32).
   One line per dialog goes to %LOCALAPPDATA%\fm\shim.log (inside a Store/MSIX app such as Claude:
@@ -57,7 +57,7 @@ $locked = -not (Remove-OrSetAside $dll)
 Copy-Item $src $dll -Force
 Grant-AppContainerRead $InstallDir
 $stale = @(Get-ChildItem $InstallDir -File -Filter '*.del')
-if ($locked -or $stale.Count) { Register-DelCleanup $RegRoot $InstallDir } else { Clear-DelCleanup $RegRoot }
+if ($locked -or $stale.Count) { Register-DelCleanup $RegRoot $InstallDir } else { Clear-DelCleanup $RegRoot $InstallDir }
 
 # The key last: it only ever points at a DLL that is already in place.
 New-KeyIfMissing "$key\InprocServer32"
@@ -67,5 +67,5 @@ Set-ItemProperty "$key\InprocServer32" -Name 'ThreadingModel' -Value $threading
 if ((Get-Item "$key\InprocServer32").GetValue('') -ne $dll -or -not (Test-Path $dll)) { throw 'Registrace se nepovedla.' }
 
 Write-Host "Nainstalováno: $dll"
-Write-Host "Výběr souborů z fm dostane Claude.exe (další aplikace: $env:LOCALAPPDATA\fm\shim-allow.txt). Aplikace, která už dialog otevřela, potřebuje restart."
+Write-Host "Výběr souborů z fm dostane Claude.exe a chrome.exe (další aplikace: $env:LOCALAPPDATA\fm\shim-allow.txt). Aplikace, která už dialog otevřela, potřebuje restart."
 Write-Host "Log: $env:LOCALAPPDATA\fm\shim.log (u Clauda v ...\Packages\Claude_…\LocalCache\Local\fm\)  ·  vypnout: soubor $env:LOCALAPPDATA\fm\disable-shim  ·  odinstalovat: scripts\uninstall-shim.ps1"

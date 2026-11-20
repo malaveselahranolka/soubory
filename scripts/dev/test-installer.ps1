@@ -7,7 +7,7 @@
   1. The wizard, clicked through as a person would: Welcome, Tasks and Finished are captured to -Out
      (PrintWindow of the wizard only), in Windows' light app theme and then in the dark one; each
      run is followed by a silent uninstall.
-  2. A silent install with both tasks into a folder whose path has a space and diacritics: files,
+  2. A silent install with all tasks into a folder whose path has a space and diacritics: files,
      Run values and verbs are checked, then folders opened through the shell (C:\, a folder with a
      space, Win+E's verb) must show an fm window. A silent uninstall must give folders back to
      Explorer and remove what the install added.
@@ -138,11 +138,12 @@ if (-not $SkipWizard) {
 }
 if ($WizardOnly) { "RESULT pass=$pass fail=$fails"; if ($fails) { exit 1 }; exit 0 }
 
-# --- 2. Silent install with both tasks, into a path with a space and diacritics ---------------
+# --- 2. Silent install with all tasks, into a path with a space and diacritics ---------------
 '=== silent install'
 $dir = Join-Path $env:LOCALAPPDATA 'Programs\Zkouška Souborů'
 $exe = Join-Path $dir 'fm.exe'
-$p = Run-Wait $Setup @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/TASKS="defaultfm,dialogkit"', "/DIR=`"$dir`"", "/LOG=`"$Out\$Name-silent-install.log`"")
+$openKey = 'HKCU:\Software\Classes\CLSID\{DC1C5A9C-E88A-4dde-A5A1-60F82A20AEF7}'
+$p = Run-Wait $Setup @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/TASKS="defaultfm,dialogkit,shim"', "/DIR=`"$dir`"", "/LOG=`"$Out\$Name-silent-install.log`"")
 Check 'setup exit code 0' ($p.ExitCode -eq 0)
 Check 'fm.exe installed' (Test-Path -LiteralPath $exe)
 Check 'notices and licence installed' ((Test-Path -LiteralPath "$dir\THIRD-PARTY-NOTICES.txt") -and (Test-Path -LiteralPath "$dir\LICENSE.txt"))
@@ -158,6 +159,8 @@ Check 'dialogkit installed' (Test-Path -LiteralPath "$dir\dialogkit\fm-dialogkit
 Check 'dialogkit 32-bit helper installed' (Test-Path -LiteralPath "$dir\dialogkit\x86\fm-dialogkit.exe")
 Check 'dialogkit Run value' ((Val 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' 'FinderWin.DialogKit') -eq "`"$dir\dialogkit\fm-dialogkit.exe`"")
 Check 'dialogkit running' ([bool](Get-Process fm-dialogkit -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$dir\*" }))
+Check 'shim installed' (Test-Path -LiteralPath "$dir\shim\fm_dialog_shim.dll")
+Check 'Open dialog goes through the shim' ((Val "$openKey\InprocServer32" '') -eq "$dir\shim\fm_dialog_shim.dll")
 Check 'fm resident' ([bool](Wait-For { Get-Process fm -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $exe } } 15 'resident fm'))
 $log = Get-Content -LiteralPath "$Out\$Name-silent-install.log" -Encoding UTF8
 $log | Where-Object { $_ -match 'PowerShell|fm\.exe --|  ' } | Select-Object -First 30
@@ -191,6 +194,7 @@ $left = @(Get-ChildItem -Recurse 'HKCU:\Software\Classes\Directory', 'HKCU:\Soft
     Where-Object { "$($_.GetValue(''))" -like "*$dir*" })
 Check "no verb opens the removed fm.exe ($($left.Count) left)" ($left.Count -eq 0)
 Check 'Redirect removed' (-not (Val 'HKCU:\Software\fm' 'Redirect'))
+Check 'Open dialog back to Windows' (-not (Test-Path -LiteralPath $openKey))
 Check 'no fm or dialogkit left running from the install folder' (-not (Get-Process fm, fm-dialogkit -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$dir\*" }))
 $before = @(Get-Process fm -ErrorAction SilentlyContinue).Count
 Start-Process -FilePath 'C:\'

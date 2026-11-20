@@ -62,6 +62,22 @@ Check 'directory removed' (-not (Test-Path $dir))
 Check 'cleanup value removed' (-not (Cleanup))
 Check 'nothing left under the classes root' (-not (Test-Path "$cls\CLSID"))
 
+'=== move to another folder while the old dll is locked (the installer after a script install)'
+& $Install $dir
+Remove-Item "$Root\ready" -ErrorAction SilentlyContinue
+$holder = Start-Process powershell -PassThru -WindowStyle Hidden -ArgumentList ('-NoProfile', '-EncodedCommand', $enc)
+for ($i = 0; $i -lt 150 -and -not (Test-Path "$Root\ready"); $i++) { Start-Sleep -Milliseconds 100 }
+& $Uninstall $dir
+$dir2 = Join-Path $Root 'inst2\shim'
+& $Install $dir2
+Check 'new folder installed' ((Server) -eq "$dir2\fm_dialog_shim.dll")
+Check "the old folder's cleanup stays pending" ((Cleanup) -like "*`"$dir`"*")
+Stop-Process -Id $holder.Id -Force; $holder.WaitForExit()
+& $Uninstall $dir2
+Check "uninstalling the new folder leaves the old folder's cleanup" ((Cleanup) -like "*`"$dir`"*" -and -not (Test-Path $dir2))
+Remove-Item -Recurse -Force $dir -ErrorAction SilentlyContinue
+Remove-ItemProperty "$reg\RunOnce" -Name 'FinderWin.Shim.Cleanup' -ErrorAction SilentlyContinue
+
 '=== shim and dialogkit side by side'
 $dk = Join-Path (Split-Path -Parent $scripts) 'dist\dialogkit'
 if (Test-Path "$dk\fm-dialogkit.exe") {
