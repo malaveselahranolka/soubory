@@ -2,8 +2,8 @@
 
 use std::collections::VecDeque;
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
-use std::sync::{Condvar, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use fm_fs::attrs::{DIRECTORY, REPARSE_POINT};
@@ -483,25 +483,34 @@ where
     }
 
     struct ScannedNode {
-        child_dir_id: u32,
         name_off: u32,
         name_len: u16,
         meta: Meta,
     }
 
     struct WorkerOutput {
-        arena: Vec<u8>,
-        nodes: Vec<ScannedNode>,
-        batches: Vec<(u32, usize, usize)>,
-        non_zero_fids: usize,
         root_failed: bool,
         failed: Vec<WalkFolderRef>,
         denied: Vec<WalkFolderRef>,
     }
 
+    // Workers insert each listed directory straight into the index (a task carries its folder's
+    // EntryId), so a walk never holds a second copy of everything it listed: a re-walk of C:
+    // (4 M entries) kept ~300 MB of per-worker listings beside the live and the fresh index.
+    let mut idx = Index::new();
+    idx.set_volume_serial(root_info.volume_serial);
+    let root_id = idx.add_root(&root_display);
+    // Drive roots on Windows always carry HIDDEN|SYSTEM; keep DIRECTORY-only on root so
+    // non-hidden descendants are not hidden by ancestor inheritance.
+    if root_info.file_id != 0 {
+        idx.set_file_id(root_id, root_info.file_id);
+    }
+    idx.mtime[root_id as usize] = root_info.mtime;
+    let built = Mutex::new(idx);
+
     let mut init_queue = VecDeque::new();
     init_queue.push_back(DirTask {
-        dir_id: 0,
+        dir_id: root_id,
         path: root_display.clone(),
         rel_path: String::new(),
         meta: Meta {
@@ -528,7 +537,6 @@ where
     let entries_seen = AtomicUsize::new(1);
     let dirs_count = AtomicUsize::new(1);
     let files_count = AtomicUsize::new(0);
-    let next_dir_id = AtomicU32::new(1);
 
     let worker_outputs: Option<Vec<WorkerOutput>> = std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(threads);
@@ -541,10 +549,11 @@ where
                 };
 
                 let mut scratch = S::Scratch::default();
-                let mut arena = Vec::<u8>::with_capacity(64 * 1024);
-                let mut nodes = Vec::<ScannedNode>::with_capacity(4096);
-                let mut batches = Vec::<(u32, usize, usize)>::with_capacity(512);
-                let mut non_zero_fids = 0usize;
+                // One directory's listing at a time.
+                let mut names = String::new();
+                let mut nodes = Vec::<ScannedNode>::new();
+                let mut eids = Vec::<EntryId>::new();
+                let mut folded_buf = String::with_capacity(128);
                 let mut root_failed = false;
                 let mut failed = Vec::<WalkFolderRef>::new();
                 let mut denied = Vec::<WalkFolderRef>::new();
@@ -576,10 +585,6 @@ where
                                 *lock_or_recover(&shared.done_mu) = true;
                                 shared.done_cv.notify_all();
                                 return WorkerOutput {
-                                    arena,
-                                    nodes,
-                                    batches,
-                                    non_zero_fids,
                                     root_failed,
                                     failed,
                                     denied,
@@ -596,10 +601,6 @@ where
                                 *lock_or_recover(&shared.done_mu) = true;
                                 shared.done_cv.notify_all();
                                 return WorkerOutput {
-                                    arena,
-                                    nodes,
-                                    batches,
-                                    non_zero_fids,
                                     root_failed,
                                     failed,
                                     denied,
@@ -619,7 +620,8 @@ where
                         None => source.open_dir(&task.path),
                     };
 
-                    let batch_start = nodes.len();
+                    names.clear();
+                    nodes.clear();
                     let mut local_dirs = 0usize;
                     let mut local_files = 0usize;
                     let (failed_before, denied_before) = (failed.len(), denied.len());
@@ -640,14 +642,13 @@ where
                                     &mut |entry| {
                                         let is_dir = (entry.attrs & DIRECTORY) != 0;
                                         let is_reparse = (entry.attrs & REPARSE_POINT) != 0;
-                                        let name_bytes = entry.name.as_bytes();
-                                        let Ok(name_off) = u32::try_from(arena.len()) else {
+                                        let Ok(name_off) = u32::try_from(names.len()) else {
                                             return;
                                         };
-                                        let Ok(name_len) = u16::try_from(name_bytes.len()) else {
+                                        let Ok(name_len) = u16::try_from(entry.name.len()) else {
                                             return;
                                         };
-                                        arena.extend_from_slice(name_bytes);
+                                        names.push_str(entry.name);
 
                                         let should_descend = is_dir
                                             && (!is_reparse
@@ -660,29 +661,23 @@ where
                                             file_id: entry.file_id,
                                         };
 
-                                        let child_dir_id = if should_descend {
-                                            let did = next_dir_id.fetch_add(1, Ordering::Relaxed);
+                                        if should_descend {
                                             let child_rel = if task.rel_path.is_empty() {
                                                 entry.name.to_owned()
                                             } else {
                                                 join_child_path(&task.rel_path, entry.name)
                                             };
                                             pending_tasks.push(DirTask {
-                                                dir_id: did,
+                                                // Its position here until it has an EntryId.
+                                                dir_id: nodes.len() as u32,
                                                 path: join_child_path(&task.path, entry.name),
                                                 rel_path: child_rel,
                                                 meta,
                                                 depth: task.depth + 1,
                                                 preopened: None,
                                             });
-                                            did
-                                        } else {
-                                            NONE
-                                        };
-
-                                        if entry.file_id != 0 {
-                                            non_zero_fids += 1;
                                         }
+
                                         if is_dir {
                                             local_dirs += 1;
                                         } else {
@@ -697,7 +692,6 @@ where
                                             ));
                                         }
                                         nodes.push(ScannedNode {
-                                            child_dir_id,
                                             name_off,
                                             name_len,
                                             meta,
@@ -716,12 +710,12 @@ where
                                             rel_path: task.rel_path.clone(),
                                         };
                                         if is_access_denied(&err) {
-                                            if task.dir_id == 0 && restart {
+                                            if task.dir_id == root_id && restart {
                                                 root_failed = true;
                                             }
                                             denied.push(fref);
                                         } else {
-                                            if task.dir_id == 0 && restart {
+                                            if task.dir_id == root_id && restart {
                                                 root_failed = true;
                                             }
                                             failed.push(fref);
@@ -738,12 +732,12 @@ where
                                 rel_path: task.rel_path.clone(),
                             };
                             if is_access_denied(&err) {
-                                if task.dir_id == 0 {
+                                if task.dir_id == root_id {
                                     root_failed = true;
                                 }
                                 denied.push(fref);
                             } else {
-                                if task.dir_id == 0 {
+                                if task.dir_id == root_id {
                                     root_failed = true;
                                 }
                                 failed.push(fref);
@@ -751,9 +745,26 @@ where
                         }
                     }
 
-                    let added = nodes.len() - batch_start;
+                    let added = nodes.len();
                     if added > 0 {
-                        batches.push((task.dir_id, batch_start, added));
+                        eids.clear();
+                        let mut idx = lock_or_recover(&built);
+                        for node in &nodes {
+                            let off = node.name_off as usize;
+                            let name = &names[off..off + node.name_len as usize];
+                            folded_buf.clear();
+                            fold_into(name, &mut folded_buf);
+                            eids.push(idx.insert_with_folded(
+                                task.dir_id,
+                                name,
+                                &folded_buf,
+                                node.meta,
+                            ));
+                        }
+                        drop(idx);
+                        for pt in &mut pending_tasks {
+                            pt.dir_id = eids[pt.dir_id as usize];
+                        }
                         entries_seen.fetch_add(added, Ordering::Relaxed);
                         if local_dirs > 0 {
                             dirs_count.fetch_add(local_dirs, Ordering::Relaxed);
@@ -851,62 +862,7 @@ where
         report.denied.extend(out.denied.iter().cloned());
     }
 
-    let total_entries = entries_seen.load(Ordering::Relaxed);
-    let num_dirs = next_dir_id.load(Ordering::Relaxed) as usize;
-    let total_non_zero_fids: usize = worker_outputs
-        .iter()
-        .map(|w| w.non_zero_fids)
-        .sum::<usize>()
-        + usize::from(root_info.file_id != 0);
-
-    let mut dir_batches = vec![(0usize, 0usize, 0usize); num_dirs];
-    for (w_idx, out) in worker_outputs.iter().enumerate() {
-        for &(dir_id, start, len) in &out.batches {
-            dir_batches[dir_id as usize] = (w_idx, start, len);
-        }
-    }
-
-    let mut idx = Index::with_capacity(total_entries);
-    idx.reserve_fid_map(total_non_zero_fids);
-    idx.set_volume_serial(root_info.volume_serial);
-    let root_id = idx.add_root(&root_display);
-    // Drive roots on Windows always carry HIDDEN|SYSTEM; keep DIRECTORY-only on root so
-    // non-hidden descendants are not hidden by ancestor inheritance.
-    if root_info.file_id != 0 {
-        idx.set_file_id(root_id, root_info.file_id);
-    }
-    idx.mtime[root_id as usize] = root_info.mtime;
-
-    let mut build_queue = VecDeque::with_capacity(num_dirs.min(4096));
-    build_queue.push_back((0u32, root_id));
-    let mut folded_buf = String::with_capacity(128);
-    let mut built_steps = 0usize;
-
-    while let Some((dir_id, parent_eid)) = build_queue.pop_front() {
-        let (w_idx, start, len) = dir_batches[dir_id as usize];
-        if len == 0 {
-            continue;
-        }
-        let w = &worker_outputs[w_idx];
-        for node in &w.nodes[start..start + len] {
-            built_steps += 1;
-            if (built_steps & 0x3FFF) == 0 && cancel.load(Ordering::Relaxed) {
-                return None;
-            }
-            let name_bytes =
-                &w.arena[node.name_off as usize..node.name_off as usize + node.name_len as usize];
-            let Ok(name) = std::str::from_utf8(name_bytes) else {
-                continue;
-            };
-            folded_buf.clear();
-            fold_into(name, &mut folded_buf);
-            let eid = idx.insert_with_folded(parent_eid, name, &folded_buf, node.meta);
-            if node.child_dir_id != NONE {
-                build_queue.push_back((node.child_dir_id, eid));
-            }
-        }
-    }
-
+    let idx = built.into_inner().unwrap_or_else(PoisonError::into_inner);
     on_progress(idx.len());
     Some((
         idx,
@@ -1190,6 +1146,8 @@ pub fn merge_index_with_report(
 
     let doomed: Vec<bool> = keep_alive.iter().map(|&keep| !keep).collect();
     changed |= live.remove_flagged(&doomed);
+    // Compacting while `fresh` is still held would keep three full indexes at once.
+    drop(fresh);
 
     if live.parent.len() > 1024
         && live.len().saturating_mul(4) < live.parent.len().saturating_mul(3)

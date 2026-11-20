@@ -2,7 +2,7 @@ use std::io::Cursor;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use fm_index::r#gen::{XorShift64, generate};
-use fm_index::{CancelToken, EntryId, Index, SearchOptions, SnapshotError, parse_query};
+use fm_index::{CancelToken, EntryId, Index, Meta, SearchOptions, SnapshotError, parse_query};
 
 #[test]
 fn snapshot_roundtrip_100k() {
@@ -203,4 +203,36 @@ fn snapshot_file_id_roundtrip_v2_rejection_and_zeroed_tail() {
         Index::load(Cursor::new(&zeroed_tail), None)
     }));
     assert!(res.expect("must not panic").is_err());
+}
+
+#[test]
+fn loaded_columns_have_no_slack_and_grow_by_an_eighth() {
+    let mut buf = Vec::new();
+    generate(100_000, 0x1234_5678).save(&mut buf).expect("save");
+    let mut loaded = Index::load(Cursor::new(&buf), None).expect("load");
+    let before = loaded.memory_columns();
+    for &(name, len, cap) in &before {
+        assert_eq!(cap, len, "{name} keeps slack after a load");
+    }
+
+    let dir = loaded
+        .iter_ids()
+        .find(|&id| loaded.is_dir(id))
+        .expect("a folder");
+    let meta = Meta {
+        attrs: 0x20,
+        size: 1,
+        mtime: 1,
+        file_id: 0,
+    };
+    loaded.insert(dir, "nový soubor.txt", meta);
+    for ((name, len, cap), &(_, len0, _)) in loaded.memory_columns().into_iter().zip(&before) {
+        assert!(cap >= len, "{name}");
+        // Entry columns grow by an eighth, arenas by a quarter: never doubled.
+        if !name.ends_with("arena") && !name.ends_with("buckets") {
+            assert!(cap <= len0 + len0 / 8 + 8, "{name}: {len0} -> {cap}");
+        } else {
+            assert!(cap <= len0 + len0 / 4 + 1024, "{name}: {len0} -> {cap}");
+        }
+    }
 }

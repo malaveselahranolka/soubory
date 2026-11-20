@@ -478,6 +478,8 @@ impl Index {
         };
         idx.rebuild_child_links_and_buckets_checked()
             .map_err(SnapshotError::Corrupt)?;
+        // The columns grew while reading (the header's counts are not trusted up front).
+        idx.shrink_to_fit();
         Ok(idx)
     }
 }
@@ -780,6 +782,7 @@ fn read_le_vec_bounded<T, const N: usize>(
         read_exact_or_truncated(r, &mut buf[..take_bytes])?;
         hasher.update(&buf[..take_bytes]);
         let (chunks, _) = buf[..take_bytes].as_chunks::<N>();
+        reserve_arena(&mut out, take_elems);
         out.extend(chunks.iter().map(|&c| from_le(c)));
         remaining -= take_elems;
     }

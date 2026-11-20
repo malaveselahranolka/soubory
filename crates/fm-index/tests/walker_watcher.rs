@@ -2401,3 +2401,49 @@ fn streaming_walk_sends_every_entry_once_and_each_folder_after_its_parent() {
     assert_eq!(entries, indexed);
     assert_eq!(entries.len(), 1 + 8 * (2 + 8) + 8 * 5 * 4);
 }
+
+#[test]
+fn walk_on_one_or_eight_threads_builds_the_same_index() {
+    // Workers insert every folder's listing as they go; three levels so children of folders
+    // listed by other workers land under the right parent.
+    let tree = TempTree::new("threads");
+    for a in 0..5 {
+        for b in 0..5 {
+            for c in 0..3 {
+                let d = tree
+                    .path
+                    .join(format!("a{a}"))
+                    .join(format!("b{b}"))
+                    .join(format!("c{c}"));
+                fs::create_dir_all(&d).unwrap();
+                fs::write(d.join(format!("f{a}{b}{c}.txt")), vec![0u8; a + b + c]).unwrap();
+            }
+            File::create(
+                tree.path
+                    .join(format!("a{a}"))
+                    .join(format!("b{b}"))
+                    .join("mid.txt"),
+            )
+            .unwrap();
+        }
+    }
+    let root = tree.path_str();
+    let walk = |threads| {
+        let opts = WalkOptions {
+            threads,
+            ..WalkOptions::default()
+        };
+        walk_root(&root, opts, &AtomicBool::new(false), |_| {})
+            .expect("walk succeeds")
+            .0
+    };
+    let (one, eight) = (walk(1), walk(8));
+    assert_eq!(one.len(), 1 + 5 * (1 + 5 * (1 + 1 + 3 * 2)));
+    assert_eq!(eight.len(), one.len());
+    assert_eq!(
+        index_rel_triples(&eight, &root),
+        index_rel_triples(&one, &root)
+    );
+    let deep = format!(r"{root}\a4\b3\c2\f432.txt");
+    assert_eq!(eight.meta(eight.lookup(&deep).expect("deep file")).size, 9);
+}

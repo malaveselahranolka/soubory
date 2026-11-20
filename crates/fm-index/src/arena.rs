@@ -194,21 +194,10 @@ impl Index {
     pub fn memory_bytes(&self) -> usize {
         let exts_bytes: usize = self.exts.iter().map(|s| s.capacity()).sum::<usize>()
             + self.exts.capacity() * std::mem::size_of::<String>();
-        self.folded_arena.capacity()
-            + self.display_arena.capacity()
-            + self.folded_off.capacity() * std::mem::size_of::<u32>()
-            + self.display_off.capacity() * std::mem::size_of::<u32>()
-            + self.parent.capacity() * std::mem::size_of::<EntryId>()
-            + self.attrs.capacity() * std::mem::size_of::<u32>()
-            + self.size.capacity() * std::mem::size_of::<u64>()
-            + self.mtime.capacity() * std::mem::size_of::<i64>()
-            + self.file_id.capacity() * std::mem::size_of::<u64>()
-            + self.ext_id.capacity() * std::mem::size_of::<u16>()
-            + self.flags.capacity() * std::mem::size_of::<u8>()
-            + self.first_child.capacity() * std::mem::size_of::<EntryId>()
-            + self.next_sibling.capacity() * std::mem::size_of::<EntryId>()
-            + self.buckets.capacity() * std::mem::size_of::<EntryId>()
-            + self.fid_buckets.capacity() * std::mem::size_of::<EntryId>()
+        self.memory_columns()
+            .iter()
+            .map(|&(_, _, cap)| cap)
+            .sum::<usize>()
             + self.fid_dups.capacity()
                 * (std::mem::size_of::<u64>() + std::mem::size_of::<Vec<EntryId>>())
             + self
@@ -218,6 +207,73 @@ impl Index {
                 .sum::<usize>()
             + self.roots.capacity() * std::mem::size_of::<EntryId>()
             + exts_bytes
+    }
+
+    /// Bytes used (`len`) and allocated (`capacity`) by each column, arena and lookup table, by
+    /// name: `(name, used, allocated)`. For memory diagnostics.
+    #[must_use]
+    pub fn memory_columns(&self) -> Vec<(&'static str, usize, usize)> {
+        fn c<T>(n: &'static str, v: &Vec<T>) -> (&'static str, usize, usize) {
+            let s = std::mem::size_of::<T>();
+            (n, v.len() * s, v.capacity() * s)
+        }
+        vec![
+            c("folded_arena", &self.folded_arena),
+            c("display_arena", &self.display_arena),
+            c("folded_off", &self.folded_off),
+            c("display_off", &self.display_off),
+            c("parent", &self.parent),
+            c("attrs", &self.attrs),
+            c("size", &self.size),
+            c("mtime", &self.mtime),
+            c("file_id", &self.file_id),
+            c("ext_id", &self.ext_id),
+            c("flags", &self.flags),
+            c("first_child", &self.first_child),
+            c("next_sibling", &self.next_sibling),
+            c("buckets", &self.buckets),
+            c("fid_buckets", &self.fid_buckets),
+        ]
+    }
+
+    /// Room for one more slot in every entry column. A full column of 64 Ki slots or more grows
+    /// by an eighth: `Vec::push` would double it, leaving up to half of it (~180 MB of columns
+    /// on C:'s 4 M entries) committed but never used.
+    fn reserve_slot(&mut self) {
+        fn grow<T>(v: &mut Vec<T>) {
+            let cap = v.capacity();
+            if v.len() == cap {
+                v.reserve_exact(if cap < 65_536 { cap.max(64) } else { cap / 8 });
+            }
+        }
+        grow(&mut self.folded_off);
+        grow(&mut self.display_off);
+        grow(&mut self.parent);
+        grow(&mut self.attrs);
+        grow(&mut self.size);
+        grow(&mut self.mtime);
+        grow(&mut self.file_id);
+        grow(&mut self.ext_id);
+        grow(&mut self.flags);
+        grow(&mut self.first_child);
+        grow(&mut self.next_sibling);
+    }
+
+    /// Releases unused capacity of every column, arena and table (after a load or a merge).
+    pub(crate) fn shrink_to_fit(&mut self) {
+        self.folded_arena.shrink_to_fit();
+        self.display_arena.shrink_to_fit();
+        self.folded_off.shrink_to_fit();
+        self.display_off.shrink_to_fit();
+        self.parent.shrink_to_fit();
+        self.attrs.shrink_to_fit();
+        self.size.shrink_to_fit();
+        self.mtime.shrink_to_fit();
+        self.file_id.shrink_to_fit();
+        self.ext_id.shrink_to_fit();
+        self.flags.shrink_to_fit();
+        self.first_child.shrink_to_fit();
+        self.next_sibling.shrink_to_fit();
     }
 
     /// Returns `true` if `id` refers to a valid live entry.
@@ -249,6 +305,7 @@ impl Index {
             self.parent.len() < MAX_SLOTS,
             "index slot capacity exceeded"
         );
+        self.reserve_slot();
         let id = self.parent.len() as EntryId;
         let f_off = push_arena(&mut self.folded_arena, folded.as_bytes());
         let d_off = if display == folded {
@@ -305,6 +362,7 @@ impl Index {
             self.parent.len() < MAX_SLOTS,
             "index slot capacity exceeded"
         );
+        self.reserve_slot();
         let id = self.parent.len() as EntryId;
         let f_off = push_arena(&mut self.folded_arena, folded.as_bytes());
         let d_off = if name == folded {
@@ -692,18 +750,6 @@ impl Index {
         );
         self.set_file_id_inner(id, file_id);
         self.index_gen = self.index_gen.wrapping_add(1);
-    }
-
-    pub(crate) fn reserve_fid_map(&mut self, expected_non_zero: usize) {
-        if expected_non_zero == 0 {
-            return;
-        }
-        let target = ((expected_non_zero.saturating_mul(10)) / 7 + 16).max(64);
-        if self.fid_buckets.is_empty() {
-            self.fid_buckets = vec![NONE; target];
-        } else if self.fid_buckets.len() < target {
-            self.rehash_fid_buckets_to(target);
-        }
     }
 
     pub(crate) fn find_child_by_file_id(&self, parent: EntryId, fid: u64) -> Option<EntryId> {
@@ -1532,7 +1578,9 @@ fn encoded_len(len: usize) -> usize {
     if len < 255 { 1 + len } else { 3 + len }
 }
 
-pub(crate) fn reserve_arena(buf: &mut Vec<u8>, additional: usize) {
+/// Reserves room for `additional` more elements, growing by a quarter once past 256 Ki elements
+/// instead of doubling.
+pub(crate) fn reserve_arena<T>(buf: &mut Vec<T>, additional: usize) {
     if buf.capacity() - buf.len() >= additional {
         return;
     }
