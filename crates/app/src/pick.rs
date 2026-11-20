@@ -22,8 +22,8 @@ use windows::{
     Win32::{
         Foundation::*,
         Storage::FileSystem::*,
-        System::Pipes::*,
-        UI::{Shell::FOLDERID_Documents, WindowsAndMessaging::*},
+        System::{Pipes::*, Threading::GetCurrentProcessId},
+        UI::{Input::KeyboardAndMouse::IsWindowEnabled, Shell::FOLDERID_Documents, WindowsAndMessaging::*},
     },
     core::PCWSTR,
 };
@@ -95,17 +95,33 @@ impl Picker {
         self.ready
     }
 
-    /// The one answer. The host's window may take the foreground back once ours closes.
+    /// The one answer, and the foreground back to the host's window while ours still has it.
+    /// Chrome and Electron (Claude) run the dialog in a helper process that may not take the
+    /// foreground itself, and once our window is gone Windows activates some other app instead.
     pub fn answer(&mut self, m: Msg) {
         if self.pipe.is_invalid() {
             return;
         }
         self.send(&m);
+        let owner = HWND(self.req.owner as *mut _);
         unsafe {
             let mut pid = 0u32;
-            GetWindowThreadProcessId(HWND(self.req.owner as *mut _), Some(&mut pid));
-            if pid != 0 {
-                let _ = AllowSetForegroundWindow(pid);
+            GetWindowThreadProcessId(owner, Some(&mut pid));
+            let mut shim = 0u32;
+            let _ = GetNamedPipeServerProcessId(self.pipe, &mut shim);
+            for p in [pid, shim].into_iter().filter(|&p| p != 0) {
+                let _ = AllowSetForegroundWindow(p);
+            }
+            let mut fg = 0u32;
+            GetWindowThreadProcessId(GetForegroundWindow(), Some(&mut fg));
+            if pid != 0 && fg == GetCurrentProcessId() {
+                // The shim enables its owner when the answer arrives; a disabled window is not
+                // activated, so wait for that (briefly: a host may keep it disabled itself).
+                let until = Instant::now() + Duration::from_millis(300);
+                while !IsWindowEnabled(owner).as_bool() && Instant::now() < until {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                let _ = SetForegroundWindow(owner);
             }
         }
         self.let_go();
