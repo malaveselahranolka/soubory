@@ -16,8 +16,9 @@ use fm_fs::attrs::{
 };
 use fm_index::win::service::{Event, Service, default_roots};
 use fm_index::win::walker::{
-    DirEntryRef, DirSource, MAX_WALK_DEPTH, RootInfo, WalkOptions, Win32DirSource, merge_index,
-    merge_index_with_report, walk_root, walk_with_source, walk_with_source_report,
+    DirEntryRef, DirSource, MAX_WALK_DEPTH, RootInfo, WalkBatch, WalkOptions, Win32DirSource,
+    merge_index, merge_index_with_report, walk_root, walk_with_source, walk_with_source_report,
+    walk_with_source_streaming,
 };
 use fm_index::win::watcher::{
     NoopWatcherFs, NotifyAction, NotifyRecord, VolumeWatcher, WatcherConfig, WatcherFs,
@@ -2296,4 +2297,72 @@ fn walker_worker_panic_fails_the_whole_walk() {
     };
     let res = walk_with_source_report(&PanickingSource(mock), "R:\\", opts, &cancel, |_| {});
     assert!(res.is_none(), "a panicked worker must fail the walk");
+}
+
+#[test]
+fn streaming_walk_sends_every_entry_once_and_each_folder_after_its_parent() {
+    // 8 x 8 folders with files on every level, a few empty ones, 8 workers racing.
+    let tree = TempTree::new("stream");
+    for a in 0..8 {
+        for b in 0..8 {
+            let d = tree.path.join(format!("a{a}")).join(format!("b{b}"));
+            fs::create_dir_all(&d).unwrap();
+            if b % 3 != 0 {
+                for f in 0..4 {
+                    File::create(d.join(format!("f{f}.txt"))).unwrap();
+                }
+            }
+        }
+        File::create(tree.path.join(format!("a{a}")).join("mid.txt")).unwrap();
+    }
+    File::create(tree.path.join("top.txt")).unwrap();
+    let root = tree.path_str();
+    let opts = WalkOptions {
+        threads: 8,
+        ..WalkOptions::default()
+    };
+    let sent = Mutex::new(Vec::new());
+    let sink = |b: WalkBatch| sent.lock().unwrap().push(b);
+    let (idx, _, _) = walk_with_source_streaming(
+        &Win32DirSource,
+        &root,
+        opts,
+        &AtomicBool::new(false),
+        |_| {},
+        Some(&sink),
+    )
+    .expect("walk succeeds");
+
+    let mut announced = HashSet::new();
+    let mut batched = HashSet::new();
+    let mut entries = HashSet::new();
+    let mut sent_count = 0;
+    for b in sent.into_inner().unwrap() {
+        assert!(
+            b.rel_path.is_empty() || announced.contains(&b.rel_path),
+            "batch of {} reached the sink before its parent's",
+            b.rel_path
+        );
+        assert!(batched.insert(b.rel_path.clone()), "two batches of {}", b.rel_path);
+        for (name, _, descend) in &b.children {
+            let rel = if b.rel_path.is_empty() {
+                name.clone()
+            } else {
+                format!("{}\\{name}", b.rel_path)
+            };
+            if *descend {
+                announced.insert(rel.clone());
+            }
+            entries.insert(rel);
+            sent_count += 1;
+        }
+    }
+    assert_eq!(batched.len(), 1 + announced.len(), "every descended folder sends a batch");
+    assert_eq!(sent_count, entries.len(), "no entry is sent twice");
+    let indexed: HashSet<String> = index_rel_triples(&idx, &root)
+        .into_iter()
+        .map(|(rel, _, _)| rel)
+        .collect();
+    assert_eq!(entries, indexed);
+    assert_eq!(entries.len(), 1 + 8 * (2 + 8) + 8 * 5 * 4);
 }

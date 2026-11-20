@@ -21,7 +21,8 @@ use windows::core::PCWSTR;
 use crate::arena::Index;
 use crate::query::{CancelToken, SearchOptions, parse_query};
 use crate::win::walker::{
-    WalkFoldersReport, WalkOptions, merge_index_with_report, walk_root_report,
+    DirSource, WalkBatch, WalkFolderRef, WalkFoldersReport, WalkOptions, Win32DirSource,
+    merge_index_with_report, walk_with_source_streaming,
 };
 use crate::win::watcher::{
     DeniedFilter, NoopWatcherFs, NotifyRecord, VolumeWatcher, WatcherConfig, Win32WatcherFs,
@@ -29,12 +30,14 @@ use crate::win::watcher::{
     renames_resolved_in_index, replay_records_filtered,
 };
 use crate::win::{
-    is_ntfs_volume, lock_or_recover, normalize_display_path, open_dir_handle,
+    is_ntfs_volume, join_child_path, lock_or_recover, normalize_display_path, open_dir_handle,
     query_dir_info_by_handle, read_or_recover, to_extended_path, wait_or_recover,
     wait_timeout_or_recover, wide_null, win32_to_io, write_or_recover,
 };
 
 const DRIVE_FIXED: u32 = 3;
+/// How often a first walk moves what it has listed into the searchable index.
+const PROGRESSIVE_INTERVAL: Duration = Duration::from_millis(500);
 const HOURLY_SAVE_INTERVAL: Duration = Duration::from_secs(3600);
 const DAILY_REWALK_INTERVAL: Duration = Duration::from_secs(86400);
 const HOUSEKEEP_TICK: Duration = Duration::from_secs(60);
@@ -160,6 +163,8 @@ struct VolumeState {
     index: Arc<RwLock<Index>>,
     dirty: Arc<AtomicBool>,
     scanning: Arc<AtomicBool>,
+    /// The index holds a first walk that has not finished yet.
+    partial: Arc<AtomicBool>,
     rewalk_cancel: Arc<AtomicBool>,
     rewalk_coord: Arc<(Mutex<RewalkCoord>, Condvar)>,
     watcher: Option<VolumeWatcher>,
@@ -287,6 +292,7 @@ impl Service {
             let denied_filter = Arc::new(RwLock::new(DeniedFilter::default()));
             let dirty = Arc::new(AtomicBool::new(false));
             let scanning = Arc::new(AtomicBool::new(true));
+            let partial = Arc::new(AtomicBool::new(false));
             let rewalk_cancel = Arc::new(AtomicBool::new(false));
             let rewalk_coord = Arc::new((
                 Mutex::new(RewalkCoord {
@@ -346,6 +352,7 @@ impl Service {
                 let denied_w = Arc::clone(&denied_filter);
                 let dirty_w = Arc::clone(&dirty);
                 let scanning_w = Arc::clone(&scanning);
+                let partial_w = Arc::clone(&partial);
                 let cancel_w = Arc::clone(&rewalk_cancel);
                 let coord_w = Arc::clone(&rewalk_coord);
                 let ev_w = Arc::clone(&on_event);
@@ -355,6 +362,7 @@ impl Service {
                     .name(format!("fm-rewalk:{root_w}"))
                     .spawn(move || {
                         rewalk_worker(
+                            &Win32DirSource,
                             &root_w,
                             index_w,
                             apply_w,
@@ -362,6 +370,7 @@ impl Service {
                             use_file_id,
                             dirty_w,
                             scanning_w,
+                            partial_w,
                             cancel_w,
                             coord_w,
                             overflow_cd,
@@ -380,6 +389,7 @@ impl Service {
                 index,
                 dirty,
                 scanning,
+                partial,
                 rewalk_cancel,
                 rewalk_coord,
                 watcher,
@@ -508,6 +518,10 @@ impl Service {
             for vol in &self.volumes {
                 if cancel.is_cancelled() {
                     return None;
+                }
+                // Mid first walk the sums are partial; they would show as real sizes.
+                if vol.partial.load(Ordering::Acquire) {
+                    continue;
                 }
                 let guard = read_or_recover(&vol.index);
                 if let Some(id) = guard.lookup(p).filter(|&id| guard.is_dir(id)) {
@@ -677,7 +691,8 @@ fn housekeep_loop(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn rewalk_worker(
+fn rewalk_worker<S: DirSource>(
+    source: &S,
     root: &str,
     index: Arc<RwLock<Index>>,
     apply_mu: Arc<Mutex<()>>,
@@ -685,11 +700,14 @@ fn rewalk_worker(
     use_file_id: bool,
     dirty: Arc<AtomicBool>,
     scanning: Arc<AtomicBool>,
+    partial: Arc<AtomicBool>,
     cancel: Arc<AtomicBool>,
     coord: Arc<(Mutex<RewalkCoord>, Condvar)>,
     overflow_cooldown: Duration,
     on_event: Arc<dyn Fn(Event) + Send + Sync>,
-) {
+) where
+    S::Handle: Send,
+{
     let (mu, cv) = &*coord;
     let fs = Win32WatcherFs;
     let mut emitted_initial_ready = false;
@@ -746,12 +764,37 @@ fn rewalk_worker(
             ..Default::default()
         };
         let walk_started = Instant::now();
-        let walk_res = walk_root_report(root, walk_opts, &cancel, |entries| {
-            on_event(Event::Progress {
-                root: root.to_owned(),
-                entries,
-            });
-        });
+        // Nothing indexed yet (no snapshot): show results while the walk runs. A re-walk keeps
+        // the existing index untouched until its merge.
+        let progressive = read_or_recover(&index).is_empty();
+        if progressive {
+            partial.store(true, Ordering::Release);
+        }
+        let batches = Mutex::new(Vec::new());
+        let sink = |b: WalkBatch| lock_or_recover(&batches).push(b);
+        let mut last_insert: Option<Instant> = None;
+        let walk_res = walk_with_source_streaming(
+            source,
+            root,
+            walk_opts,
+            &cancel,
+            |entries| {
+                on_event(Event::Progress {
+                    root: root.to_owned(),
+                    entries,
+                });
+                if progressive && last_insert.is_none_or(|t| t.elapsed() >= PROGRESSIVE_INTERVAL)
+                {
+                    last_insert = Some(Instant::now());
+                    let listed = std::mem::take(&mut *lock_or_recover(&batches));
+                    if insert_walk_batches(root, &index, &apply_mu, &denied_filter, listed) {
+                        on_event(Event::Changed);
+                    }
+                }
+            },
+            progressive.then_some(&sink as &(dyn Fn(WalkBatch) + Sync)),
+        );
+        drop(batches);
 
         let Some((fresh, stats, walk_report)) = walk_res else {
             let mut st = lock_or_recover(mu);
@@ -792,9 +835,11 @@ fn rewalk_worker(
             fresh,
             &walk_report,
             use_file_id,
+            progressive,
             &fs,
             &cancel,
         );
+        partial.store(false, Ordering::Release);
 
         if changed {
             dirty.store(true, Ordering::Release);
@@ -839,6 +884,7 @@ fn apply_rewalk_result(
     fresh: Index,
     walk_report: &WalkFoldersReport,
     use_file_id: bool,
+    progressive: bool,
     fs: &dyn crate::win::watcher::WatcherFs,
     cancel: &AtomicBool,
 ) -> (bool, usize) {
@@ -859,6 +905,11 @@ fn apply_rewalk_result(
             // `live` was not merged and the watcher already applied every captured record to
             // it; replaying them again is not idempotent. Keep live and the denied filter.
             return (false, live.len());
+        }
+        if progressive {
+            // `live` holds only what this walk showed while it ran (plus watcher edits, which
+            // the replay re-applies): `fresh` replaces it as on any first walk, tightly sized.
+            *live = Index::new();
         }
 
         let active_denied = DeniedFilter::from_walk(&walk_report.denied);
@@ -926,6 +977,65 @@ fn apply_rewalk_result(
         );
     }
     (changed, live.len())
+}
+
+/// Puts a first walk's listings into the live index while the walk runs (the finished walk then
+/// replaces them). Each folder appears with its own listing, so one that failed before listing
+/// anything never shows, as after the walk. Entries are found by path because the watcher may
+/// compact `live` meanwhile, renumbering every `EntryId`. The volume serial stays unset until the
+/// walk ends, so a snapshot saved from a cancelled walk fails to load (on volumes with a serial).
+/// Returns `true` if anything was inserted.
+fn insert_walk_batches(
+    root: &str,
+    index: &RwLock<Index>,
+    apply_mu: &Mutex<()>,
+    denied_filter: &RwLock<DeniedFilter>,
+    batches: Vec<WalkBatch>,
+) -> bool {
+    if batches.is_empty() {
+        return false;
+    }
+    let _apply_guard = lock_or_recover(apply_mu);
+    let mut live = write_or_recover(index);
+    let mut denied = Vec::new();
+    let mut changed = false;
+    for b in batches {
+        // A root that lists nothing is root_failed or empty: the end of the walk decides both.
+        if b.children.is_empty() && (b.failed || b.rel_path.is_empty()) {
+            continue;
+        }
+        let id = if b.rel_path.is_empty() {
+            live.add_root(root)
+        } else {
+            let (parent_rel, name) = b.rel_path.rsplit_once('\\').unwrap_or(("", &b.rel_path));
+            // Gone or renamed by the watcher meanwhile: the end of the walk settles it.
+            let Some(parent) = live
+                .lookup(&join_child_path(root, parent_rel))
+                .filter(|&p| live.is_dir(p))
+            else {
+                continue;
+            };
+            live.insert(parent, name, b.meta)
+        };
+        for (name, meta, descend) in &b.children {
+            if !descend {
+                live.insert(id, name, *meta);
+            }
+        }
+        if b.denied {
+            denied.push(WalkFolderRef {
+                file_id: b.meta.file_id,
+                rel_path: b.rel_path,
+            });
+        }
+        changed = true;
+    }
+    // The watcher already applies to these folders; drop its updates under denied ones now,
+    // not only once the walk ends.
+    if !denied.is_empty() {
+        write_or_recover(denied_filter).extend_from(&denied);
+    }
+    changed
 }
 
 fn resolve_volume_serial(root: &str) -> u32 {
@@ -1044,11 +1154,13 @@ fn save_volume_snapshot(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::mpsc;
+
     use fm_fs::attrs::DIRECTORY;
 
     use super::*;
     use crate::Meta;
-    use crate::win::walker::WalkFolderRef;
+    use crate::win::walker::{DirEntryRef, RootInfo, walk_with_source_report};
     use crate::win::watcher::NotifyAction;
 
     #[test]
@@ -1104,6 +1216,7 @@ mod tests {
             Index::new(),
             &failed_report,
             true,
+            false,
             &NoopWatcherFs,
             &AtomicBool::new(false),
         );
@@ -1184,6 +1297,7 @@ mod tests {
             fresh,
             report,
             use_file_id,
+            false,
             &NoopWatcherFs,
             &AtomicBool::new(false),
         );
@@ -1465,11 +1579,13 @@ mod tests {
             let (root, coord, readys) = (root.clone(), Arc::clone(&coord), Arc::clone(&readys));
             thread::spawn(move || {
                 rewalk_worker(
+                    &Win32DirSource,
                     &root,
                     Arc::new(RwLock::new(Index::new())),
                     Arc::new(Mutex::new(())),
                     Arc::new(RwLock::new(DeniedFilter::default())),
                     true,
+                    Arc::new(AtomicBool::new(false)),
                     Arc::new(AtomicBool::new(false)),
                     Arc::new(AtomicBool::new(false)),
                     Arc::new(AtomicBool::new(false)),
@@ -1505,5 +1621,390 @@ mod tests {
             failed_walk_cooldown(Duration::from_secs(60), 40),
             FAILED_WALK_RETRY_MAX
         );
+    }
+
+    #[test]
+    fn rename_race_in_progressive_first_walk_leaves_one_folder() {
+        // During a first walk the watcher already applies: it renames P -> Q (P not shown yet,
+        // so it lands as an Added Q), then P's pre-rename listing is inserted. Live holds two
+        // folders with FileId 10. When a walker worker panics, the retry merges that partial
+        // index (a finished first walk replaces it instead): merge + replay must leave only Q.
+        for q_listed in [false, true] {
+            for use_file_id in [true, false] {
+                let mut live = Index::new();
+                let r = live.add_root("R:\\");
+                live.set_file_id(r, 1);
+                let d = live.insert(r, "D", meta(DIRECTORY, 2));
+                let q = live.insert(d, "Q", meta(DIRECTORY, 10));
+                let p = live.insert(d, "P", meta(DIRECTORY, 10));
+                let mut fresh = Index::new();
+                let fr = fresh.add_root("R:\\");
+                fresh.set_file_id(fr, 1);
+                let fd = fresh.insert(fr, "D", meta(DIRECTORY, 2));
+                let fp = fresh.insert(fd, "P", meta(DIRECTORY, 10));
+                for (fid, name) in [(11, "c1.txt"), (12, "c2.txt")] {
+                    live.insert(p, name, meta(ARC, fid));
+                    if q_listed {
+                        live.insert(q, name, meta(ARC, fid));
+                    }
+                    fresh.insert(fp, name, meta(ARC, fid));
+                }
+                let co = coord(true);
+                capture_during_walk(
+                    &co.0,
+                    &[
+                        rec(NotifyAction::RenamedOldName, "D\\P", 10, 2, DIRECTORY),
+                        rec(NotifyAction::RenamedNewName, "D\\Q", 10, 2, DIRECTORY),
+                    ],
+                );
+                let (idx, _) = rewalk(live, fresh, &WalkFoldersReport::default(), &co, use_file_id);
+                let tag = format!("q_listed={q_listed} use_file_id={use_file_id}");
+                assert!(idx.lookup("R:\\D\\Q\\c1.txt").is_some(), "{tag}");
+                assert!(idx.lookup("R:\\D\\Q\\c2.txt").is_some(), "{tag}");
+                assert_eq!(idx.lookup("R:\\D\\P"), None, "{tag}");
+                assert_eq!(idx.len(), 5, "{tag}");
+            }
+        }
+    }
+
+    /// Win32 listing where `gate` opens only once released and `gone` never opens (a folder
+    /// that vanished after its parent listed it).
+    struct GatedSource {
+        gate: String,
+        gone: String,
+        open: (Mutex<bool>, Condvar),
+    }
+
+    impl GatedSource {
+        fn release(&self) {
+            *self.open.0.lock().unwrap() = true;
+            self.open.1.notify_all();
+        }
+    }
+
+    impl DirSource for GatedSource {
+        type Handle = <Win32DirSource as DirSource>::Handle;
+        type Scratch = <Win32DirSource as DirSource>::Scratch;
+
+        fn open_dir(&self, path: &str) -> io::Result<Self::Handle> {
+            if path == self.gone {
+                return Err(io::ErrorKind::NotFound.into());
+            }
+            if path == self.gate {
+                let mut open = self.open.0.lock().unwrap();
+                while !*open {
+                    open = self.open.1.wait(open).unwrap();
+                }
+            }
+            Win32DirSource.open_dir(path)
+        }
+
+        fn root_info(&self, dir: &Self::Handle) -> io::Result<RootInfo> {
+            Win32DirSource.root_info(dir)
+        }
+
+        fn read_batch(
+            &self,
+            dir: &Self::Handle,
+            restart: bool,
+            scratch: &mut Self::Scratch,
+            emit: &mut dyn FnMut(DirEntryRef<'_>),
+        ) -> io::Result<bool> {
+            Win32DirSource.read_batch(dir, restart, scratch, emit)
+        }
+    }
+
+    /// Temp tree `top.txt, empty\, sub\needle_alpha.txt, sub\inner\deep.txt, gate\late.txt,
+    /// gone\x.txt`: returns its directory, display root, and a source gating `gate`.
+    fn gated_tree(tag: &str) -> (PathBuf, String, Arc<GatedSource>) {
+        let dir = std::env::temp_dir().join(format!(
+            "fm_idx_{tag}_{}_{}",
+            std::process::id(),
+            TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        for d in ["empty", "sub\\inner", "gate", "gone"] {
+            fs::create_dir_all(dir.join(d)).unwrap();
+        }
+        for f in [
+            "top.txt",
+            "sub\\needle_alpha.txt",
+            "sub\\inner\\deep.txt",
+            "gate\\late.txt",
+            "gone\\x.txt",
+        ] {
+            fs::write(dir.join(f), b"x").unwrap();
+        }
+        let root = normalize_display_path(&dir.to_string_lossy());
+        // NTFS refreshes a folder's mtime in its parent's listing lazily (on open): settle it
+        // so walks run at different times list the same values.
+        let settle = walk_with_source_report(
+            &Win32DirSource,
+            &root,
+            WalkOptions::default(),
+            &AtomicBool::new(false),
+            |_| {},
+        );
+        assert!(settle.is_some());
+        let src = Arc::new(GatedSource {
+            gate: join_child_path(&root, "gate"),
+            gone: join_child_path(&root, "gone"),
+            open: (Mutex::new(false), Condvar::new()),
+        });
+        (dir, root, src)
+    }
+
+    fn finds(idx: &Index, q: &str) -> Vec<String> {
+        let opts = SearchOptions {
+            include_hidden: true,
+            limit: 10,
+        };
+        let hits = idx.search_scoped(&parse_query(q), None, &opts, &CancelToken::new());
+        hits.unwrap().into_iter().map(|h| idx.path(h.id)).collect()
+    }
+
+    fn listing(idx: &Index) -> Vec<(String, u32, u64, i64, u64)> {
+        let mut v: Vec<_> = idx
+            .iter_ids()
+            .map(|id| {
+                let m = idx.meta(id);
+                (idx.path(id), m.attrs, m.size, m.mtime, m.file_id)
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// One volume's walk thread, started over `root` from `live`.
+    struct Walking {
+        index: Arc<RwLock<Index>>,
+        partial: Arc<AtomicBool>,
+        dirty: Arc<AtomicBool>,
+        cancel: Arc<AtomicBool>,
+        coord: Arc<(Mutex<RewalkCoord>, Condvar)>,
+        events: mpsc::Receiver<Event>,
+        worker: JoinHandle<()>,
+    }
+
+    impl Walking {
+        fn start(src: &Arc<GatedSource>, root: &str, live: Index) -> Self {
+            let index = Arc::new(RwLock::new(live));
+            let partial = Arc::new(AtomicBool::new(false));
+            let dirty = Arc::new(AtomicBool::new(false));
+            let cancel = Arc::new(AtomicBool::new(false));
+            let coord = Arc::new(coord(false));
+            coord.0.lock().unwrap().manual_or_timer_pending = true;
+            let (tx, events) = mpsc::channel();
+            let worker = {
+                let (src, root) = (Arc::clone(src), root.to_owned());
+                let (index, partial, dirty) =
+                    (Arc::clone(&index), Arc::clone(&partial), Arc::clone(&dirty));
+                let (cancel, coord) = (Arc::clone(&cancel), Arc::clone(&coord));
+                thread::spawn(move || {
+                    rewalk_worker(
+                        &*src,
+                        &root,
+                        index,
+                        Arc::new(Mutex::new(())),
+                        Arc::new(RwLock::new(DeniedFilter::default())),
+                        true,
+                        dirty,
+                        Arc::new(AtomicBool::new(false)),
+                        partial,
+                        cancel,
+                        coord,
+                        Duration::ZERO,
+                        Arc::new(move |ev| {
+                            let _ = tx.send(ev);
+                        }),
+                    );
+                })
+            };
+            Self {
+                index,
+                partial,
+                dirty,
+                cancel,
+                coord,
+                events,
+                worker,
+            }
+        }
+
+        /// Waits up to 10 s for a `Changed` and then for `done`, failing if `Ready` comes first.
+        fn changed_until(&self, done: impl Fn(&Index) -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut changed = false;
+            while !(changed && done(&self.index.read().unwrap())) {
+                assert!(Instant::now() < deadline, "no progressive result in 10 s");
+                match self.events.recv_timeout(Duration::from_millis(50)) {
+                    Ok(Event::Ready { .. }) => panic!("Ready came before progressive results"),
+                    Ok(Event::Changed) => changed = true,
+                    _ => {}
+                }
+            }
+        }
+
+        fn wait_ready(&self) {
+            loop {
+                match self.events.recv_timeout(Duration::from_secs(10)) {
+                    Ok(Event::Ready { .. }) => return,
+                    Ok(_) => {}
+                    Err(e) => panic!("no Ready: {e}"),
+                }
+            }
+        }
+
+        fn stop(self) -> Index {
+            self.coord.0.lock().unwrap().stop = true;
+            self.coord.1.notify_all();
+            self.worker.join().unwrap();
+            std::mem::take(&mut *self.index.write().unwrap())
+        }
+    }
+
+    #[test]
+    fn first_walk_is_searchable_before_ready_and_ends_like_a_plain_walk() {
+        let (dir, root, src) = gated_tree("progressive");
+        let w = Walking::start(&src, &root, Index::new());
+        let needle = join_child_path(&root, "sub\\needle_alpha.txt");
+        w.changed_until(|idx| finds(idx, "needle_alpha") == [needle.clone()]);
+        {
+            let idx = w.index.read().unwrap();
+            let at = |rel: &str| idx.lookup(&join_child_path(&root, rel));
+            assert!(at("empty").is_some(), "an empty folder shows with its own listing");
+            assert!(at("sub\\inner\\deep.txt").is_some());
+            assert_eq!(at("gate\\late.txt"), None, "the walk is still gated");
+            assert_eq!(at("gone"), None, "a folder that failed to list never shows");
+            assert_eq!(idx.volume_serial(), 0, "a partial index must not load as a snapshot");
+        }
+        assert!(w.partial.load(Ordering::Acquire), "folder sizes wait for the merge");
+        src.release();
+        w.wait_ready();
+        assert!(!w.partial.load(Ordering::Acquire) && w.dirty.load(Ordering::Acquire));
+        let live = w.stop();
+
+        // What the non-progressive first walk produced: the fresh index merged into an empty one.
+        let (fresh, _, report) = walk_with_source_report(
+            &*src,
+            &root,
+            WalkOptions::default(),
+            &AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap();
+        let mut plain = Index::new();
+        merge_index_with_report(&mut plain, fresh, &report, true);
+        assert_eq!(live.len(), plain.len());
+        assert_eq!(listing(&live), listing(&plain));
+        assert_eq!(live.volume_serial(), plain.volume_serial());
+        assert!(live.lookup(&join_child_path(&root, "gate\\late.txt")).is_some());
+        assert_eq!(live.lookup(&join_child_path(&root, "gone")), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rewalk_over_an_existing_index_is_not_progressive() {
+        let (dir, root, src) = gated_tree("rewalk");
+        let mut live = Index::new();
+        let r = live.add_root(&root);
+        live.insert(r, "stale.txt", meta(ARC, 0));
+        let w = Walking::start(&src, &root, live);
+        // Gated for two insert intervals: a progressive walk would insert at its first tick.
+        let until = Instant::now() + PROGRESSIVE_INTERVAL * 2;
+        let mut ticks = 0;
+        while Instant::now() < until {
+            match w.events.recv_timeout(Duration::from_millis(50)) {
+                Ok(Event::Progress { .. }) => ticks += 1,
+                Ok(ev) => panic!("{ev:?} while the re-walk is gated"),
+                Err(_) => {}
+            }
+        }
+        assert!(ticks >= 3, "{ticks} progress ticks");
+        let needle = join_child_path(&root, "sub\\needle_alpha.txt");
+        {
+            let idx = w.index.read().unwrap();
+            assert_eq!(idx.len(), 2);
+            assert_eq!(idx.lookup(&needle), None);
+        }
+        assert!(!w.partial.load(Ordering::Acquire));
+        src.release();
+        w.wait_ready();
+        let idx = w.stop();
+        assert!(idx.lookup(&needle).is_some());
+        assert_eq!(idx.lookup(&join_child_path(&root, "stale.txt")), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn walk_batches_show_denied_folders_filtered_and_never_failed_ones() {
+        let batch = |rel: &str, fid, failed, denied, children: Vec<(String, Meta, bool)>| {
+            WalkBatch {
+                rel_path: rel.to_owned(),
+                meta: meta(DIRECTORY, fid),
+                failed,
+                denied,
+                children,
+            }
+        };
+        let kid = |name: &str, attrs, fid, descend| (name.to_owned(), meta(attrs, fid), descend);
+        let batches = vec![
+            batch(
+                "",
+                1,
+                false,
+                false,
+                vec![
+                    kid("Secret", DIRECTORY, 2, true),
+                    kid("Gone", DIRECTORY, 3, true),
+                    kid("a.txt", ARC, 4, false),
+                ],
+            ),
+            batch("Secret", 2, false, true, Vec::new()),
+            batch("Gone", 3, true, false, Vec::new()),
+        ];
+        let index = RwLock::new(Index::new());
+        let denied = RwLock::new(DeniedFilter::default());
+        assert!(insert_walk_batches("R:\\", &index, &Mutex::new(()), &denied, batches));
+        let idx = index.into_inner().unwrap();
+        assert!(idx.lookup("R:\\Secret").is_some_and(|s| idx.is_dir(s)));
+        assert!(idx.lookup("R:\\a.txt").is_some());
+        assert_eq!(idx.lookup("R:\\Gone"), None, "a failed folder that listed nothing");
+        assert_eq!(idx.len(), 3);
+        let under = rec(NotifyAction::Added, "Secret\\leak.txt", 9, 2, ARC);
+        let df = denied.into_inner().unwrap();
+        for use_file_id in [true, false] {
+            assert!(df.is_record_denied(Some((&idx, 0)), &under, use_file_id));
+        }
+        let beside = rec(NotifyAction::Added, "b.txt", 10, 1, ARC);
+        assert!(!df.is_record_denied(Some((&idx, 0)), &beside, true));
+    }
+
+    #[test]
+    fn cancelled_first_walk_stops_cleanly_and_its_snapshot_does_not_load() {
+        let (dir, root, src) = gated_tree("cancel");
+        let w = Walking::start(&src, &root, Index::new());
+        w.changed_until(|idx| !finds(idx, "needle_alpha").is_empty());
+        w.cancel.store(true, Ordering::Release);
+        // The gated worker must return for the walk to end (a real listing would).
+        src.release();
+        let partial = Arc::clone(&w.partial);
+        let live = w.stop();
+        assert!(partial.load(Ordering::Acquire));
+        assert!(!live.is_empty());
+        assert_eq!(live.volume_serial(), 0);
+
+        // Saved at exit, the partial index carries serial 0 and is rejected on the next start.
+        let serial = resolve_volume_serial(&root);
+        assert_ne!(serial, 0, "needs a volume with a serial");
+        let data_dir = dir.join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let saved = RwLock::new(live);
+        assert!(matches!(
+            save_volume_snapshot(&data_dir, serial, &saved, &AtomicBool::new(true)),
+            Ok(true)
+        ));
+        let path = snapshot_path(&data_dir, serial);
+        assert!(load_snapshot_for_root(&path, serial, &root).is_empty());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

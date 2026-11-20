@@ -65,6 +65,23 @@ pub struct WalkStats {
     pub millis: u64,
 }
 
+/// One directory's listing, handed to the sink of [`walk_with_source_streaming`] as soon as the
+/// directory is read.
+#[derive(Debug, Clone)]
+pub struct WalkBatch {
+    /// Directory path relative to the walk root (`""` for the root itself).
+    pub rel_path: String,
+    /// The directory's own metadata as its parent listed it (root: `DIRECTORY` + its root info).
+    pub meta: Meta,
+    /// Listing failed with an error other than access denied (see [`WalkFoldersReport::failed`]).
+    pub failed: bool,
+    /// Listing was refused with access denied (see [`WalkFoldersReport::denied`]).
+    pub denied: bool,
+    /// Children as listed: name, metadata, and whether the walk descends into it (its own batch
+    /// then reaches the sink after this one).
+    pub children: Vec<(String, Meta, bool)>,
+}
+
 /// Configuration for [`walk_root`] and [`walk_with_source`].
 #[derive(Debug, Clone, Copy)]
 pub struct WalkOptions {
@@ -328,7 +345,24 @@ pub fn walk_with_source_report<S: DirSource>(
     root: &str,
     opts: WalkOptions,
     cancel: &AtomicBool,
+    on_progress: impl FnMut(usize),
+) -> Option<(Index, WalkStats, WalkFoldersReport)>
+where
+    S::Handle: Send,
+{
+    walk_with_source_streaming(source, root, opts, cancel, on_progress, None)
+}
+
+/// [`walk_with_source_report`] that also hands every listed directory to `sink`, from the worker
+/// threads. A directory's batch reaches `sink` before any of its subdirectories is queued, so it
+/// always arrives before the batches of its subdirectories.
+pub fn walk_with_source_streaming<S: DirSource>(
+    source: &S,
+    root: &str,
+    opts: WalkOptions,
+    cancel: &AtomicBool,
     mut on_progress: impl FnMut(usize),
+    sink: Option<&(dyn Fn(WalkBatch) + Sync)>,
 ) -> Option<(Index, WalkStats, WalkFoldersReport)>
 where
     S::Handle: Send,
@@ -395,7 +429,7 @@ where
         dir_id: u32,
         path: String,
         rel_path: String,
-        file_id: u64,
+        meta: Meta,
         depth: u16,
         preopened: Option<H>,
     }
@@ -462,7 +496,12 @@ where
         dir_id: 0,
         path: root_display.clone(),
         rel_path: String::new(),
-        file_id: root_info.file_id,
+        meta: Meta {
+            attrs: DIRECTORY,
+            size: 0,
+            mtime: root_info.mtime,
+            file_id: root_info.file_id,
+        },
         depth: 0,
         preopened: Some(root_handle),
     });
@@ -560,6 +599,8 @@ where
                     let batch_start = nodes.len();
                     let mut local_dirs = 0usize;
                     let mut local_files = 0usize;
+                    let (failed_before, denied_before) = (failed.len(), denied.len());
+                    let mut listed = Vec::new();
                     pending_tasks.clear();
 
                     match dir_handle {
@@ -589,6 +630,12 @@ where
                                             && (!is_reparse
                                                 || is_cloud_reparse_tag(entry.reparse_tag))
                                             && task.depth + 1 < opts.max_depth;
+                                        let meta = Meta {
+                                            attrs: entry.attrs,
+                                            size: if is_dir { 0 } else { entry.size },
+                                            mtime: entry.mtime,
+                                            file_id: entry.file_id,
+                                        };
 
                                         let child_dir_id = if should_descend {
                                             let did = next_dir_id.fetch_add(1, Ordering::Relaxed);
@@ -601,7 +648,7 @@ where
                                                 dir_id: did,
                                                 path: join_child_path(&task.path, entry.name),
                                                 rel_path: child_rel,
-                                                file_id: entry.file_id,
+                                                meta,
                                                 depth: task.depth + 1,
                                                 preopened: None,
                                             });
@@ -619,16 +666,18 @@ where
                                             local_files += 1;
                                         }
 
+                                        if sink.is_some() {
+                                            listed.push((
+                                                entry.name.to_owned(),
+                                                meta,
+                                                should_descend,
+                                            ));
+                                        }
                                         nodes.push(ScannedNode {
                                             child_dir_id,
                                             name_off,
                                             name_len,
-                                            meta: Meta {
-                                                attrs: entry.attrs,
-                                                size: if is_dir { 0 } else { entry.size },
-                                                mtime: entry.mtime,
-                                                file_id: entry.file_id,
-                                            },
+                                            meta,
                                         });
                                     },
                                 );
@@ -640,7 +689,7 @@ where
                                     Err(err) => {
                                         record_io_error(&err, &denied_count, &error_count);
                                         let fref = WalkFolderRef {
-                                            file_id: task.file_id,
+                                            file_id: task.meta.file_id,
                                             rel_path: task.rel_path.clone(),
                                         };
                                         if is_access_denied(&err) {
@@ -662,7 +711,7 @@ where
                         Err(err) => {
                             record_io_error(&err, &denied_count, &error_count);
                             let fref = WalkFolderRef {
-                                file_id: task.file_id,
+                                file_id: task.meta.file_id,
                                 rel_path: task.rel_path.clone(),
                             };
                             if is_access_denied(&err) {
@@ -689,6 +738,17 @@ where
                         if local_files > 0 {
                             files_count.fetch_add(local_files, Ordering::Relaxed);
                         }
+                    }
+
+                    // Before `pending_tasks` is queued: no subdirectory batch can overtake this one.
+                    if let Some(sink) = sink {
+                        sink(WalkBatch {
+                            rel_path: task.rel_path,
+                            meta: task.meta,
+                            failed: failed.len() > failed_before,
+                            denied: denied.len() > denied_before,
+                            children: listed,
+                        });
                     }
 
                     active_guard.active = false;
