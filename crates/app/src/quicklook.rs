@@ -668,7 +668,7 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
                     }
                     VK_LEFT | VK_RIGHT | VK_UP | VK_DOWN | VK_HOME | VK_END => {
                         // Move the selection in the main window; the preview follows.
-                        crate::win::forward_key(vk);
+                        crate::win::forward_key(hwnd, vk);
                     }
                     _ => {}
                 }

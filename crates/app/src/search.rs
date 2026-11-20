@@ -5,8 +5,10 @@ use crate::fsys;
 use std::path::PathBuf;
 use windows::Win32::Foundation::{LPARAM, WPARAM};
 
-pub fn start(_app: &mut App) {}
+pub fn start() {}
 pub fn stop() {}
+pub fn forget(_hwnd: windows::Win32::Foundation::HWND) {}
+pub fn index_event(_w: WPARAM, _l: LPARAM) {}
 
 pub fn default_scope(from: &Loc) -> Option<PathBuf> {
     from.folder().map(|p| p.to_path_buf())
@@ -34,4 +36,4 @@ pub fn run(app: &mut App) {
     t.sel = crate::sel::Selection::new(t.entries.len());
 }
 
-pub fn message(_app: &mut App, _msg: u32, _w: WPARAM, _l: LPARAM) {}
+pub fn message(_app: &mut App, _w: WPARAM, _l: LPARAM) {}

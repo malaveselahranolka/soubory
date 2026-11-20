@@ -15,7 +15,7 @@ use windows::{
         Foundation::*,
         Graphics::{Dwm::*, Gdi::*},
         Storage::FileSystem::*,
-        System::{LibraryLoader::*, Threading::*},
+        System::{DataExchange::COPYDATASTRUCT, LibraryLoader::*, Threading::*},
         UI::{Controls::*, HiDpi::*, Input::KeyboardAndMouse::*, Shell::*, WindowsAndMessaging::*},
     },
     core::*,
@@ -39,6 +39,8 @@ enum EditKind {
 }
 
 struct Edit {
+    /// The main window the edit belongs to.
+    owner: HWND,
     hwnd: HWND,
     kind: EditKind,
     index: usize,
@@ -55,13 +57,83 @@ struct Watch {
 
 thread_local! {
     static EDITS: RefCell<Vec<Edit>> = const { RefCell::new(Vec::new()) };
-    static WATCH: RefCell<Option<Watch>> = const { RefCell::new(None) };
-    static APP: RefCell<*mut App> = const { RefCell::new(std::ptr::null_mut()) };
-    static SEARCH_PREV: RefCell<Option<Loc>> = const { RefCell::new(None) };
+    static WATCHES: RefCell<Vec<(isize, Watch)>> = const { RefCell::new(Vec::new()) };
+    /// Our main windows, oldest first. Each one's App lives behind GWLP_USERDATA.
+    static WINDOWS: RefCell<Vec<isize>> = const { RefCell::new(Vec::new()) };
+    /// Message-only window for process-wide events: thumbnails, the index, a second launch.
+    static HUB: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
 }
 
-pub fn app_ptr() -> *mut App {
-    APP.with(|a| *a.borrow())
+const MAIN_CLASS: PCWSTR = w!("FmMainWindow");
+const HUB_CLASS: PCWSTR = w!("FmHub");
+const COPY_OPEN: usize = 0x666D_0001;
+
+/// The App behind one of our main windows; null for any other window.
+pub fn app_of(hwnd: HWND) -> *mut App {
+    if hwnd.is_invalid() || !WINDOWS.with(|w| w.borrow().contains(&(hwnd.0 as isize))) {
+        return std::ptr::null_mut();
+    }
+    unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App }
+}
+
+pub fn windows() -> Vec<HWND> {
+    WINDOWS.with(|w| w.borrow().iter().map(|&h| HWND(h as *mut c_void)).collect())
+}
+
+/// Runs `f` on every open window's App (prefs and favorites changes, index events).
+pub fn for_each_app(mut f: impl FnMut(&mut App)) {
+    for h in windows() {
+        if let Some(app) = unsafe { app_of(h).as_mut() } {
+            f(app);
+        }
+    }
+}
+
+pub fn invalidate_all() {
+    for_each_app(|a| a.invalidate());
+}
+
+pub fn hub() -> HWND {
+    HUB.with(|h| HWND(h.get() as *mut c_void))
+}
+
+/// Single instance (`Local\fm.main`): a second launch hands its folder to the running process,
+/// which opens a window for it. Returns true when handed over (this process should exit).
+pub fn hand_over(path: Option<&Path>) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    unsafe {
+        // The handle stays open for the life of the process; that is what marks the instance.
+        let _ = CreateMutexW(None, false, w!("Local\\fm.main"));
+        if GetLastError() != ERROR_ALREADY_EXISTS {
+            return false;
+        }
+        for _ in 0..30 {
+            if let Ok(hub) = FindWindowExW(Some(HWND_MESSAGE), None, HUB_CLASS, None) {
+                let mut pid = 0u32;
+                GetWindowThreadProcessId(hub, Some(&mut pid));
+                let _ = AllowSetForegroundWindow(pid);
+                let s: Vec<u16> = path.map(|p| p.as_os_str().encode_wide().collect()).unwrap_or_default();
+                let cds = COPYDATASTRUCT {
+                    dwData: COPY_OPEN,
+                    cbData: (s.len() * 2) as u32,
+                    lpData: s.as_ptr() as *mut c_void,
+                };
+                let mut res = 0usize;
+                let ok = SendMessageTimeoutW(
+                    hub,
+                    WM_COPYDATA,
+                    WPARAM(0),
+                    LPARAM(&cds as *const COPYDATASTRUCT as isize),
+                    SMTO_ABORTIFHUNG,
+                    5000,
+                    Some(&mut res),
+                );
+                return ok.0 != 0 && res != 0;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        false
+    }
 }
 
 pub fn run(start: Loc) -> i32 {
@@ -70,7 +142,6 @@ pub fn run(start: Loc) -> i32 {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         allow_dark_menus();
         let hinst = GetModuleHandleW(None).unwrap_or_default();
-        let class = w!("FmMainWindow");
         let icon = folder_icon();
         let wc = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
@@ -78,19 +149,63 @@ pub fn run(start: Loc) -> i32 {
             lpfnWndProc: Some(wndproc),
             hInstance: hinst.into(),
             hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
-            lpszClassName: class,
+            lpszClassName: MAIN_CLASS,
             hIcon: icon,
             hIconSm: icon,
             ..Default::default()
         };
         RegisterClassExW(&wc);
+        let hub_wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(hub_proc),
+            hInstance: hinst.into(),
+            lpszClassName: HUB_CLASS,
+            ..Default::default()
+        };
+        RegisterClassExW(&hub_wc);
+        if let Ok(h) = CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            HUB_CLASS,
+            None,
+            WINDOW_STYLE(0),
+            0,
+            0,
+            0,
+            0,
+            Some(HWND_MESSAGE),
+            None,
+            Some(hinst.into()),
+            None,
+        ) {
+            HUB.with(|c| c.set(h.0 as isize));
+        }
 
-        let mut app = Box::new(App::new(start));
+        let Some(first) = open_window(start, None) else { return 1 };
+        crate::search::start();
+        if let Some(app) = app_of(first).as_mut() {
+            dev_flags(app);
+        }
+
+        let mut msg = MSG::default();
+        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        crate::search::stop();
+        msg.wParam.0 as i32
+    }
+}
+
+/// Opens a main window on `loc`. `near`: cascade from that window (Ctrl+N, a second launch);
+/// otherwise it goes where the last window was closed.
+pub fn open_window(loc: Loc, near: Option<HWND>) -> Option<HWND> {
+    unsafe {
+        let hinst = GetModuleHandleW(None).unwrap_or_default();
+        let mut app = Box::new(App::new(loc));
         crate::prefs::load(&mut app);
         app.side_rows = crate::sidebar::build(&app.prefs.favorites);
         app.reload(None);
-        let app_raw: *mut App = &mut *app;
-        APP.with(|a| *a.borrow_mut() = app_raw);
+        let app_raw: *mut App = Box::into_raw(app);
 
         // Initial size in DIPs, scaled for the primary monitor.
         let mut pt = POINT::default();
@@ -101,7 +216,7 @@ pub fn run(start: Loc) -> i32 {
         let s = dx as f32 / 96.0;
         let hwnd = CreateWindowExW(
             WS_EX_NOREDIRECTIONBITMAP | WS_EX_APPWINDOW,
-            class,
+            MAIN_CLASS,
             w!("Soubory"),
             WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
             CW_USEDEFAULT,
@@ -113,9 +228,10 @@ pub fn run(start: Loc) -> i32 {
             Some(hinst.into()),
             Some(app_raw as *const c_void),
         );
-        let Ok(hwnd) = hwnd else { return 1 };
-        app.hwnd = hwnd;
-        setup_dwm(&mut app);
+        // shortcut: if creation fails before WM_NCCREATE the App leaks; it never does in practice.
+        let Ok(hwnd) = hwnd else { return None };
+        let app = &mut *app_raw;
+        setup_dwm(app);
         let _ = SetWindowPos(
             hwnd,
             None,
@@ -125,25 +241,73 @@ pub fn run(start: Loc) -> i32 {
             0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
         );
-        set_title(&app);
-        watch_current(&mut app);
+        set_title(app);
+        watch_current(app);
         crate::droptarget::register(hwnd);
-        let restored = crate::prefs::restore_window(&app);
-        let maximized = restored && app.prefs.window.is_some_and(|w| w.1);
-        let _ = ShowWindow(hwnd, if maximized { SW_SHOWMAXIMIZED } else if restored { SW_SHOWNORMAL } else { SW_SHOWDEFAULT });
-        crate::search::start(&mut app);
-        dev_flags(&mut app);
-
-        let mut msg = MSG::default();
-        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-            let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+        let mut near_rect = RECT::default();
+        if near.is_some_and(|n| GetWindowRect(n, &mut near_rect).is_ok() && !IsIconic(n).as_bool()) {
+            // Explorer and Finder offset a new window down and right of the current one.
+            let off = (26.0 * app.scale) as i32;
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                near_rect.left + off,
+                near_rect.top + off,
+                near_rect.right - near_rect.left,
+                near_rect.bottom - near_rect.top,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+            let _ = ShowWindow(hwnd, SW_SHOWNORMAL);
+        } else {
+            let restored = crate::prefs::restore_window(app);
+            let maximized = restored && app.prefs.window.is_some_and(|w| w.1);
+            let _ = ShowWindow(hwnd, if maximized { SW_SHOWMAXIMIZED } else if restored { SW_SHOWNORMAL } else { SW_SHOWDEFAULT });
         }
-        stop_watch();
-        crate::search::stop();
-        APP.with(|a| *a.borrow_mut() = std::ptr::null_mut());
-        drop(app);
-        msg.wParam.0 as i32
+        Some(hwnd)
+    }
+}
+
+unsafe extern "system" fn hub_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        match msg {
+            WM_APP_THUMB => {
+                crate::thumbs::arrived(w, l);
+                invalidate_all();
+                Some(LRESULT(0))
+            }
+            WM_APP_INDEX => {
+                crate::search::index_event(w, l);
+                Some(LRESULT(0))
+            }
+            WM_COPYDATA => {
+                let cds = &*(l.0 as *const COPYDATASTRUCT);
+                if cds.dwData != COPY_OPEN {
+                    return Some(LRESULT(0));
+                }
+                let n = cds.cbData as usize / 2;
+                let text = if n == 0 || cds.lpData.is_null() {
+                    String::new()
+                } else {
+                    String::from_utf16_lossy(std::slice::from_raw_parts(cds.lpData as *const u16, n))
+                };
+                let loc = crate::start_loc(&text);
+                let near = GetForegroundWindow();
+                let near = if app_of(near).is_null() { windows().last().copied() } else { Some(near) };
+                if let Some(h) = open_window(loc, near) {
+                    let _ = SetForegroundWindow(h);
+                }
+                Some(LRESULT(1))
+            }
+            _ => None,
+        }
+    }));
+    match r {
+        Ok(Some(r)) => r,
+        Ok(None) => unsafe { DefWindowProcW(hwnd, msg, w, l) },
+        Err(e) => {
+            crate::prefs::log(&format!("panic in hub (msg {msg:#x}): {}", panic_text(&e)));
+            LRESULT(0)
+        }
     }
 }
 
@@ -176,7 +340,7 @@ fn dev_flags(app: &mut App) {
     }
     if let Some(t) = val("--dev-search") {
         focus_search(app);
-        if let Some((h, _)) = edit_of(EditKind::Search) {
+        if let Some((h, _)) = edit_of(app.hwnd, EditKind::Search) {
             let w = wide(&t);
             unsafe {
                 let _ = SetWindowTextW(h, PCWSTR(w.as_ptr()));
@@ -327,9 +491,16 @@ pub fn to_screen(app: &App, x: f32, y: f32) -> POINT {
     p
 }
 
+/// Ctrl+N: a new window on the same folder (Explorer), in this process.
 pub fn new_window(app: &App) {
-    if let (Ok(exe), Some(dir)) = (std::env::current_exe(), app.tab().loc.folder()) {
-        let _ = std::process::Command::new(exe).arg(dir).spawn();
+    let loc = match &app.tab().loc {
+        Loc::Search { .. } => crate::start_loc(""),
+        other => other.clone(),
+    };
+    if let Some(h) = open_window(loc, Some(app.hwnd)) {
+        unsafe {
+            let _ = SetForegroundWindow(h);
+        }
     }
 }
 
@@ -371,9 +542,13 @@ fn paint_now(app: &mut App) {
 
 // ---- folder watching -------------------------------------------------------------------------------------
 
-fn stop_watch() {
-    WATCH.with(|w| {
-        if let Some(mut old) = w.borrow_mut().take() {
+fn stop_watch(hwnd: HWND) {
+    let gone = WATCHES.with(|w| {
+        let mut v = w.borrow_mut();
+        v.iter().position(|(h, _)| *h == hwnd.0 as isize).map(|i| v.remove(i).1)
+    });
+    {
+        if let Some(mut old) = gone {
             unsafe {
                 let _ = SetEvent(old.stop);
             }
@@ -384,7 +559,7 @@ fn stop_watch() {
                 let _ = CloseHandle(old.stop);
             }
         }
-    });
+    }
 }
 
 /// Watches the current folder (not its subtree) and posts WM_APP_FS on any change.
@@ -392,7 +567,7 @@ pub fn watch_current(app: &mut App) {
     if app.offscreen || app.hwnd.is_invalid() {
         return;
     }
-    stop_watch();
+    stop_watch(app.hwnd);
     let Some(dir) = app.tab().loc.folder().map(Path::to_path_buf) else {
         return;
     };
@@ -430,11 +605,14 @@ pub fn watch_current(app: &mut App) {
             }
             let _ = FindCloseChangeNotification(ch);
         });
-        WATCH.with(|w| {
-            *w.borrow_mut() = Some(Watch {
-                stop,
-                thread: Some(thread),
-            })
+        WATCHES.with(|w| {
+            w.borrow_mut().push((
+                hwnd as isize,
+                Watch {
+                    stop,
+                    thread: Some(thread),
+                },
+            ))
         });
     }
 }
@@ -505,7 +683,7 @@ fn create_edit(
     text: &str,
     sel: (i32, i32),
 ) -> Option<HWND> {
-    destroy_edit(kind);
+    destroy_edit(app.hwnd, kind);
     let t = &app.theme;
     let (bg, fg) = match kind {
         EditKind::Search | EditKind::Path => (paint::over(t.field, t.chrome), t.ink),
@@ -556,6 +734,7 @@ fn create_edit(
         let brush = CreateSolidBrush(bgc);
         EDITS.with(|e| {
             e.borrow_mut().push(Edit {
+                owner: app.hwnd,
                 hwnd,
                 kind,
                 index,
@@ -576,10 +755,10 @@ fn create_edit(
     }
 }
 
-fn destroy_edit(kind: EditKind) {
+fn destroy_edit(owner: HWND, kind: EditKind) {
     let gone = EDITS.with(|e| {
         let mut v = e.borrow_mut();
-        v.iter().position(|x| x.kind == kind).map(|i| v.remove(i))
+        v.iter().position(|x| x.owner == owner && x.kind == kind).map(|i| v.remove(i))
     });
     if let Some(ed) = gone {
         unsafe {
@@ -591,11 +770,11 @@ fn destroy_edit(kind: EditKind) {
     }
 }
 
-fn edit_of(kind: EditKind) -> Option<(HWND, usize)> {
+fn edit_of(owner: HWND, kind: EditKind) -> Option<(HWND, usize)> {
     EDITS.with(|e| {
         e.borrow()
             .iter()
-            .find(|x| x.kind == kind)
+            .find(|x| x.owner == owner && x.kind == kind)
             .map(|x| (x.hwnd, x.index))
     })
 }
@@ -613,6 +792,7 @@ fn position_edits(app: &App) {
     let list: Vec<(HWND, EditKind, usize)> = EDITS.with(|e| {
         e.borrow()
             .iter()
+            .filter(|x| x.owner == app.hwnd)
             .map(|x| (x.hwnd, x.kind, x.index))
             .collect()
     });
@@ -632,36 +812,33 @@ fn position_edits(app: &App) {
     }
 }
 
-pub fn search_active(_app: &App) -> bool {
-    edit_of(EditKind::Search).is_some()
+pub fn search_active(app: &App) -> bool {
+    edit_of(app.hwnd, EditKind::Search).is_some()
 }
 
-pub fn renaming_index(_app: &App) -> Option<usize> {
-    edit_of(EditKind::Rename).map(|e| e.1)
+pub fn renaming_index(app: &App) -> Option<usize> {
+    edit_of(app.hwnd, EditKind::Rename).map(|e| e.1)
 }
 
 /// Where the rename field sits, so paint can draw its frame around the EDIT.
 pub fn rename_rect(app: &App) -> Option<crate::geom::Rect> {
-    edit_of(EditKind::Rename).map(|(_, i)| edit_rect(app, EditKind::Rename, i))
+    edit_of(app.hwnd, EditKind::Rename).map(|(_, i)| edit_rect(app, EditKind::Rename, i))
 }
 
-/// Quick Look forwards navigation keys to the main window's selection.
-pub fn forward_key(vk: VIRTUAL_KEY) {
-    let p = app_ptr();
-    if p.is_null() {
-        return;
-    }
-    let app = unsafe { &mut *p };
+/// Quick Look forwards navigation keys to its owner window's selection.
+pub fn forward_key(ql: HWND, vk: VIRTUAL_KEY) {
+    let owner = unsafe { GetWindow(ql, GW_OWNER) }.unwrap_or_default();
+    let Some(app) = (unsafe { app_of(owner).as_mut() }) else { return };
     app.key(vk, false, false, false);
     app.invalidate();
 }
 
-pub fn path_editing() -> bool {
-    edit_of(EditKind::Path).is_some()
+pub fn path_editing(app: &App) -> bool {
+    edit_of(app.hwnd, EditKind::Path).is_some()
 }
 
 pub fn focus_search(app: &mut App) {
-    if let Some((h, _)) = edit_of(EditKind::Search) {
+    if let Some((h, _)) = edit_of(app.hwnd, EditKind::Search) {
         unsafe {
             let _ = SetFocus(Some(h));
             SendMessageW(h, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1)));
@@ -676,14 +853,14 @@ pub fn focus_search(app: &mut App) {
 }
 
 pub fn clear_search(app: &mut App) {
-    destroy_edit(EditKind::Search);
+    destroy_edit(app.hwnd, EditKind::Search);
     app.search_text.clear();
     app.focus = Focus::Content;
     unsafe {
         let _ = SetFocus(Some(app.hwnd));
     }
     if matches!(app.tab().loc, Loc::Search { .. }) {
-        let prev = SEARCH_PREV.with(|p| p.borrow_mut().take());
+        let prev = app.search_prev.take();
         let t = app.tab_mut();
         t.loc = prev.unwrap_or(Loc::Computer);
         t.scroll = 0.0;
@@ -696,7 +873,7 @@ fn search_changed(app: &mut App, text: String) {
     app.search_text = text.clone();
     if text.trim().is_empty() {
         if matches!(app.tab().loc, Loc::Search { .. }) {
-            let prev = SEARCH_PREV.with(|p| p.borrow_mut().take());
+            let prev = app.search_prev.take();
             let t = app.tab_mut();
             t.loc = prev.unwrap_or(Loc::Computer);
             app.reload(None);
@@ -707,8 +884,10 @@ fn search_changed(app: &mut App, text: String) {
     let scope = match &app.tab().loc {
         Loc::Search { scope, .. } => scope.clone(),
         other => {
-            SEARCH_PREV.with(|p| *p.borrow_mut() = Some(other.clone()));
-            crate::search::default_scope(other)
+            let prev = Some(other.clone());
+            let scope = crate::search::default_scope(other);
+            app.search_prev = prev;
+            scope
         }
     };
     let t = app.tab_mut();
@@ -733,7 +912,7 @@ pub fn go_to_folder(app: &mut App) {
 }
 
 fn path_entered(app: &mut App, text: &str) {
-    destroy_edit(EditKind::Path);
+    destroy_edit(app.hwnd, EditKind::Path);
     unsafe {
         let _ = SetFocus(Some(app.hwnd));
     }
@@ -813,13 +992,13 @@ pub fn begin_rename(app: &mut App) {
 }
 
 fn commit_rename(app: &mut App, cancel: bool) {
-    let Some((h, i)) = edit_of(EditKind::Rename) else {
+    let Some((h, i)) = edit_of(app.hwnd, EditKind::Rename) else {
         return;
     };
     let text = edit_text(h);
     // Only take focus back when the edit still has it (not when the user clicked into search).
     let had_focus = unsafe { GetFocus() } == h;
-    destroy_edit(EditKind::Rename);
+    destroy_edit(app.hwnd, EditKind::Rename);
     if had_focus {
         unsafe {
             let _ = SetFocus(Some(app.hwnd));
@@ -859,7 +1038,7 @@ unsafe extern "system" fn edit_proc(
     id: usize,
     _: usize,
 ) -> LRESULT {
-    let app = app_ptr();
+    let app = app_of(unsafe { GetParent(h) }.unwrap_or_default());
     if app.is_null() {
         return unsafe { DefSubclassProc(h, m, w, l) };
     }
@@ -910,7 +1089,7 @@ unsafe extern "system" fn edit_proc(
                         return LRESULT(0);
                     }
                     if !is_char && vk == VK_ESCAPE {
-                        destroy_edit(EditKind::Path);
+                        destroy_edit(app.hwnd, EditKind::Path);
                         unsafe {
                             let _ = SetFocus(Some(app.hwnd));
                         }
@@ -939,7 +1118,7 @@ unsafe extern "system" fn edit_proc(
         }
         (WM_KILLFOCUS, EDIT_PATH) => {
             let r = unsafe { DefSubclassProc(h, m, w, l) };
-            destroy_edit(EditKind::Path);
+            destroy_edit(app.hwnd, EditKind::Path);
             app.invalidate();
             return r;
         }
@@ -949,7 +1128,7 @@ unsafe extern "system" fn edit_proc(
             }
             if app.search_text.is_empty() {
                 let r = unsafe { DefSubclassProc(h, m, w, l) };
-                destroy_edit(EditKind::Search);
+                destroy_edit(app.hwnd, EditKind::Search);
                 app.invalidate();
                 return r;
             }
@@ -1010,10 +1189,25 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
             let app = cs.lpCreateParams as *mut App;
             (*app).hwnd = hwnd;
             (*app).scale = GetDpiForWindow(hwnd) as f32 / 96.0;
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, app as isize);
+            WINDOWS.with(|w| w.borrow_mut().push(hwnd.0 as isize));
             let _ = EnableNonClientDpiScaling(hwnd);
             return DefWindowProcW(hwnd, msg, wparam, lparam);
         }
-        let ptr = app_ptr();
+        if msg == WM_NCDESTROY {
+            // Last message: the window's App goes with it.
+            let p = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App;
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            WINDOWS.with(|w| w.borrow_mut().retain(|&h| h != hwnd.0 as isize));
+            if !p.is_null() {
+                drop(Box::from_raw(p));
+            }
+            if windows().is_empty() {
+                PostQuitMessage(0);
+            }
+            return DefWindowProcW(hwnd, msg, wparam, lparam);
+        }
+        let ptr = app_of(hwnd);
         if ptr.is_null() {
             return DefWindowProcW(hwnd, msg, wparam, lparam);
         }
@@ -1050,7 +1244,7 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                 let (x, y) = (p.x as f32 / app.scale, p.y as f32 / app.scale);
                 match app.hit(x, y) {
                     Hit::Caption(Cap::Max) => LRESULT(HTMAXBUTTON as isize),
-                    Hit::Drag if !path_editing() => LRESULT(HTCAPTION as isize),
+                    Hit::Drag if !path_editing(app) => LRESULT(HTCAPTION as isize),
                     _ => LRESULT(HTCLIENT as isize),
                 }
             }
@@ -1113,7 +1307,7 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                     if let Some(g) = app.gfx.as_mut() {
                         g.resize(w, h);
                     }
-                    if edit_of(EditKind::Rename).is_some() {
+                    if edit_of(app.hwnd, EditKind::Rename).is_some() {
                         commit_rename(app, false);
                     }
                     app.relayout();
@@ -1134,7 +1328,7 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                     SWP_NOZORDER | SWP_NOACTIVATE,
                 );
                 for k in [EditKind::Search, EditKind::Rename, EditKind::Path] {
-                    destroy_edit(k);
+                    destroy_edit(app.hwnd, k);
                 }
                 LRESULT(0)
             }
@@ -1153,7 +1347,7 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
             }
             WM_SETFOCUS => {
                 if app.focus == Focus::Search {
-                    if let Some((h, _)) = edit_of(EditKind::Search) {
+                    if let Some((h, _)) = edit_of(app.hwnd, EditKind::Search) {
                         let _ = SetFocus(Some(h));
                     }
                 }
@@ -1224,7 +1418,7 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                 };
                 let _ = ScreenToClient(hwnd, &mut p);
                 if msg == WM_MOUSEWHEEL {
-                    if edit_of(EditKind::Rename).is_some() {
+                    if edit_of(app.hwnd, EditKind::Rename).is_some() {
                         commit_rename(app, false);
                     }
                     let (ctrl, _, _) = mods();
@@ -1268,7 +1462,7 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                 let code = ((wparam.0 >> 16) & 0xFFFF) as u32;
                 let id = wparam.0 & 0xFFFF;
                 if id == EDIT_SEARCH && code == EN_CHANGE {
-                    if let Some((h, _)) = edit_of(EditKind::Search) {
+                    if let Some((h, _)) = edit_of(app.hwnd, EditKind::Search) {
                         let t = edit_text(h);
                         if t != app.search_text {
                             search_changed(app, t);
@@ -1297,7 +1491,7 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                 match wparam.0 {
                     TIMER_FS => {
                         let _ = KillTimer(Some(hwnd), TIMER_FS);
-                        if edit_of(EditKind::Rename).is_none() {
+                        if edit_of(app.hwnd, EditKind::Rename).is_none() {
                             crate::thumbs::refresh();
                             app.reload(None);
                             crate::views::refresh_columns(app);
@@ -1318,12 +1512,8 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                 SetTimer(Some(hwnd), TIMER_FS, 150, None);
                 LRESULT(0)
             }
-            WM_APP_THUMB => {
-                crate::thumbs::arrived(app, wparam, lparam);
-                LRESULT(0)
-            }
-            WM_APP_SEARCH | WM_APP_INDEX => {
-                crate::search::message(app, msg, wparam, lparam);
+            WM_APP_SEARCH => {
+                crate::search::message(app, wparam, lparam);
                 LRESULT(0)
             }
             WM_SETTINGCHANGE
@@ -1333,7 +1523,7 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                 app.theme = crate::theme::Theme::detect();
                 setup_dwm(app);
                 for k in [EditKind::Search, EditKind::Rename, EditKind::Path] {
-                    destroy_edit(k);
+                    destroy_edit(app.hwnd, k);
                 }
                 app.invalidate();
                 DefWindowProcW(hwnd, msg, wparam, lparam)
@@ -1348,7 +1538,11 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
             }
             WM_DESTROY => {
                 crate::droptarget::revoke(hwnd);
-                PostQuitMessage(0);
+                stop_watch(hwnd);
+                for k in [EditKind::Search, EditKind::Rename, EditKind::Path] {
+                    destroy_edit(hwnd, k);
+                }
+                crate::search::forget(hwnd);
                 LRESULT(0)
             }
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),

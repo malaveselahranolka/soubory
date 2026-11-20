@@ -202,6 +202,8 @@ pub struct App {
     pub hover: Hit,
     /// Drop target under a drag: the rect, and whether it is the whole folder view.
     pub drop_hl: Option<(Rect, bool)>,
+    /// Where the tab was before typing into search (Esc goes back there).
+    pub search_prev: Option<Loc>,
     pub pressed: Hit,
     pub focus: Focus,
     pub active: bool,
@@ -249,6 +251,7 @@ impl App {
             preview_on: false,
             hover: Hit::None,
             drop_hl: None,
+            search_prev: None,
             pressed: Hit::None,
             focus: Focus::Content,
             active: true,

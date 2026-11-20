@@ -139,7 +139,7 @@ pub fn image(app: &App, c: &crate::gfx::Canvas, path: &std::path::Path, mtime: u
         if !s.started {
             s.started = true;
             let q = s.queue.clone();
-            start(app.hwnd, q);
+            start(crate::win::hub(), q);
         }
         s.tick += 1;
         let tick = s.tick;
@@ -176,7 +176,7 @@ pub fn image(app: &App, c: &crate::gfx::Canvas, path: &std::path::Path, mtime: u
     })
 }
 
-pub fn arrived(app: &mut App, _w: WPARAM, l: LPARAM) {
+pub fn arrived(_w: WPARAM, l: LPARAM) {
     let res = unsafe { Box::from_raw(l.0 as *mut Res) };
     S.with(|s| {
         let mut s = s.borrow_mut();
@@ -194,7 +194,6 @@ pub fn arrived(app: &mut App, _w: WPARAM, l: LPARAM) {
             evict(&mut s);
         }
     });
-    app.invalidate();
 }
 
 fn evict(s: &mut State) {

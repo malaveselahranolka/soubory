@@ -63,7 +63,7 @@ thread_local! {
 }
 
 pub fn register(hwnd: HWND) {
-    let t: IDropTarget = Target.into();
+    let t: IDropTarget = Target { hwnd: hwnd.0 as isize }.into();
     unsafe {
         if let Err(e) = RegisterDragDrop(hwnd, &t) {
             crate::prefs::log(&format!("RegisterDragDrop failed: {e}"));
@@ -78,10 +78,14 @@ pub fn revoke(hwnd: HWND) {
 }
 
 #[implement(IDropTarget)]
-struct Target;
+struct Target {
+    hwnd: isize,
+}
 
-fn app() -> Option<&'static mut App> {
-    unsafe { crate::win::app_ptr().as_mut() }
+impl Target {
+    fn app(&self) -> Option<&'static mut App> {
+        unsafe { crate::win::app_of(HWND(self.hwnd as *mut std::ffi::c_void)).as_mut() }
+    }
 }
 
 fn client(app: &App, pt: &POINTL) -> (f32, f32) {
@@ -100,7 +104,7 @@ impl IDropTarget_Impl for Target_Impl {
         pt: &POINTL,
         effect: *mut DROPEFFECT,
     ) -> Result<()> {
-        let Some(app) = app() else { return Ok(()) };
+        let Some(app) = self.app() else { return Ok(()) };
         let data = data.cloned();
         let helper: Option<IDropTargetHelper> =
             unsafe { CoCreateInstance(&CLSID_DragDropHelper, None, CLSCTX_INPROC_SERVER).ok() };
@@ -129,7 +133,7 @@ impl IDropTarget_Impl for Target_Impl {
     }
 
     fn DragOver(&self, keys: MODIFIERKEYS_FLAGS, pt: &POINTL, effect: *mut DROPEFFECT) -> Result<()> {
-        let Some(app) = app() else { return Ok(()) };
+        let Some(app) = self.app() else { return Ok(()) };
         let allowed = unsafe { effect.as_ref().map(|e| e.0).unwrap_or(0) };
         let e = over(app, keys.0, pt, allowed);
         unsafe {
@@ -157,7 +161,7 @@ impl IDropTarget_Impl for Target_Impl {
                 let _ = h.DragLeave();
             }
         }
-        if let Some(app) = app() {
+        if let Some(app) = self.app() {
             end(app);
         }
         Ok(())
@@ -170,7 +174,7 @@ impl IDropTarget_Impl for Target_Impl {
         pt: &POINTL,
         effect: *mut DROPEFFECT,
     ) -> Result<()> {
-        let Some(app) = app() else { return Ok(()) };
+        let Some(app) = self.app() else { return Ok(()) };
         let allowed = unsafe { effect.as_ref().map(|e| e.0).unwrap_or(0) };
         // Make sure the target matches the drop point, then take everything out of the state:
         // the shell's Drop runs progress and conflict dialogs that pump messages.
@@ -517,7 +521,7 @@ pub fn dev(app: &mut App, args: &[String]) {
         if let Some(o) = out { let _ = std::fs::write(o, log); }
         return;
     };
-    let t: IDropTarget = Target.into();
+    let t: IDropTarget = Target { hwnd: app.hwnd.0 as isize }.into();
     let all = DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK;
     unsafe {
         let mut e = all;

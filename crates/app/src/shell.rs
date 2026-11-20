@@ -791,8 +791,12 @@ fn toggle_favorite(app: &mut App, p: &Path) {
         app.prefs.favorites.push(p.to_path_buf());
     }
     crate::prefs::save(app);
-    app.side_rows = crate::sidebar::build(&app.prefs.favorites);
-    app.invalidate();
+    let favs = app.prefs.favorites.clone();
+    crate::win::for_each_app(|a| {
+        a.prefs.favorites = favs.clone();
+        a.side_rows = crate::sidebar::build(&favs);
+        a.invalidate();
+    });
 }
 
 pub fn properties(app: &mut App) {

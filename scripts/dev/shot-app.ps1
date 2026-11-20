@@ -24,7 +24,7 @@ public static class Shot {
 }
 '@ -ReferencedAssemblies System.Drawing
 $exe = 'C:\Users\adame\.fm-target\debug\fm.exe'
-$p = Start-Process $exe -ArgumentList (@("`"$Path`"") + $Dev) -PassThru
+$p = Start-Process $exe -ArgumentList (@("`"$Path`"", "--new-instance") + $Dev) -PassThru
 for ($i = 0; $i -lt 50 -and $p.MainWindowHandle -eq 0; $i++) { Start-Sleep -Milliseconds 100; $p.Refresh() }
 Start-Sleep -Milliseconds $Wait
 $h = if ($Class) { [Shot]::FindWindow($Class, [NullString]::Value) } else { $p.MainWindowHandle }
