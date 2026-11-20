@@ -57,3 +57,50 @@ fn started_picker_answers_on_the_pipe() {
     assert_eq!(m, Msg::Cancelled);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The resident's way in: a test fm with its door under a test-only class (`--dev-door`) takes the
+/// request, opens the picker from its hub, and answers when the picker's window is closed (a
+/// WM_CLOSE posted to that window, as its close button sends).
+#[test]
+#[ignore]
+fn door_opens_a_picker_in_the_running_fm() {
+    use windows::{
+        Win32::{Foundation::*, UI::WindowsAndMessaging::*},
+        core::HSTRING,
+    };
+    std::thread::spawn(|| {
+        std::thread::sleep(Duration::from_secs(120));
+        eprintln!("watchdog: no answer through the door");
+        std::process::exit(101);
+    });
+    let pid = std::process::id();
+    let dir = std::env::temp_dir().join(format!("fm-pick-door-{pid}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.png"), "x").unwrap();
+    let class = format!("FmDoorTest-{pid}");
+    let mut fm = std::process::Command::new(env!("CARGO_BIN_EXE_fm")).arg(&dir).args(["--new-instance", "--dev-door", &class]).spawn().unwrap();
+    let door = (0..150).find_map(|_| {
+        std::thread::sleep(Duration::from_millis(100));
+        unsafe { FindWindowExW(Some(HWND_MESSAGE), None, &HSTRING::from(class.as_str()), None) }.ok()
+    });
+    assert!(door.is_some(), "the test fm opened its door");
+    let title = format!("fm-pick-test-{pid}");
+    let t = title.clone();
+    std::thread::spawn(move || {
+        for _ in 0..300 {
+            if let Ok(h) = unsafe { FindWindowW(windows::core::w!("FmMainWindow"), &HSTRING::from(t.as_str())) } {
+                let _ = unsafe { PostMessageW(Some(h), WM_CLOSE, WPARAM(0), LPARAM(0)) };
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    });
+    let mut req = Request { folder: dir.to_string_lossy().into_owned(), title, ..Default::default() };
+    let hosts = Hosts { door: class, exe: None, installed: false, args: String::new(), connect: Duration::from_secs(30) };
+    let r = run(&mut req, HWND::default(), &hosts);
+    let _ = fm.kill();
+    let _ = fm.wait();
+    assert_eq!(r, Ok(("resident", Msg::Cancelled)));
+    let _ = std::fs::remove_dir_all(&dir);
+}

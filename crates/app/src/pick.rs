@@ -198,10 +198,10 @@ pub fn patterns(spec: &str) -> Option<Vec<String>> {
     (!v.is_empty() && !v.iter().any(|p| p == "*" || p == "*.*")).then_some(v)
 }
 
-/// Folders always show, so the user can get anywhere; files only when a pattern matches.
+/// Folders and shortcuts always show, as in the system dialog; files only when a pattern matches.
 pub fn shows(patterns: &[String], e: &Entry) -> bool {
     let name = e.name.to_lowercase();
-    e.is_dir || patterns.iter().any(|p| wild(p, &name))
+    e.is_dir || name.ends_with(".lnk") || patterns.iter().any(|p| wild(p, &name))
 }
 
 /// The patterns of the file type a picker window shows; None outside pickers and for "all files".
@@ -258,11 +258,11 @@ pub fn accept_selection(app: &mut App) {
 }
 
 fn accept(app: &mut App, items: &[usize]) {
-    if let [i] = *items {
-        if !is_file(app, i) {
-            app.open(i, false);
-            return;
-        }
+    if let [i] = *items
+        && !is_file(app, i)
+    {
+        app.open(i, false);
+        return;
     }
     if items.is_empty() {
         return;
@@ -271,9 +271,16 @@ fn accept(app: &mut App, items: &[usize]) {
         app.note("Vyberte jen soubory.");
         return;
     }
-    let paths: Vec<PathBuf> = items.iter().map(|&i| app.tab().path_of(i)).collect();
+    // A shortcut gives what it points to, as in the system dialog.
+    let paths: Vec<PathBuf> = items
+        .iter()
+        .map(|&i| {
+            let p = app.tab().path_of(i);
+            crate::shell::link_target(&p).unwrap_or(p)
+        })
+        .collect();
     if paths.iter().any(|p| !p.is_file()) {
-        app.note("Soubor už neexistuje.");
+        app.note("Soubor (nebo cíl zástupce) neexistuje.");
         return;
     }
     if paths.len() > 1 && app.pick.as_ref().is_some_and(|p| !p.req.multi) {
@@ -309,11 +316,11 @@ pub fn clamp(app: &mut App) {
 
 /// Once a second: the host may have gone (closed, crashed, gave up); its picker goes too.
 pub fn tick(app: &mut App) {
-    if let Some(p) = app.pick.as_mut() {
-        if !p.alive() {
-            p.let_go();
-            crate::win::close(app);
-        }
+    if let Some(p) = app.pick.as_mut()
+        && !p.alive()
+    {
+        p.let_go();
+        crate::win::close(app);
     }
 }
 
@@ -446,6 +453,7 @@ mod tests {
         assert!(shows(&p, &entry("Léto.png", false)) && shows(&p, &entry("A.JPG", false)));
         assert!(!shows(&p, &entry("a.png.txt", false)) && !shows(&p, &entry("png", false)));
         assert!(shows(&p, &entry("Fotky.txt", true)), "folders always show");
+        assert!(shows(&p, &entry("Smlouva.pdf.LNK", false)), "shortcuts too");
         assert_eq!(patterns("*.*"), None);
         assert_eq!(patterns("*"), None);
         assert_eq!(patterns(""), None);

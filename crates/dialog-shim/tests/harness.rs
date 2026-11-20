@@ -248,8 +248,7 @@ fn picker_through_the_wrapper() {
         let owner = CreateWindowExW(WINDOW_EX_STYLE(0), w!("STATIC"), w!("owner"), WS_OVERLAPPED, 0, 0, 100, 100, None, None, None, None).unwrap();
         let folder: IShellItem = SHCreateItemFromParsingName(&HSTRING::from(files.as_os_str()), None).unwrap();
         // Electron's sequence.
-        let electron = |opts: FILEOPENDIALOGOPTIONS| -> IFileOpenDialog {
-            let d: IFileOpenDialog = factory().CreateInstance(None).unwrap();
+        let setters = |d: &IFileOpenDialog, opts: FILEOPENDIALOGOPTIONS| {
             d.SetOptions(opts).unwrap();
             d.SetFileName(w!("")).unwrap();
             d.SetTitle(w!("Vyberte soubory")).unwrap();
@@ -264,6 +263,10 @@ fn picker_through_the_wrapper() {
                 d.SetFileTypeIndex(1).unwrap();
             }
             d.SetFolder(&folder).unwrap();
+        };
+        let electron = |opts: FILEOPENDIALOGOPTIONS| -> IFileOpenDialog {
+            let d: IFileOpenDialog = factory().CreateInstance(None).unwrap();
+            setters(&d, opts);
             d
         };
         let base = FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST;
@@ -273,6 +276,19 @@ fn picker_through_the_wrapper() {
         let l = log_lines(&fm).pop().unwrap();
         assert!(l.contains(&format!("\t{me}\tFileOpenDialog\tIClassFactory\t")) && l.contains("\tpicker\t") && l.contains("hr=0x00000000"), "{l}");
         assert!(l.contains("harness"), "the caller shows on the stack: {l}");
+
+        // 0. Through COM itself, as a host's CoCreateInstance gets it (whatever interfaces COM asks
+        // the factory and the dialog for): our factory registered in-process under a throwaway class.
+        let probe = GUID::from_u128(0x5f1d_0c2a_7e3b_4a19_8c6d_2b9e_0f41_a7d3);
+        let cookie = CoRegisterClassObject(&probe, &factory().cast::<IUnknown>().unwrap(), CLSCTX_INPROC_SERVER, REGCLS_MULTIPLEUSE).unwrap();
+        set(Script::Answer(Msg::Picked(vec![a.clone()])));
+        let d: IFileOpenDialog = CoCreateInstance(&probe, None, CLSCTX_INPROC_SERVER).unwrap();
+        setters(&d, base);
+        show(&d, owner).unwrap();
+        assert!(last_show(&fm).ends_with("\tpicker (resident)\tpicked 1"), "{}", last_show(&fm));
+        assert_eq!(path_of(&d.GetResult().unwrap()), a);
+        CoRevokeClassObject(cookie).unwrap();
+        SEEN.lock().unwrap().clear();
 
         // 1. Single pick: the setters reach fm, GetResult(s) and GetFolder answer from the pick.
         set(Script::Answer(Msg::Picked(vec![a.clone()])));
@@ -306,6 +322,13 @@ fn picker_through_the_wrapper() {
         let all = d.GetResults().unwrap();
         assert_eq!((0..all.GetCount().unwrap()).map(|i| path_of(&all.GetItemAt(i).unwrap())).collect::<Vec<_>>(), [a.clone(), b.clone()]);
         assert!(last_show(&fm).ends_with("\tpicker (resident)\tpicked 2"), "{}", last_show(&fm));
+        // An answer longer than the pipe's buffer arrives in pieces.
+        let many = vec![a.clone(); 1000];
+        set(Script::Answer(Msg::Picked(many.clone())));
+        let d = electron(base | FOS_ALLOWMULTISELECT);
+        show(&d, owner).unwrap();
+        assert!(last_show(&fm).ends_with("\tpicker (resident)\tpicked 1000"), "{}", last_show(&fm));
+        assert_eq!(d.GetResults().unwrap().GetCount().unwrap(), 1000);
         // Two files for a single-select dialog are not taken: the system dialog comes instead.
         set(Script::Answer(Msg::Picked(vec![a.clone(), b.clone()])));
         let d = electron(base);
@@ -332,6 +355,11 @@ fn picker_through_the_wrapper() {
         let d = electron(base);
         assert!(show(&d, owner).is_err());
         assert!(last_show(&fm).ends_with("\tfallback: fm.exe not found\tsystem: cancelled"), "{}", last_show(&fm));
+        // An fm.exe without the --pick marker (the user's installed beta) is never started.
+        std::env::set_var("FM_SHIM_TEST_EXE", &exe);
+        let d = electron(base);
+        assert!(show(&d, owner).is_err());
+        assert!(last_show(&fm).ends_with("\tfallback: fm.exe too old for --pick\tsystem: cancelled"), "{}", last_show(&fm));
 
         // 6. Delegation: the picker never shows for what only the real dialog can do.
         SEEN.lock().unwrap().clear();

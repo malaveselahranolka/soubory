@@ -1475,6 +1475,11 @@ pub fn timer(_app: &mut App, _id: usize) {}
 /// The folder a shortcut points to: Explorer opens it in the same window (a folder verb would
 /// start a new one). Not resolved (no search for a moved target), only read.
 pub fn link_folder(lnk: &Path) -> Option<PathBuf> {
+    link_target(lnk).filter(|p| p.is_dir())
+}
+
+/// The file system path a shortcut (`.lnk`) points to, read as link_folder reads it.
+pub fn link_target(lnk: &Path) -> Option<PathBuf> {
     if !lnk.extension().is_some_and(|x| x.eq_ignore_ascii_case("lnk")) {
         return None;
     }
@@ -1485,7 +1490,7 @@ pub fn link_folder(lnk: &Path) -> Option<PathBuf> {
         let mut buf = [0u16; 1024];
         sl.GetPath(&mut buf, std::ptr::null_mut(), 0).ok()?;
         let n = buf.iter().position(|&c| c == 0).unwrap_or(0);
-        Some(PathBuf::from(String::from_utf16_lossy(&buf[..n]))).filter(|p| n > 0 && p.is_dir())
+        (n > 0).then(|| PathBuf::from(String::from_utf16_lossy(&buf[..n])))
     }
 }
 

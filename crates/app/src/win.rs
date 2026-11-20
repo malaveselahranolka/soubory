@@ -362,18 +362,20 @@ pub fn is_elevated() -> bool {
 /// The resident fm's door: a message-only window on its own thread that takes handed-over
 /// command lines and `--quit`, answers at once and passes them to the UI thread (the hub). A
 /// window stuck on a slow share then never makes a launch time out and start a second fm.
-fn open_door() {
-    std::thread::spawn(|| unsafe {
+/// `class`: DOOR_CLASS, or a test's own (`--dev-door`) so a test never meets the user's fm.
+fn open_door(class: Vec<u16>) {
+    std::thread::spawn(move || unsafe {
+        let class = PCWSTR(class.as_ptr());
         let hinst = GetModuleHandleW(None).unwrap_or_default();
         let wc = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
             lpfnWndProc: Some(door_proc),
             hInstance: hinst.into(),
-            lpszClassName: DOOR_CLASS,
+            lpszClassName: class,
             ..Default::default()
         };
         RegisterClassExW(&wc);
-        if CreateWindowExW(WINDOW_EX_STYLE(0), DOOR_CLASS, None, WINDOW_STYLE(0), 0, 0, 0, 0, Some(HWND_MESSAGE), None, Some(hinst.into()), None).is_err() {
+        if CreateWindowExW(WINDOW_EX_STYLE(0), class, None, WINDOW_STYLE(0), 0, 0, 0, 0, Some(HWND_MESSAGE), None, Some(hinst.into()), None).is_err() {
             return;
         }
         let mut msg = MSG::default();
@@ -483,8 +485,14 @@ pub fn run(raw: &str, cwd: &Path, background: bool, resident: bool, pick: Option
             register_proc_ref();
             watch_drives(h);
         }
+        // A test run may open a door under its own class: the resident's way into fm, tested.
+        let dev_door = std::env::args().skip_while(|a| a != "--dev-door").nth(1);
         if resident {
-            open_door();
+            open_door(DOOR_CLASS.as_wide().iter().copied().chain([0]).collect());
+        } else if let Some(c) = dev_door {
+            open_door(wide(&c));
+        }
+        if resident {
             // Message-only windows get no broadcasts: this hidden one hears the session end.
             let _ = CreateWindowExW(
                 WS_EX_TOOLWINDOW,
