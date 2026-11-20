@@ -185,23 +185,27 @@ impl Drop for OwnerOff {
     }
 }
 
-/// The picker has no owner and ours is disabled: when the user brings the host forward (its
-/// taskbar button, Alt+Tab), the picker comes back on top, restored if minimized. Only while the
-/// host is the foreground app, which then may hand the foreground on.
+/// The picker has no owner and ours is disabled: when the user brings the blocked window forward
+/// (its taskbar button, Alt+Tab), the picker comes back on top, restored if minimized, as a modal
+/// dialog would. Only for the owner itself: the host's other windows stay the user's, as under the
+/// system dialog, and with no owner nothing is pulled. The host is the foreground app then, so it
+/// may hand the foreground on.
 fn refocus(picker: HWND, owner: HWND) {
     unsafe {
-        let fg = GetForegroundWindow();
-        if picker.is_invalid() || fg.is_invalid() || fg == picker || !IsWindow(Some(picker)).as_bool() {
+        if owner.is_invalid() || picker.is_invalid() || !IsWindow(Some(picker)).as_bool() {
             return;
         }
-        let mut pid = 0u32;
-        GetWindowThreadProcessId(fg, Some(&mut pid));
-        if fg == owner || pid == GetCurrentProcessId() {
-            if IsIconic(picker).as_bool() {
-                let _ = ShowWindow(picker, SW_RESTORE);
-            }
-            let _ = SetForegroundWindow(picker);
+        let fg = GetForegroundWindow();
+        if fg.is_invalid() || (fg != owner && fg != GetAncestor(owner, GA_ROOT)) {
+            return;
         }
+        if IsIconic(picker).as_bool() {
+            // Async: a busy fm must never stall the host's thread.
+            let _ = ShowWindowAsync(picker, SW_RESTORE);
+        }
+        // The picker's own modal (a delete confirmation) if it has one, as the taskbar does.
+        let top = GetLastActivePopup(picker);
+        let _ = SetForegroundWindow(if top.is_invalid() { picker } else { top });
     }
 }
 

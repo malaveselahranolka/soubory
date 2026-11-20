@@ -362,13 +362,16 @@ pub fn item_menu(app: &mut App, pt: POINT) {
         if single_dir {
             append(top, C_NEW_TAB, "Otevřít v nové kartě", false, true);
         }
+        // A picker changes no lists of the user's (tags, favorites, saved searches): a `--pick`
+        // child runs in the host's file view, and the resident's picker saves no prefs.
+        let own = app.pick.is_none();
         let tags = submenu(top, "Štítky");
         let current = crate::tags::mask_of_all(&paths);
         for (i, (_, name)) in crate::theme::TAGS.iter().enumerate() {
-            append(tags, C_TAG0 + i as u32, name, current & (1 << i) != 0, true);
+            append(tags, C_TAG0 + i as u32, name, current & (1 << i) != 0, own);
         }
         sep(tags);
-        append(tags, C_TAG_CLEAR, "Odebrat štítky", false, current != 0);
+        append(tags, C_TAG_CLEAR, "Odebrat štítky", false, own && current != 0);
         append(
             top,
             C_COPY_PATH,
@@ -397,7 +400,7 @@ pub fn item_menu(app: &mut App, pt: POINT) {
                     "Přidat do oblíbených"
                 },
                 false,
-                true,
+                own,
             );
         }
         // Move our items before the shell's.
@@ -765,7 +768,7 @@ fn more_menu_at(app: &mut App, pt: POINT) {
         sep(m);
         if let Loc::Search { text, scope } = &app.tab().loc {
             let saved = app.prefs.saved.iter().any(|(t, s)| t == text.trim() && s == scope);
-            append(m, C_SAVE_SEARCH, "Uložit hledání", saved, !text.trim().is_empty() && !saved);
+            append(m, C_SAVE_SEARCH, "Uložit hledání", saved, app.pick.is_none() && !text.trim().is_empty() && !saved);
         }
         append(m, C_GOTO, "Přejít na složku…\tCtrl+L", false, true);
         append(m, C_TERMINAL, "Otevřít v Terminálu", false, in_folder);
@@ -873,10 +876,10 @@ pub fn sidebar_menu(app: &mut App, i: usize, pt: POINT) {
         append(m, C_NEW_TAB, "Otevřít v nové kartě", false, true);
         let is_fav = matches!(&loc, Loc::Folder(p) if app.prefs.favorites.contains(p));
         if is_fav {
-            append(m, C_REMOVE_FAV, "Odebrat z oblíbených", false, true);
+            append(m, C_REMOVE_FAV, "Odebrat z oblíbených", false, app.pick.is_none());
         }
         if matches!(loc, Loc::Search { .. }) {
-            append(m, C_REMOVE_SEARCH, "Odebrat z postranního panelu", false, true);
+            append(m, C_REMOVE_SEARCH, "Odebrat z postranního panelu", false, app.pick.is_none());
         }
         if eject {
             append(m, C_EJECT, "Vysunout", false, true);
@@ -929,6 +932,9 @@ pub fn sidebar_menu(app: &mut App, i: usize, pt: POINT) {
 }
 
 fn toggle_favorite(app: &mut App, p: &Path) {
+    if app.pick.is_some() {
+        return;
+    }
     if let Some(k) = app.prefs.favorites.iter().position(|f| f == p) {
         app.prefs.favorites.remove(k);
     } else {
@@ -951,6 +957,9 @@ fn sidebar_changed(app: &App) {
 
 /// "Uložit hledání": the current search becomes a sidebar item in every window.
 pub fn save_search(app: &mut App) {
+    if app.pick.is_some() {
+        return;
+    }
     let Loc::Search { text, scope } = app.tab().loc.clone() else { return };
     let item = (text.replace(['\t', '\r', '\n'], " ").trim().to_string(), scope);
     if item.0.is_empty() || app.prefs.saved.contains(&item) {

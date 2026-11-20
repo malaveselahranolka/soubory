@@ -359,10 +359,12 @@ pub fn parts(app: &App) -> Option<Parts> {
     let ok = Rect::new(bar.r() - 16.0 - ok_w, y, ok_w, BTN_H);
     let cancel = Rect::new(ok.x - 8.0 - cancel_w, y, cancel_w, BTN_H);
     let new = Rect::new(app.lay.card.x + 12.0, y, (m("Nový", Font::Body) + 44.0).max(72.0), BTN_H);
-    let types = p.req.filters.get(p.filter).map(|(name, spec)| {
+    // shortcut: a bar too narrow for the file types drops the field (the chosen type still
+    // filters); widen the window to change it.
+    let types = p.req.filters.get(p.filter).and_then(|(name, spec)| {
         let x = new.r() + 8.0;
-        let w = (m(type_label(name, spec), Font::Body) + 44.0).clamp(120.0, 320.0).min(cancel.x - 16.0 - x).max(40.0);
-        Rect::new(x, y, w, BTN_H)
+        let room = cancel.x - 16.0 - x;
+        (room >= 80.0).then(|| Rect::new(x, y, (m(type_label(name, spec), Font::Body) + 44.0).clamp(120.0, 320.0).min(room), BTN_H))
     });
     Some(Parts { new, types, cancel, ok })
 }
@@ -575,6 +577,11 @@ mod tests {
         assert_eq!((button_name(&app, H_NEW).as_str(), button_enabled(&app, H_NEW)), ("Nový", true));
         assert_eq!(button_name(&app, H_TYPES), "Typ souboru: Vše");
         assert!(!button_enabled(&app, H_OK), "nothing selected yet");
+        // The narrowest window with the widest sidebar: the file types never cover Zrušit.
+        (app.w, app.sidebar_on, app.sidebar_w) = (640.0, true, 320.0);
+        app.relayout();
+        let p = parts(&app).unwrap();
+        assert!(p.types.is_none_or(|t| t.r() < p.cancel.x) && p.new.r() < p.cancel.x, "{:?} {:?} {:?}", p.new, p.types, p.cancel);
         app.tab_mut().loc = Loc::Computer;
         assert!(!button_enabled(&app, H_NEW), "nothing is made outside a folder");
         let _ = std::fs::remove_dir_all(&dir);
