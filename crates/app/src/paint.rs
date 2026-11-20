@@ -834,6 +834,11 @@ fn empty_state(app: &App, c: &mut Canvas, t: &Theme, b: Rect) {
             "Začněte psát".into(),
             "Hledá se v názvech všech souborů na discích.".into(),
         ),
+        (None, Loc::Search { scope: None, .. }) if crate::search::status().is_some() => (
+            g::SEARCH,
+            "Zatím nic".into(),
+            "Disk se ještě indexuje, výsledky se doplní samy.".into(),
+        ),
         (None, Loc::Search { .. }) => (
             g::SEARCH,
             "Nic nenalezeno".into(),

@@ -7,9 +7,9 @@ Nothing here has been tried by hand in daily use yet; see "Not verified" at the 
 ## From Explorer
 | Feature | How | Status |
 |---|---|---|
-| Navigation pane: Home, Desktop…Videos, OneDrive, This PC, drives, Network, Recycle Bin, tags | sidebar sections | ✅ |
+| Navigation pane: Home, Desktop…Videos, OneDrive, This PC, drives, Network, Recycle Bin, tags; follows drives being plugged in, mapped or ejected | sidebar sections, shell drive notifications | ✅ (drive events not exercised) |
 | Address bar: breadcrumb, typed path (Ctrl+L / Alt+D / Ctrl+Shift+G) | path bar edit | 🔶 |
-| Sibling-folder dropdowns in the breadcrumb | | ⬜ |
+| Folder menus on the path-bar chevrons (subfolders, drives) | `crumb_menu` | 🔶 |
 | Back / Forward / Up, Alt+arrows, Backspace | history per tab | 🔶 |
 | Tabs (Ctrl+T, Ctrl+W, Ctrl+Tab, middle-click) | tab strip | 🔶 |
 | Several windows (Ctrl+N), one process; a second launch opens a window in it | hub window, `WM_COPYDATA` | ✅ |
@@ -29,7 +29,7 @@ Nothing here has been tried by hand in daily use yet; see "Not verified" at the 
 | Open in Terminal, Copy as path (Ctrl+Shift+C) | | 🔶 |
 | Recycle Bin: original location, date deleted, Restore, Empty | shell namespace folder | ✅ |
 | Network | shell namespace folder (empty while network discovery is off) | 🔶 |
-| Map network drive | | ⬜ |
+| Map / disconnect network drive | More menu → Windows' own dialogs | 🔶 |
 | Open folders and drives instead of Explorer; Win+E | `scripts/set-default-fm.ps1` (HKCU, undo with `restore-explorer.ps1`) | ✅ sandbox |
 | Open/Save dialogs: New file / New folder button | fm-dialogkit | ✅ |
 | Replace the system Open dialog (Option 2) | `fm_dialog_shim.dll`, gate build: logs only | 🔶 gate |
@@ -49,7 +49,7 @@ Nothing here has been tried by hand in daily use yet; see "Not verified" at the 
 | Rename multiple items: replace, add text, number | ✅ |
 | Duplicate (Ctrl+D), New Folder with Selection | ✅ |
 | Search scope bar: whole computer / this folder | ✅ |
-| Smart folders (saved searches) | ⬜ |
+| Smart folders: saved searches in the sidebar (More → Uložit hledání) | ✅ open (harness), 🔶 save |
 | Calculate folder sizes | ⬜ (from the index) |
 
 ## Our own

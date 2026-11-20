@@ -220,9 +220,9 @@ pub fn open_window(loc: Loc, near: Option<HWND>) -> Option<HWND> {
         let mut app = Box::new(App::new(loc));
         crate::win::trace("app_new");
         crate::prefs::load(&mut app);
-        // App::new built the sidebar without favorites; only they can change it.
-        if !app.prefs.favorites.is_empty() {
-            app.side_rows = crate::sidebar::build(&app.prefs.favorites);
+        // App::new built the sidebar from default prefs; only favorites and saved searches differ.
+        if !app.prefs.favorites.is_empty() || !app.prefs.saved.is_empty() {
+            app.side_rows = crate::sidebar::build(&app.prefs);
         }
         app.reload(None);
         let app_raw: *mut App = Box::into_raw(app);
@@ -307,7 +307,7 @@ fn drives_changed() {
     crate::fsys::forget_volume_names();
     let roots: Vec<PathBuf> = crate::fsys::volumes().into_iter().map(|v| v.root).collect();
     for_each_app(|a| {
-        a.side_rows = crate::sidebar::build(&a.prefs.favorites);
+        a.side_rows = crate::sidebar::build(&a.prefs);
         // A tab on a drive that went away goes to "Tento počítač", like Explorer.
         let gone = a.tab().loc.folder().and_then(|p| p.ancestors().last()).is_some_and(|root| {
             root.to_string_lossy().len() == 3 && !roots.iter().any(|r| r.as_os_str().eq_ignore_ascii_case(root.as_os_str()))
@@ -425,6 +425,14 @@ fn dev_flags(app: &mut App) {
         crate::quicklook::toggle(app);
     }
     crate::droptarget::dev(app, &args);
+    // Clicks the sidebar row with this label through the real hit test and click handlers.
+    if let Some(label) = val("--dev-side") {
+        let row = app.side_rows.iter().position(|r| matches!(r, crate::sidebar::Row::Item { label: l, .. } if *l == label));
+        if let Some(r) = row.map(|i| crate::paint::side_row_rect(app, i)) {
+            app.mouse_down(r.cx(), r.cy(), false, false);
+            app.mouse_up(r.cx(), r.cy(), false, false);
+        }
+    }
     if let Some(script) = val("--dev-keys") {
         dev_keys(app, &script, val("--dev-out"));
     }

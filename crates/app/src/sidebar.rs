@@ -1,7 +1,6 @@
 //! Sidebar model: Finder's sections with Windows locations.
 use crate::app::Loc;
 use crate::fsys;
-use std::path::PathBuf;
 use windows::Win32::UI::Shell::*;
 
 #[derive(Clone, Debug)]
@@ -33,9 +32,11 @@ pub mod glyph {
     pub const FOLDER: char = '\u{E8B7}';
     pub const EJECT: char = '\u{F847}';
     pub const BIN: char = '\u{E74D}';
+    pub const SEARCH: char = '\u{E721}';
 }
 
-pub fn build(favorites: &[PathBuf]) -> Vec<Row> {
+pub fn build(prefs: &crate::app::Prefs) -> Vec<Row> {
+    let favorites = &prefs.favorites;
     let mut rows = vec![Row::Header("Oblíbené")];
     rows.push(Row::Item {
         label: "Nedávné".into(),
@@ -67,6 +68,18 @@ pub fn build(favorites: &[PathBuf]) -> Vec<Row> {
             label: fsys::display_name(p),
             glyph: glyph::FOLDER,
             loc: Loc::Folder(p.clone()),
+            eject: false,
+        });
+    }
+    for (text, scope) in &prefs.saved {
+        let label = match scope {
+            Some(f) => format!("{text} ({})", fsys::display_name(f)),
+            None => text.clone(),
+        };
+        rows.push(Row::Item {
+            label,
+            glyph: glyph::SEARCH,
+            loc: Loc::Search { text: text.clone(), scope: scope.clone() },
             eject: false,
         });
     }

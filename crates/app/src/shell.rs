@@ -64,6 +64,8 @@ const C_SELECT_ALL: u32 = OWN + 55;
 const C_REFRESH: u32 = OWN + 56;
 const C_MAP_DRIVE: u32 = OWN + 57;
 const C_UNMAP_DRIVE: u32 = OWN + 58;
+const C_SAVE_SEARCH: u32 = OWN + 59;
+const C_REMOVE_SEARCH: u32 = OWN + 60;
 
 thread_local! {
     /// Context menus that are being tracked; their owner-draw/init messages are forwarded.
@@ -722,6 +724,10 @@ fn more_menu_at(app: &mut App, pt: POINT) {
             true,
         );
         sep(m);
+        if let Loc::Search { text, scope } = &app.tab().loc {
+            let saved = app.prefs.saved.iter().any(|(t, s)| t == text.trim() && s == scope);
+            append(m, C_SAVE_SEARCH, "Uložit hledání", saved, !text.trim().is_empty() && !saved);
+        }
         append(m, C_GOTO, "Přejít na složku…\tCtrl+L", false, true);
         append(m, C_TERMINAL, "Otevřít v Terminálu", false, in_folder);
         append(m, C_PROPS, "Vlastnosti složky", false, in_folder);
@@ -766,6 +772,7 @@ fn own_command(app: &mut App, cmd: u32) {
             app.invalidate();
         }
         C_GOTO => crate::win::go_to_folder(app),
+        C_SAVE_SEARCH => save_search(app),
         // Windows' own dialogs; the drive watcher updates every sidebar when a drive appears.
         C_MAP_DRIVE => unsafe {
             let _ = windows::Win32::NetworkManagement::WNet::WNetConnectionDialog(app.hwnd, windows::Win32::NetworkManagement::WNet::RESOURCETYPE_DISK.0);
@@ -810,6 +817,9 @@ pub fn sidebar_menu(app: &mut App, i: usize, pt: POINT) {
         if is_fav {
             append(m, C_REMOVE_FAV, "Odebrat z oblíbených", false, true);
         }
+        if matches!(loc, Loc::Search { .. }) {
+            append(m, C_REMOVE_SEARCH, "Odebrat z postranního panelu", false, true);
+        }
         if eject {
             append(m, C_EJECT, "Vysunout", false, true);
         }
@@ -827,6 +837,13 @@ pub fn sidebar_menu(app: &mut App, i: usize, pt: POINT) {
                     toggle_favorite(app, p);
                 }
             }
+            C_REMOVE_SEARCH => {
+                if let Loc::Search { text, scope } = &loc {
+                    app.prefs.saved.retain(|(t, s)| !(t == text && s == scope));
+                    crate::prefs::save(app);
+                    sidebar_changed(app);
+                }
+            }
             C_EJECT => {
                 if let Loc::Folder(p) = &loc {
                     if let Some(cm) = item_cm(app.hwnd, std::slice::from_ref(p)) {
@@ -836,7 +853,7 @@ pub fn sidebar_menu(app: &mut App, i: usize, pt: POINT) {
                             let _ = DestroyMenu(m2);
                         }
                     }
-                    app.side_rows = crate::sidebar::build(&app.prefs.favorites);
+                    app.side_rows = crate::sidebar::build(&app.prefs);
                     app.invalidate();
                 }
             }
@@ -857,12 +874,31 @@ fn toggle_favorite(app: &mut App, p: &Path) {
         app.prefs.favorites.push(p.to_path_buf());
     }
     crate::prefs::save(app);
-    let favs = app.prefs.favorites.clone();
+    sidebar_changed(app);
+}
+
+/// Favorites and saved searches are shared by every window.
+fn sidebar_changed(app: &App) {
+    let (favs, saved) = (app.prefs.favorites.clone(), app.prefs.saved.clone());
     crate::win::for_each_app(|a| {
         a.prefs.favorites = favs.clone();
-        a.side_rows = crate::sidebar::build(&favs);
+        a.prefs.saved = saved.clone();
+        a.side_rows = crate::sidebar::build(&a.prefs);
         a.invalidate();
     });
+}
+
+/// "Uložit hledání": the current search becomes a sidebar item in every window.
+pub fn save_search(app: &mut App) {
+    let Loc::Search { text, scope } = app.tab().loc.clone() else { return };
+    let item = (text.trim().to_string(), scope);
+    if item.0.is_empty() || app.prefs.saved.contains(&item) {
+        return;
+    }
+    app.prefs.saved.push(item);
+    crate::prefs::save(app);
+    sidebar_changed(app);
+    app.note("Hledání je uložené v postranním panelu.");
 }
 
 pub fn properties(app: &mut App) {

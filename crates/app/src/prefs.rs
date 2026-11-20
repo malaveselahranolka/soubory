@@ -67,6 +67,13 @@ pub fn load(app: &mut App) {
                     }
                 }
             }
+            "search" => {
+                let (text, scope) = v.split_once('\t').map_or((v, None), |(t, s)| (t, Some(PathBuf::from(s))));
+                let item = (text.to_string(), scope);
+                if !item.0.is_empty() && !app.prefs.saved.contains(&item) {
+                    app.prefs.saved.push(item);
+                }
+            }
             "favorite" => {
                 let p = PathBuf::from(v);
                 if !app.prefs.favorites.contains(&p) {
@@ -132,6 +139,12 @@ pub fn save(app: &App) {
     }
     for f in &app.prefs.favorites {
         s.push_str(&format!("favorite={}\n", f.display()));
+    }
+    for (text, scope) in &app.prefs.saved {
+        match scope {
+            Some(f) => s.push_str(&format!("search={text}\t{}\n", f.display())),
+            None => s.push_str(&format!("search={text}\n")),
+        }
     }
     let path = file();
     let _ = std::fs::create_dir_all(data_dir());

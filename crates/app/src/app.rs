@@ -195,6 +195,8 @@ pub struct Prefs {
     pub folders_first: bool,
     pub icon_size: f32,
     pub favorites: Vec<PathBuf>,
+    /// Saved searches (Finder's smart folders): text and optional folder scope.
+    pub saved: Vec<(String, Option<PathBuf>)>,
     /// Normal (restored) window rect in workspace pixels, and whether it was maximized.
     pub window: Option<([i32; 4], bool)>,
 }
@@ -252,6 +254,7 @@ impl App {
             folders_first: true,
             icon_size: 64.0,
             favorites: Vec::new(),
+            saved: Vec::new(),
             window: None,
         };
         let mut app = App {
@@ -266,7 +269,7 @@ impl App {
             lay: Layout::default(),
             tabs: vec![Tab::new(start, View::List)],
             cur: 0,
-            side_rows: sidebar::build(&prefs.favorites),
+            side_rows: sidebar::build(&prefs),
             side_scroll: 0.0,
             sidebar_w: DEFAULT_SIDEBAR,
             sidebar_on: true,
@@ -422,6 +425,18 @@ impl App {
         }
         crate::win::watch_current(self);
         crate::win::set_title(self);
+    }
+
+    /// A saved search: the search field shows its text, the scope bar offers its folder, and
+    /// clearing the field returns to where the user was.
+    pub fn open_search(&mut self, text: String, scope: Option<PathBuf>) {
+        if !matches!(self.tab().loc, Loc::Search { .. }) {
+            self.search_prev = Some(scope.clone().map_or_else(|| self.tab().loc.clone(), Loc::Folder));
+        }
+        self.search_text = text.clone();
+        self.tab_mut().by_rank = true;
+        self.go(Loc::Search { text, scope });
+        self.relayout();
     }
 
     pub fn go(&mut self, loc: Loc) {
@@ -996,6 +1011,7 @@ impl App {
             Hit::SideRow(i) => {
                 self.focus = Focus::Sidebar;
                 match self.side_rows.get(i).cloned() {
+                    Some(Row::Item { loc: Loc::Search { text, scope }, .. }) => self.open_search(text, scope),
                     Some(Row::Item { loc, .. }) => self.go(loc),
                     Some(Row::Tag(t)) => self.go(Loc::Tag(t)),
                     _ => {}
@@ -1189,7 +1205,7 @@ impl App {
             (VK_DELETE, false, s, false) => crate::shell::delete(self, s),
             (VK_F2, false, false, false) => crate::win::begin_rename(self),
             (VK_F5, false, false, false) => {
-                self.side_rows = sidebar::build(&self.prefs.favorites);
+                self.side_rows = sidebar::build(&self.prefs);
                 self.reload(None);
                 self.invalidate();
             }
