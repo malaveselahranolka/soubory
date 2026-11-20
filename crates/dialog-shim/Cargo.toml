@@ -4,12 +4,15 @@ version.workspace = true
 license.workspace = true
 repository.workspace = true
 edition.workspace = true
-description = "Option 2 gate: HKCU server for CLSID_FileOpenDialog that logs and hands back comdlg32's own factory."
+description = "Option 2: HKCU server for CLSID_FileOpenDialog that shows fm's picker in allowlisted apps and hands everything else to comdlg32."
 
 [lib]
 name = "fm_dialog_shim"
-# cdylib: the COM server. rlib: tests call the routing logic directly.
+# cdylib: the COM server. rlib: fm shares the pick protocol (proto.rs); tests call the routing logic.
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 windows = { workspace = true }
+
+[dev-dependencies]
+windows-core = { workspace = true }

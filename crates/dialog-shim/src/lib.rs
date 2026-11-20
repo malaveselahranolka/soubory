@@ -1,19 +1,31 @@
-//! `fm_dialog_shim.dll`: the Option 2 gate (docs/ARCHITECTURE.md, M9).
+//! `fm_dialog_shim.dll`: Option 2 (docs/ARCHITECTURE.md, M9 and M10).
 //!
 //! `scripts/install-shim.ps1` registers it in HKCU as the in-process server of
-//! CLSID_FileOpenDialog. Every call hands back **comdlg32's own class factory**, untouched, so
-//! dialogs behave exactly as before. It only appends one line per dialog to
-//! `%LOCALAPPDATA%\fm\shim.log`: which process, its integrity level and AppContainer status, the
-//! interface asked for, where a replacement picker would be used ([`route`]) and the modules on
-//! the call stack (does legacy `GetOpenFileName` come through here too?). No paths, file names
-//! or dialog contents are logged.
+//! CLSID_FileOpenDialog. Outside the allowlist ([`route`]) every call hands back **comdlg32's own
+//! class factory**, untouched. An allowlisted host (Claude.exe, plus `shim-allow.txt`) gets a
+//! factory whose dialogs forward every call to the real one and, in `Show()`, open fm's picker
+//! instead when the dialog asks nothing the picker cannot do (`wrap.rs`, `pick.rs`).
 //!
-//! Rules for code inside other processes (§4.7): nothing runs in `DllMain`, every export is inside
-//! `catch_unwind`, nothing blocks, no state is kept. The kill switch `%LOCALAPPDATA%\fm\disable-shim`
-//! turns even the logging off.
+//! `%LOCALAPPDATA%\fm\shim.log` gets one line per `DllGetClassObject` (process, integrity level,
+//! AppContainer, interface, route, the modules on the call stack) and one per `Show()` (options,
+//! decision and why, outcome). No paths, file names or dialog contents are logged.
+//!
+//! Rules for code inside other processes (§4.7): nothing runs in `DllMain`, every export and every
+//! COM method is inside `catch_unwind`, state lives in one dialog object. The kill switch
+//! `%LOCALAPPDATA%\fm\disable-shim` makes it hand out comdlg32's factory again and stops the log.
 #![allow(clippy::missing_safety_doc)]
 
-/// Where a dialog would go once a picker exists. The gate build always passes through.
+pub mod proto;
+#[cfg(windows)]
+pub mod pick;
+#[cfg(windows)]
+mod wrap;
+
+/// Hosts that get the picker without being listed in `shim-allow.txt`: the M9 gate saw Claude's
+/// dialog come through the override; nothing is known about other apps yet.
+pub const DEFAULT_ALLOW: &[&str] = &["Claude.exe"];
+
+/// Where a host's Open dialogs go.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Route {
     Pass(&'static str),
@@ -36,7 +48,7 @@ pub fn route(h: &Host, allow: &[String]) -> Route {
         Route::Pass("appcontainer")
     } else if h.exe.eq_ignore_ascii_case("explorer.exe") {
         Route::Pass("explorer")
-    } else if !allow.iter().any(|a| a.trim().eq_ignore_ascii_case(h.exe)) {
+    } else if !DEFAULT_ALLOW.iter().copied().chain(allow.iter().map(String::as_str)).any(|a| a.trim().eq_ignore_ascii_case(h.exe)) {
         Route::Pass("not allowlisted")
     } else {
         Route::Picker
@@ -53,7 +65,7 @@ pub fn parse_allow(text: &str) -> Vec<String> {
 }
 
 #[cfg(windows)]
-mod imp {
+pub(crate) mod imp {
     use super::*;
     use std::{ffi::c_void, io::Write, path::PathBuf};
     use windows::{
@@ -96,9 +108,26 @@ mod imp {
             return E_POINTER;
         }
         unsafe { *out = std::ptr::null_mut() };
-        let hr = std::panic::catch_unwind(|| unsafe { forward(&*clsid, &*iid, out) })
-            .unwrap_or(E_UNEXPECTED);
-        let _ = std::panic::catch_unwind(|| unsafe { log(&*clsid, &*iid, hr) });
+        let (clsid, iid) = unsafe { (&*clsid, &*iid) };
+        // The kill switch: comdlg32's factory and nothing else, not even the log.
+        if killed() {
+            return std::panic::catch_unwind(|| unsafe { forward(clsid, iid, out) }).unwrap_or(E_UNEXPECTED);
+        }
+        let host = std::panic::catch_unwind(host_route).unwrap_or(Route::Pass("panic"));
+        let wrap = host == Route::Picker && *clsid == FileOpenDialog && (*iid == IClassFactory::IID || *iid == IUnknown::IID);
+        let hr = std::panic::catch_unwind(|| unsafe {
+            if !wrap {
+                return forward(clsid, iid, out);
+            }
+            let mut real = std::ptr::null_mut();
+            let hr = forward(clsid, &IClassFactory::IID, &mut real);
+            if hr.is_ok() {
+                *out = crate::wrap::factory(IClassFactory::from_raw(real));
+            }
+            hr
+        })
+        .unwrap_or(E_UNEXPECTED);
+        let _ = std::panic::catch_unwind(|| log(clsid, iid, hr, &host));
         hr
     }
 
@@ -129,17 +158,23 @@ mod imp {
     }
 
     fn hklm_server(clsid: &GUID) -> Option<PathBuf> {
-        let key: Vec<u16> = format!("SOFTWARE\\Classes\\CLSID\\{{{clsid:?}}}\\InprocServer32\0")
-            .encode_utf16()
-            .collect();
-        let mut buf = [0u16; 520];
+        let s = reg_sz(HKEY_LOCAL_MACHINE, &format!("SOFTWARE\\Classes\\CLSID\\{{{clsid:?}}}\\InprocServer32"), "")?;
+        let p = PathBuf::from(s.trim().trim_matches('"'));
+        p.is_absolute().then_some(p)
+    }
+
+    /// A string value from the 64-bit view; `name` "" is the key's default value.
+    pub(crate) fn reg_sz(root: HKEY, key: &str, name: &str) -> Option<String> {
+        let key: Vec<u16> = key.encode_utf16().chain(Some(0)).collect();
+        let name: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+        let mut buf = [0u16; 1040];
         let mut size = (buf.len() * 2) as u32;
         // RRF_RT_REG_SZ also accepts REG_EXPAND_SZ and expands it (%SystemRoot%).
         unsafe {
             RegGetValueW(
-                HKEY_LOCAL_MACHINE,
+                root,
                 PCWSTR(key.as_ptr()),
-                PCWSTR::null(),
+                if name.len() > 1 { PCWSTR(name.as_ptr()) } else { PCWSTR::null() },
                 RRF_RT_REG_SZ | RRF_SUBKEY_WOW6464KEY,
                 None,
                 Some(buf.as_mut_ptr().cast()),
@@ -148,9 +183,7 @@ mod imp {
         }
         .ok()
         .ok()?;
-        let s = String::from_utf16_lossy(&buf[..(size as usize / 2).saturating_sub(1)]);
-        let p = PathBuf::from(s.trim().trim_matches('"'));
-        p.is_absolute().then_some(p)
+        Some(String::from_utf16_lossy(&buf[..(size as usize / 2).saturating_sub(1)]))
     }
 
     fn system_comdlg32() -> Option<PathBuf> {
@@ -178,7 +211,40 @@ mod imp {
         std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("fm"))
     }
 
-    unsafe fn log(clsid: &GUID, iid: &GUID, hr: HRESULT) {
+    pub(crate) fn killed() -> bool {
+        fm_dir().is_some_and(|d| d.join("disable-shim").exists())
+    }
+
+    /// This process's route, from its image name, token and `shim-allow.txt`.
+    fn host_route() -> Route {
+        let exe = module_name(None).unwrap_or_default();
+        let (elevated, app_container, _) = token_info();
+        let allow = fm_dir()
+            .and_then(|d| std::fs::read_to_string(d.join("shim-allow.txt")).ok())
+            .map(|t| parse_allow(&t))
+            .unwrap_or_default();
+        route(&Host { exe: &exe, elevated, app_container }, &allow)
+    }
+
+    fn log(clsid: &GUID, iid: &GUID, hr: HRESULT, host: &Route) {
+        let (_, app_container, integrity) = token_info();
+        let r = match host {
+            Route::Pass(why) => format!("pass ({why})"),
+            Route::Picker => "picker".into(),
+        };
+        log_line(&format!(
+            "{cls}\t{itf}\t{integrity}\tappcontainer={ac}\t{r}\thr={hr:#010x}\t{stack}",
+            cls = guid_name(clsid),
+            itf = guid_name(iid),
+            ac = app_container as u8,
+            hr = hr.0 as u32,
+            stack = caller_modules(),
+        ));
+    }
+
+    /// Appends `<time>\t<pid>\t<exe>\t<fields>` to shim.log, unless the kill switch is set or the
+    /// log is over 1 MB.
+    pub(crate) fn log_line(fields: &str) {
         let Some(dir) = fm_dir() else { return };
         if dir.join("disable-shim").exists() {
             return;
@@ -187,25 +253,9 @@ mod imp {
         if std::fs::metadata(&path).is_ok_and(|m| m.len() > LOG_CAP) {
             return;
         }
-        let exe = module_name(None).unwrap_or_default();
-        let (elevated, app_container, integrity) = token_info();
-        let allow = std::fs::read_to_string(dir.join("shim-allow.txt"))
-            .map(|t| parse_allow(&t))
-            .unwrap_or_default();
-        let r = match route(
-            &Host {
-                exe: &exe,
-                elevated,
-                app_container,
-            },
-            &allow,
-        ) {
-            Route::Pass(why) => format!("pass ({why})"),
-            Route::Picker => "picker (gate: passed through)".into(),
-        };
         let t = unsafe { GetLocalTime() };
         let line = format!(
-            "{y}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}\t{pid}\t{exe}\t{cls}\t{itf}\t{integrity}\tappcontainer={ac}\t{r}\thr={hr:#010x}\t{stack}\n",
+            "{y}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}\t{pid}\t{exe}\t{fields}\n",
             y = t.wYear,
             mo = t.wMonth,
             d = t.wDay,
@@ -213,11 +263,7 @@ mod imp {
             mi = t.wMinute,
             s = t.wSecond,
             pid = unsafe { GetCurrentProcessId() },
-            cls = guid_name(clsid),
-            itf = guid_name(iid),
-            ac = app_container as u8,
-            hr = hr.0 as u32,
-            stack = caller_modules(),
+            exe = module_name(None).unwrap_or_default(),
         );
         let _ = std::fs::create_dir_all(&dir);
         // AppContainer hosts cannot write here; that is expected and silent.
@@ -230,7 +276,7 @@ mod imp {
         }
     }
 
-    fn guid_name(g: &GUID) -> String {
+    pub(crate) fn guid_name(g: &GUID) -> String {
         match *g {
             x if x == FileOpenDialog => "FileOpenDialog".into(),
             x if x == FileSaveDialog => "FileSaveDialog".into(),
@@ -379,6 +425,12 @@ mod tests {
         assert_eq!(
             route(&host("notepad.exe"), &[]),
             Route::Pass("not allowlisted")
+        );
+        // Claude.exe needs no line in shim-allow.txt.
+        assert_eq!(route(&host("claude.exe"), &[]), Route::Picker);
+        assert_eq!(
+            route(&Host { elevated: true, ..host("Claude.exe") }, &[]),
+            Route::Pass("elevated")
         );
         let explorer = vec!["explorer.exe".to_string()];
         assert_eq!(
