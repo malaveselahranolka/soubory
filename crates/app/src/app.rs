@@ -385,6 +385,8 @@ impl App {
             preview: (self.preview_on && self.w > 900.0).then_some(280.0),
         });
         self.clamp_scroll();
+        // A taller window may fit the whole sidebar again; Koš then goes back to the bottom.
+        self.side_scroll = self.side_scroll.clamp(0.0, (crate::paint::sidebar_height(self) - self.lay.sidebar.h).max(0.0));
     }
 
     pub fn invalidate(&self) {

@@ -52,11 +52,33 @@ pub fn own(e: &Entry, virtual_place: bool) -> Option<Own> {
         let custom = !e.is_placeholder() && e.attrs & (FILE_ATTRIBUTE_READONLY.0 | FILE_ATTRIBUTE_SYSTEM.0) != 0;
         return (!custom).then_some(Own::Folder(None));
     }
-    let ext = e.ext().to_ascii_lowercase();
+    let ext = ext_of(e);
     if SHELL_EXT.contains(&ext.as_str()) {
         return None;
     }
     Some(Own::File(category(&ext, &e.name)))
+}
+
+/// The extension, lower case: from the name, or from the full path when the name hides it
+/// (Recycle Bin items are listed by display name; their $R… file keeps the extension).
+pub fn ext_of(e: &Entry) -> String {
+    let x = e.ext();
+    if !x.is_empty() || e.is_dir {
+        return x.to_ascii_lowercase();
+    }
+    e.full.as_deref().and_then(|p| p.extension()).map(|x| x.to_string_lossy().to_ascii_lowercase()).unwrap_or_default()
+}
+
+/// `own_at`, and a read-only or system folder whose shell icon is still the plain folder (its
+/// desktop.ini only renames it, as with Program Files or Users) is fm's too. The shell index is
+/// looked up once per path and cached, as the shell icon was before.
+pub fn own_in(icons: &mut crate::icons::Icons, e: &Entry, dir: &Path, virtual_place: bool) -> Option<Own> {
+    let o = own_at(e, dir, virtual_place);
+    let drive = e.full.as_deref().is_some_and(|p| p.parent().is_none());
+    if o.is_none() && e.is_dir && !virtual_place && !drive && icons.index(dir, e) == icons.folder_index() {
+        return Some(Own::Folder(None));
+    }
+    o
 }
 
 /// `own` for an entry listed in `dir`, with fm's emblem on the user's known folders (their
@@ -193,7 +215,7 @@ impl Cat {
 
 /// The extension as the page shows it: up to four letters or digits, upper case.
 pub fn label(e: &Entry) -> Option<String> {
-    let x = e.ext();
+    let x = ext_of(e);
     (!x.is_empty() && x.len() <= 4 && x.chars().all(|c| c.is_ascii_alphanumeric())).then(|| x.to_ascii_uppercase())
 }
 
@@ -221,8 +243,8 @@ fn folder_colors(t: &Theme) -> (Color, Color) {
     if t.is_dark() { (rgb(0xC08420), rgb(0xE3A93A)) } else { (rgb(0xDB9A26), rgb(0xF4B740)) }
 }
 
-/// Draws `icon` square in `r`. `on`: the colour of a selected row's text, for glyphs drawn on
-/// the selection fill. `opacity` dims hidden and cut items.
+/// Draws `icon` square in `r`. `on`: the colour of a selected item's text, for icons drawn on
+/// the accent selection fill. `opacity` dims hidden and cut items.
 pub fn draw(c: &mut Canvas, t: &Theme, icon: Own, e: &Entry, r: Rect, on: Option<Color>, opacity: f32) {
     let hc = t.mode == Mode::HighContrast;
     let s = r.w.min(r.h);
@@ -234,14 +256,19 @@ pub fn draw(c: &mut Canvas, t: &Theme, icon: Own, e: &Entry, r: Rect, on: Option
         }
         Own::Folder(emblem) => {
             let mark = if hc {
-                let ink = alpha(on.unwrap_or(t.ink), opacity);
-                c.path(FOLDER_BACK, 96.0, box_, Color { a: 0.0, ..ink }, Some((ink, 1.0)));
+                // The back sits on whatever is behind (the selection in tiles); the front is card.
+                let back = alpha(on.unwrap_or(t.ink), opacity);
+                let ink = alpha(t.ink, opacity);
+                c.path(FOLDER_BACK, 96.0, box_, Color { a: 0.0, ..back }, Some((back, 1.0)));
                 c.path(FOLDER_FRONT, 96.0, box_, t.card, Some((ink, 1.0)));
                 ink
             } else {
+                // Dimmed (hidden, cut) folders fade toward the card as solid colours: two translucent
+                // fills would show a darker band where the back runs under the front.
+                let fade = |col: Color| if opacity < 1.0 { mix(col, t.card, 1.0 - opacity) } else { col };
                 let (back, front) = folder_colors(t);
-                c.path(FOLDER_BACK, 96.0, box_, alpha(back, opacity), None);
-                c.path(FOLDER_FRONT, 96.0, box_, alpha(front, opacity), None);
+                c.path(FOLDER_BACK, 96.0, box_, fade(back), None);
+                c.path(FOLDER_FRONT, 96.0, box_, fade(front), None);
                 // Pressed into the front, like Finder's emblems.
                 alpha(mix(back, rgb(0x000000), 0.22), 0.9 * opacity)
             };
@@ -260,7 +287,12 @@ pub fn draw(c: &mut Canvas, t: &Theme, icon: Own, e: &Entry, r: Rect, on: Option
         }
         Own::File(cat) => {
             let k = s / 96.0;
-            let col = if hc { t.ink } else { ink(t, cat.color()) };
+            let col = match on {
+                _ if hc => t.ink,
+                // On the accent fill (a selected tile) the page takes the selection's text colour.
+                Some(on) => on,
+                None => ink(t, cat.color()),
+            };
             if hc {
                 c.path(PAGE, 96.0, box_, t.card, Some((alpha(col, opacity), 1.0)));
             } else {
@@ -268,7 +300,7 @@ pub fn draw(c: &mut Canvas, t: &Theme, icon: Own, e: &Entry, r: Rect, on: Option
                 c.path(PAGE, 96.0, box_, fill, Some((alpha(col, 0.34 * opacity), (1.25 * k).max(1.0 / c.scale))));
                 c.path(FOLD, 96.0, box_, alpha(col, 0.40 * opacity), None);
             }
-            let text = if hc || t.is_dark() { col } else { mix(col, rgb(0x000000), 0.15) };
+            let text = if hc || t.is_dark() || on.is_some() { col } else { mix(col, rgb(0x000000), 0.15) };
             let lbl = (s >= 72.0).then(|| label(e)).flatten();
             match (cat.inner(), &lbl) {
                 (Some(g), _) => {
@@ -339,6 +371,12 @@ mod tests {
         assert_eq!(f("Windows.iso"), Some(Own::File(Cat::Disk)));
         assert_eq!(f("záloha.dat"), Some(Own::File(Cat::Other)));
         assert_eq!(f("bez přípony"), Some(Own::File(Cat::Other)));
+        // A Recycle Bin item shown without its extension: the $R… file still has it.
+        let bin = Entry { full: Some(r"C:\$Recycle.Bin\S-1-5-21\$RAB12CD.pdf".into()), ..file("Smlouva") };
+        assert_eq!(own(&bin, false), Some(Own::File(Cat::Pdf)));
+        assert_eq!(label(&bin).as_deref(), Some("PDF"));
+        let prog = Entry { full: Some(r"C:\$Recycle.Bin\S-1-5-21\$RAB12CE.exe".into()), ..file("Setup") };
+        assert_eq!(own(&prog, false), None);
         assert_eq!(f("Makefile"), Some(Own::File(Cat::Code)));
         assert_eq!(f("LICENSE"), Some(Own::File(Cat::Text)));
         // A dotfile has no extension; its name decides.

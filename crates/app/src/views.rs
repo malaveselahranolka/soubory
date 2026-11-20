@@ -277,7 +277,7 @@ pub fn paint_columns(app: &mut App, c: &mut Canvas, t: &Theme) {
             let e = app.tab().cols_left[k].entries[i].clone();
             let selected = app.tab().cols_left[k].sel.is(i);
             let dir = app.tab().cols_left[k].dir.clone();
-            let idx = crate::fileicons::own_at(&e, &dir, false).ok_or_else(|| cached_icon(app, &dir, &e, Slot::Left(k, i)));
+            let idx = crate::fileicons::own_in(&mut app.icons, &e, &dir, false).ok_or_else(|| cached_icon(app, &dir, &e, Slot::Left(k, i)));
             let mask = crate::tags::mask(&e.path_in(&dir));
             column_row(app, c, t, r, &e, idx, mask, if selected { Some((t.sel_inactive, t.ink)) } else { None });
         }
@@ -296,7 +296,8 @@ pub fn paint_columns(app: &mut App, c: &mut Canvas, t: &Theme) {
         let r = app.row_rect(i);
         let e = app.tab().entries[i].clone();
         let dir = app.tab().dir();
-        let idx = crate::fileicons::own_at(&e, &dir, false).ok_or_else(|| cached_icon(app, &dir, &e, Slot::Active(i)));
+        let virt = crate::paint::virtual_place(app);
+        let idx = crate::fileicons::own_in(&mut app.icons, &e, &dir, virt).ok_or_else(|| cached_icon(app, &dir, &e, Slot::Active(i)));
         let selected = app.tab().sel.is(i);
         if app.kb && app.tab().sel.focus == Some(i) && !selected && app.focus == Focus::Content {
             c.round_stroke(r.inset(INSET / 2.0, 1.0), 6.0, t.focus, 1.5);
@@ -320,7 +321,7 @@ pub fn paint_columns(app: &mut App, c: &mut Canvas, t: &Theme) {
             let r = Rect::new(rx, b.y + 4.0 + i as f32 * ROW_H - scroll, COL_W, ROW_H);
             let p = app.tab().col_right.as_ref().unwrap();
             let (e, dir) = (p.entries[i].clone(), p.dir.clone());
-            let idx = crate::fileicons::own_at(&e, &dir, false).ok_or_else(|| cached_icon(app, &dir, &e, Slot::Right(i)));
+            let idx = crate::fileicons::own_in(&mut app.icons, &e, &dir, false).ok_or_else(|| cached_icon(app, &dir, &e, Slot::Right(i)));
             let mask = crate::tags::mask(&e.path_in(&dir));
             column_row(app, c, t, r, &e, idx, mask, None);
         }
@@ -569,7 +570,9 @@ pub fn paint_inspector(app: &mut App, c: &mut Canvas, t: &Theme, r: Rect) {
                     size: 0,
                     modified: 0,
                     created: 0,
-                    attrs: 0x10,
+                    // Read-only marks it as possibly customised: fm's icon decision then asks the
+                    // shell's (cached) icon for this path instead of reading attributes on every paint.
+                    attrs: 0x10 | 0x01,
                     full: Some(dir.clone()),
                     shell: None,
                     origin: None,

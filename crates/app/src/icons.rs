@@ -87,6 +87,17 @@ impl Icons {
         i
     }
 
+    /// The plain folder's index (a folder without its own desktop.ini icon).
+    pub fn folder_index(&mut self) -> i32 {
+        let key = "\u{1}dir".to_string();
+        if let Some(&i) = self.by_ext.get(&key) {
+            return i;
+        }
+        let i = sys_index("folder", true, true);
+        self.by_ext.insert(key, i);
+        i
+    }
+
     /// Index for a path (sidebar, drives, path bar).
     pub fn index_for_path(&mut self, p: &Path) -> i32 {
         if let Some(&i) = self.by_path.get(p) {

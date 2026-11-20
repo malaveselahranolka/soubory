@@ -429,10 +429,13 @@ fn drop_highlight(app: &App, c: &mut Canvas, t: &Theme) {
 pub fn side_row_at(app: &App, x: f32, y: f32) -> Option<usize> {
     let s = app.lay.sidebar;
     let (x, y) = (x - s.x, y - s.y + app.side_scroll);
-    side_rects(app)
-        .iter()
-        .position(|r| r.contains(x, y))
-        .filter(|&k| matches!(app.side_rows[k], Row::Item { .. } | Row::Tag(_)))
+    // Places answer across the sidebar's full width (the strips beside a pill are not the
+    // caption); tag dots only within their own targets.
+    side_rects(app).iter().zip(&app.side_rows).position(|(r, row)| match row {
+        Row::Item { .. } => y >= r.y && y < r.b(),
+        Row::Tag(_) => r.contains(x, y),
+        Row::Divider | Row::Spacer => false,
+    })
 }
 
 fn side_selected(app: &App, row: &Row) -> bool {
@@ -697,13 +700,30 @@ fn header(app: &App, c: &mut Canvas, t: &Theme, h: Rect) {
 
 /// fm's own icon for `e` in the current tab, or None where the shell's icon stays: programs,
 /// custom folders, drives, and virtual places other than the Recycle Bin.
-pub fn own_icon(app: &App, e: &fsys::Entry) -> Option<crate::fileicons::Own> {
-    let virtual_place = match &app.tab().loc {
+pub fn own_icon(app: &mut App, e: &fsys::Entry) -> Option<crate::fileicons::Own> {
+    let (virtual_place, bin) = match &app.tab().loc {
+        Loc::Computer => (true, false),
+        Loc::Shell { id, .. } => {
+            let bin = crate::shellns::is_recycle_bin(id);
+            (!bin, bin)
+        }
+        _ => (false, false),
+    };
+    // A Recycle Bin file whose type cannot be told keeps the shell's icon.
+    if bin && !e.is_dir && crate::fileicons::ext_of(e).is_empty() {
+        return None;
+    }
+    let dir = app.tab().dir();
+    crate::fileicons::own_in(&mut app.icons, e, &dir, virtual_place)
+}
+
+/// The current tab shows a shell place whose items keep the shell's icons (all but the bin).
+pub fn virtual_place(app: &App) -> bool {
+    match &app.tab().loc {
         Loc::Computer => true,
         Loc::Shell { id, .. } => !crate::shellns::is_recycle_bin(id),
         _ => false,
-    };
-    crate::fileicons::own_at(e, &app.tab().dir(), virtual_place)
+    }
 }
 
 /// The colour a small icon glyph takes on a selected item: the selection's text colour where the
@@ -1456,7 +1476,12 @@ mod tests {
                 let r = side_row_rect(&app, k);
                 let hit = side_row_at(&app, r.cx(), r.cy());
                 match app.side_rows[k] {
-                    Row::Item { .. } => assert_eq!(hit, Some(k), "row {k} at {w}x{h}"),
+                    Row::Item { .. } => {
+                        assert_eq!(hit, Some(k), "row {k} at {w}x{h}");
+                        // Beside the pill is still the place, not the window caption.
+                        assert_eq!(side_row_at(&app, 1.0, r.cy()), Some(k));
+                        assert_eq!(side_row_at(&app, w - 4.0, r.cy()), Some(k));
+                    }
                     Row::Tag(_) => {
                         assert_eq!(hit, Some(k), "tag {k} at {w}x{h}");
                         assert!(r.w >= 24.0 && r.h >= 24.0 && r.r() <= w - INSET + 0.01, "tag {k} target {r:?}");

@@ -222,14 +222,23 @@ fn evict(s: &mut State) {
 /// Synchronous variant for Quick Look's fallback image (cached; placeholder-safe).
 pub fn image_blocking(c: &crate::gfx::Canvas, path: &std::path::Path, e: &crate::fsys::Entry, dip: f32, own: bool) -> Option<(ID2D1Bitmap, f32, f32)> {
     let key = Key { path: path.to_path_buf(), px: bucket(dip * c.scale), mtime: e.modified, icon: !own };
-    let img = S.with(|s| match s.borrow().slots.get(&key) {
-        Some(Slot::Ready(img, _)) => Some(img.clone()),
-        _ => None,
+    let (img, failed) = S.with(|s| match s.borrow().slots.get(&key) {
+        Some(Slot::Ready(img, _)) => (Some(img.clone()), false),
+        Some(Slot::Failed) => (None, true),
+        _ => (None, false),
     });
+    if failed {
+        return None;
+    }
     let img = match img {
         Some(i) => i,
         None => {
-            let i = Rc::new(load(path, key.px, e.is_placeholder(), key.icon)?);
+            let Some(i) = load(path, key.px, e.is_placeholder(), key.icon) else {
+                // Remembered, so Quick Look does not ask the shell again on every paint.
+                S.with(|s| s.borrow_mut().slots.insert(key, Slot::Failed));
+                return None;
+            };
+            let i = Rc::new(i);
             S.with(|s| {
                 let mut s = s.borrow_mut();
                 s.bytes += i.data.len();
@@ -244,7 +253,10 @@ pub fn image_blocking(c: &crate::gfx::Canvas, path: &std::path::Path, e: &crate:
 
 /// Folder changed: drop failed lookups and pending markers so they are retried.
 pub fn refresh() {
-    S.with(|s| s.borrow_mut().slots.retain(|_, v| matches!(v, Slot::Ready(..))));
+    // A file without a thumbnail that fm draws itself stays a miss: its key carries the mtime, so a
+    // changed file is asked again anyway.
+    // shortcut: a placeholder downloaded meanwhile keeps its miss (same mtime) until fm restarts.
+    S.with(|s| s.borrow_mut().slots.retain(|k, v| matches!(v, Slot::Ready(..)) || (matches!(v, Slot::Failed) && !k.icon)));
 }
 
 pub fn forget_device(_app: &mut App) {
