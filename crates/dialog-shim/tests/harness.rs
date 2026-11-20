@@ -1,8 +1,9 @@
 //! Loads a temp copy of the built DLL (no registry) and drives its dialogs the way Electron does,
 //! with a stand-in for fm: a door window of a test-only class that answers on the pipe. Covers
 //! routing and logging, the recorded setters, single and multiple picks, cancel, a picker that
-//! never connects and an fm that refuses (both: the system dialog), delegation on Advise, a
-//! foreign QueryInterface and folder picking, and the kill switch.
+//! never connects and an fm that refuses (both: the system dialog), event sinks (Chrome: OnFileOk
+//! accepts or refuses the pick), delegation on a foreign QueryInterface and folder picking, and
+//! the kill switch.
 //!
 //! The cases that end in the system dialog show it on the desktop for a moment: a timer on this
 //! thread posts IDCANCEL to it (a message to our own window; no input is synthesized). One test function,
@@ -15,7 +16,7 @@ use std::{
     ptr::null_mut,
     sync::{
         Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
 };
 use windows::{
@@ -131,12 +132,17 @@ fn start_door(class: String) {
     rx.recv().unwrap();
 }
 
+/// Chrome-like sink: counts OnFileOk calls and refuses (S_FALSE) while VETO is set.
+static FILE_OK: AtomicU32 = AtomicU32::new(0);
+static VETO: AtomicBool = AtomicBool::new(false);
+
 #[implement(IFileDialogEvents)]
 struct Events;
 
 impl IFileDialogEvents_Impl for Events_Impl {
     fn OnFileOk(&self, _: Ref<IFileDialog>) -> Result<()> {
-        Ok(())
+        FILE_OK.fetch_add(1, Ordering::SeqCst);
+        if VETO.load(Ordering::SeqCst) { Err(Error::from_hresult(S_FALSE)) } else { Ok(()) }
     }
     fn OnFolderChanging(&self, _: Ref<IFileDialog>, _: Ref<IShellItem>) -> Result<()> {
         Ok(())
@@ -361,14 +367,35 @@ fn picker_through_the_wrapper() {
         assert!(show(&d, owner).is_err());
         assert!(last_show(&fm).ends_with("\tfallback: fm.exe too old for --pick\tsystem: cancelled"), "{}", last_show(&fm));
 
-        // 6. Delegation: the picker never shows for what only the real dialog can do.
-        SEEN.lock().unwrap().clear();
-        set(Script::Answer(Msg::Picked(vec![a.clone()])));
-        let d = electron(base);
+        // 6. Event sinks (Chrome): the picker shows and the host's OnFileOk takes its result...
+        set(Script::Answer(Msg::Picked(vec![a.clone(), b.clone()])));
+        let d = electron(base | FOS_ALLOWMULTISELECT);
         let events: IFileDialogEvents = Events.into();
         d.Advise(&events).unwrap();
+        show(&d, owner).unwrap();
+        assert!(last_show(&fm).ends_with("\tpicker (resident)\tpicked 2"), "{}", last_show(&fm));
+        assert_eq!(FILE_OK.load(Ordering::SeqCst), 1);
+        assert_eq!(d.GetResults().unwrap().GetCount().unwrap(), 2);
+        // ...or refuses it: the system dialog then, under the host's rules, nothing picked.
+        VETO.store(true, Ordering::SeqCst);
+        set(Script::Answer(Msg::Picked(vec![a.clone()])));
+        let d = electron(base);
+        d.Advise(&events).unwrap();
         assert!(show(&d, owner).is_err());
-        assert!(last_show(&fm).ends_with("\tdelegate: advise\tsystem: cancelled"), "{}", last_show(&fm));
+        assert!(last_show(&fm).ends_with("\tfallback: resident: host refused the pick\tsystem: cancelled"), "{}", last_show(&fm));
+        assert!(d.GetResult().is_err(), "a refused pick is not the result");
+        VETO.store(false, Ordering::SeqCst);
+        // An unadvised sink is not asked.
+        let calls = FILE_OK.load(Ordering::SeqCst);
+        let d = electron(base);
+        let c = d.Advise(&events).unwrap();
+        d.Unadvise(c).unwrap();
+        show(&d, owner).unwrap();
+        assert_eq!(FILE_OK.load(Ordering::SeqCst), calls);
+
+        // 7. Delegation: the picker never shows for what only the real dialog can do.
+        SEEN.lock().unwrap().clear();
+        set(Script::Answer(Msg::Picked(vec![a.clone()])));
         let d = electron(base);
         let _custom: IFileDialogCustomize = d.cast().unwrap();
         assert!(show(&d, owner).is_err());
@@ -383,7 +410,7 @@ fn picker_through_the_wrapper() {
         }
         assert!(SEEN.lock().unwrap().is_empty(), "fm was never asked");
 
-        // 7. Kill switch: comdlg32's factory again, nothing logged.
+        // 8. Kill switch: comdlg32's factory again, nothing logged.
         let before = log_lines(&fm).len();
         std::fs::write(fm.join("disable-shim"), "").unwrap();
         let d: IFileOpenDialog = factory().CreateInstance(None).unwrap();

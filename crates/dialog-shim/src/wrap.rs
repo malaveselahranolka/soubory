@@ -135,6 +135,8 @@ struct State {
     req: crate::proto::Request,
     /// Our picker's result, for GetResult(s) and GetFolder.
     picked: Option<Vec<String>>,
+    /// The host's event sinks (Advise cookie, sink); the real dialog has them too.
+    sinks: Vec<(u32, IFileDialogEvents)>,
 }
 
 impl Dialog {
@@ -269,7 +271,6 @@ macro_rules! pass {
 }
 
 pass!(get_file_type_index, [base__ GetFileTypeIndex], (i: *mut u32));
-pass!(unadvise, [base__ Unadvise], (cookie: u32));
 pass!(set_options, [base__ SetOptions], (o: FILEOPENDIALOGOPTIONS));
 pass!(get_options, [base__ GetOptions], (o: *mut FILEOPENDIALOGOPTIONS));
 pass!(get_current_selection, [base__ GetCurrentSelection], (out: *mut *mut c_void));
@@ -324,9 +325,45 @@ record!(set_default_folder, SetDefaultFolder, (item: *mut c_void), |s| s.req.def
 record!(set_file_types, SetFileTypes, (n: u32, specs: *const COMDLG_FILTERSPEC), |s| {
     s.req.filters = if specs.is_null() { Vec::new() } else { std::slice::from_raw_parts(specs, n as usize).iter().map(|f| (text(f.pszName), text(f.pszSpec))).collect() }
 });
-// Events and item filters reach only the real dialog's own view: it shows instead.
-record!(advise, Advise, (events: *mut c_void, cookie: *mut u32), |s| { s.delegate.get_or_insert_with(|| "advise".into()); });
+// Item filters reach only the real dialog's own view: it shows instead.
 record!(set_filter, SetFilter, (filter: *mut c_void), |s| { s.delegate.get_or_insert_with(|| "item filter".into()); });
+
+/// Event sinks go to the real dialog (it may still show) and are kept for the picker's OnFileOk.
+/// Chrome advises two: one closes the dialog with its window, one refuses an accept while Enter
+/// is held; neither needs the folder or selection events the picker never sends.
+unsafe extern "system" fn advise(this: *mut c_void, events: *mut c_void, cookie: *mut u32) -> HRESULT {
+    guard(|| unsafe {
+        let d = me(this);
+        let hr = (d.vt().base__.Advise)(d.raw(), events, cookie);
+        if hr.is_ok() && !cookie.is_null() {
+            match IFileDialogEvents::from_raw_borrowed(&events) {
+                Some(e) => d.st().sinks.push((*cookie, e.clone())),
+                None => _ = d.st().delegate.get_or_insert_with(|| "advise".into()),
+            }
+        }
+        hr
+    })
+}
+
+unsafe extern "system" fn unadvise(this: *mut c_void, cookie: u32) -> HRESULT {
+    guard(|| unsafe {
+        let d = me(this);
+        let hr = (d.vt().base__.Unadvise)(d.raw(), cookie);
+        // Released after the lock: the host's sink may go away with it.
+        let _gone = {
+            let mut st = d.st();
+            st.sinks.iter().position(|(c, _)| *c == cookie).map(|i| st.sinks.remove(i))
+        };
+        hr
+    })
+}
+
+/// The host's OnFileOk for the picker's result, as the real dialog asks before it closes; false
+/// when a sink refused it (S_FALSE). Any other answer accepts, as with the real dialog.
+unsafe fn host_accepts(this: *mut c_void, d: &Dialog) -> bool {
+    let sinks: Vec<IFileDialogEvents> = d.st().sinks.iter().map(|(_, e)| e.clone()).collect();
+    sinks.iter().all(|e| unsafe { (Interface::vtable(e).OnFileOk)(e.as_raw(), this) } != S_FALSE)
+}
 
 /// Hands an interface to the caller.
 fn put<T: Interface>(out: *mut *mut c_void, r: Result<T>) -> HRESULT {
@@ -459,8 +496,13 @@ unsafe extern "system" fn show(this: *mut c_void, owner: HWND) -> HRESULT {
             Ok((via, Msg::Picked(paths))) if valid(&paths, req.multi) => {
                 let n = paths.len();
                 d.st().picked = Some(paths);
-                line(&format!("picker ({via})"), &format!("picked {n}"));
-                return S_OK;
+                if host_accepts(this, d) {
+                    line(&format!("picker ({via})"), &format!("picked {n}"));
+                    return S_OK;
+                }
+                // Refused: the system dialog lets the user try again under the host's own rules.
+                d.st().picked = None;
+                format!("{via}: host refused the pick")
             }
             Ok((via, Msg::Cancelled)) => {
                 line(&format!("picker ({via})"), "cancelled");
