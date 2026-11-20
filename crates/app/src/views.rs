@@ -447,7 +447,7 @@ pub fn paint_gallery(app: &mut App, c: &mut Canvas, t: &Theme) {
 }
 
 fn kind_and_size(e: &Entry) -> String {
-    if e.is_dir { fsys::kind_name(e) } else { format!("{} – {}", fsys::kind_name(e), fsys::format_size(e.size)) }
+    if e.is_dir && e.size == 0 { fsys::kind_name(e) } else { format!("{} – {}", fsys::kind_name(e), fsys::format_size(e.size)) }
 }
 
 /// Large image (thumbnail or icon) fitted into `r`.
@@ -505,7 +505,7 @@ pub fn preview_card(app: &mut App, c: &mut Canvas, t: &Theme, r: Rect, path: &Pa
     c.text("Informace", Rect::new(inner.x, y, inner.w, 20.0), Font::CaptionStrong, t.ink3, Align::Start);
     y += 22.0;
     let mut rows: Vec<(&str, String)> = vec![("Vytvořeno", fsys::format_date_long(e.created)), ("Změněno", fsys::format_date_long(e.modified))];
-    if !e.is_dir {
+    if !e.is_dir || e.size > 0 {
         rows.push(("Velikost", format!("{} ({} bajtů)", fsys::format_size(e.size), group_digits(e.size))));
     }
     if let Some(parent) = path.parent() {

@@ -182,12 +182,15 @@ pub fn arrange(
         })
         .collect();
     if ctx.key == GroupKey::Kind {
-        // Kinds rank by their names, in the user's collation.
-        let mut names: Vec<String> = b.iter().filter(|x| x.pin == 0).map(|x| x.label.clone()).collect();
-        names.sort_by(|a, b| fsys::name_cmp(a, b));
-        names.dedup();
+        // Kinds rank by their names in the user's collation; each distinct kind is collated
+        // once (a big folder has many files but few kinds). Equal-collating names still get
+        // distinct ranks, so two labels never interleave.
+        let distinct: std::collections::HashSet<&str> = b.iter().filter(|x| x.pin == 0).map(|x| x.label.as_str()).collect();
+        let mut names: Vec<&str> = distinct.into_iter().collect();
+        names.sort_by(|a, b| fsys::name_cmp(a, b).then_with(|| a.cmp(b)));
+        let rank: std::collections::HashMap<String, i64> = names.iter().enumerate().map(|(i, n)| (n.to_string(), i as i64)).collect();
         for x in b.iter_mut().filter(|x| x.pin == 0) {
-            x.rank = names.binary_search_by(|n| fsys::name_cmp(n, &x.label)).unwrap_or(0) as i64;
+            x.rank = rank[&x.label];
         }
     }
     // Each key's natural direction is its sort's default (dates and sizes newest/largest first);

@@ -201,13 +201,8 @@ pub fn sort(entries: &mut [Entry], key: SortKey, ascending: bool, folders_first:
             SortKey::Name => Ordering::Equal,
             SortKey::Modified => a.modified.cmp(&b.modified),
             SortKey::Created => a.created.cmp(&b.created),
-            SortKey::Size => {
-                if a.is_dir && b.is_dir {
-                    Ordering::Equal
-                } else {
-                    a.size.cmp(&b.size)
-                }
-            }
+            // Folders carry their size once the index has reported it (0 until then).
+            SortKey::Size => a.size.cmp(&b.size),
             SortKey::Kind => kind_name(a).cmp(&kind_name(b)),
         };
         let ord = primary.then_with(|| name_cmp(&a.name, &b.name));

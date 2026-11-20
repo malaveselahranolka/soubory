@@ -1405,11 +1405,17 @@ pub fn open_terminal(app: &mut App) {
 
 /// Drag the selection out (to Explorer, a browser, the desktop…) with the shell's own data object.
 /// A tag location lists what carries the tag, so it reloads; elsewhere only the dots change.
+/// Tags live in one store for all windows: every window showing a tag place or grouped by tags
+/// lists again (background tabs do it when shown).
 pub fn tags_changed(app: &mut App) {
-    if matches!(app.tab().loc, Loc::Tag(_)) || !app.shown_groups().is_empty() && app.tab().group == crate::groups::GroupKey::Tags {
-        app.reload(None);
+    fn refresh(a: &mut App) {
+        if matches!(a.tab().loc, Loc::Tag(_)) || a.groups_by_tags() {
+            a.reload(None);
+        }
+        a.invalidate();
     }
-    app.invalidate();
+    refresh(app);
+    crate::win::for_each_other_app(app.hwnd, refresh);
 }
 
 /// The shell's drop target for dropping onto `path` (into a folder or drive, onto an app or a .zip).

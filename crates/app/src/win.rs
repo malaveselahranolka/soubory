@@ -24,6 +24,8 @@ use windows::{
 pub const WM_APP_FS: u32 = WM_APP + 10;
 pub const WM_APP_THUMB: u32 = WM_APP + 11;
 pub const WM_APP_SEARCH: u32 = WM_APP + 12;
+/// Folder sizes from the index (search.rs).
+pub const WM_APP_SIZES: u32 = WM_APP + 18;
 pub const WM_APP_INDEX: u32 = WM_APP + 13;
 pub const WM_APP_OPDONE: u32 = WM_APP + 14;
 pub const WM_APP_SHELLLIST: u32 = WM_APP + 15;
@@ -188,6 +190,15 @@ pub fn windows() -> Vec<HWND> {
 /// Runs `f` on every open window's App (prefs and favorites changes, index events).
 pub fn for_each_app(mut f: impl FnMut(&mut App)) {
     for h in windows() {
+        if let Some(app) = unsafe { app_of(h).as_mut() } {
+            f(app);
+        }
+    }
+}
+
+/// `f` for every window but `except` (whose App the caller already holds).
+pub fn for_each_other_app(except: HWND, mut f: impl FnMut(&mut App)) {
+    for h in windows().into_iter().filter(|&h| h != except) {
         if let Some(app) = unsafe { app_of(h).as_mut() } {
             f(app);
         }
@@ -531,6 +542,17 @@ fn dev_flags(app: &mut App) {
         };
         app.set_view(view);
     }
+    if let Some(k) = val("--dev-sort") {
+        use crate::fsys::SortKey;
+        let key = match k.as_str() {
+            "modified" => SortKey::Modified,
+            "created" => SortKey::Created,
+            "size" => SortKey::Size,
+            "kind" => SortKey::Kind,
+            _ => SortKey::Name,
+        };
+        app.set_sort(key);
+    }
     if let Some(g) = val("--dev-group") {
         app.set_group(crate::groups::GroupKey::from_pref(&g));
     }
@@ -677,6 +699,10 @@ fn dev_keys(app: &mut App, script: &str, out: Option<String>) {
             }
             log += &format!("hit ok={ok} bad={bad:?} pinned={:?}
 ", app.pinned_header().map(|(g, r)| (g, r.y)));
+        } else if step == "sizes" {
+            let t = app.tab();
+            let v: Vec<String> = t.entries.iter().filter(|e| e.is_dir).map(|e| format!("{}={}", e.name, e.size)).collect();
+            log += &format!("sizes [{}] order [{}]\n", v.join(" "), t.entries.iter().map(|e| e.name.as_str()).collect::<Vec<_>>().join(" "));
         } else if step == "procref" {
             // What a shell thread with CTF_PROCESS_REF sees.
             let before = OPS.load(std::sync::atomic::Ordering::SeqCst);
@@ -1516,6 +1542,13 @@ pub fn begin_rename(app: &mut App) {
     app.invalidate();
 }
 
+/// Commits an open rename (before anything reorders the list under it).
+pub fn end_rename(app: &mut App) {
+    if edit_of(app.hwnd, EditKind::Rename).is_some() {
+        commit_rename(app, false);
+    }
+}
+
 fn commit_rename(app: &mut App, cancel: bool) {
     let Some((h, i)) = edit_of(app.hwnd, EditKind::Rename) else {
         return;
@@ -1547,11 +1580,15 @@ fn commit_rename(app: &mut App, cancel: bool) {
             if matches!(app.tab().loc, Loc::Folder(_)) {
                 app.reload(Some(&new_name));
             } else {
+                let folders_first = app.prefs.folders_first;
                 let t = app.tab_mut();
                 t.entries[i].name = new_name.clone();
                 if let Some(f) = &mut t.entries[i].full {
                     f.set_file_name(&new_name);
                 }
+                // Search and Recents patch the item in place: its sort place and group follow.
+                t.resort(folders_first);
+                app.reveal_focus();
             }
         }
         Err(msg) => app.note(&msg),
@@ -1972,6 +2009,8 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                 LRESULT(1)
             }
             WM_RBUTTONUP => {
+                // Its commands (sort, group, view) reorder the list under the rename field.
+                end_rename(app);
                 let (x, y) = xy(lparam, app.scale);
                 let mut p = POINT {
                     x: (lparam.0 & 0xFFFF) as i16 as i32,
@@ -2101,6 +2140,10 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
             }
             WM_APP_SEARCH => {
                 crate::search::message(app, wparam, lparam);
+                LRESULT(0)
+            }
+            WM_APP_SIZES => {
+                crate::search::sizes_message(app, lparam);
                 LRESULT(0)
             }
             WM_APP_SHELLLIST => {

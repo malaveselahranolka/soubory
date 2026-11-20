@@ -364,8 +364,20 @@ fn drop_highlight(app: &App, c: &mut Canvas, t: &Theme) {
         c.round_stroke(r.inset(2.0, 2.0), 6.0, ring, 2.0);
         c.pop_clip();
     } else {
+        // A row partly under the pinned group header is highlighted only below it.
+        let b = app.lay.body;
+        let clip = b.intersects(&r).then(|| {
+            let top = app.pinned_header().map_or(b.y, |(_, p)| p.b());
+            Rect::new(b.x, top, b.w, (b.b() - top).max(0.0))
+        });
+        if let Some(cr) = clip {
+            c.push_clip(cr);
+        }
         c.round(r, 6.0, Color { a: 0.16, ..ring });
         c.round_stroke(r.inset(0.75, 0.75), 6.0, ring, 1.5);
+        if clip.is_some() {
+            c.pop_clip();
+        }
     }
 }
 
@@ -782,7 +794,8 @@ fn list_view(app: &mut App, c: &mut Canvas, t: &Theme) {
                     Align::Start,
                 ),
                 Col::Size => {
-                    let s = if e.is_dir && (!matches!(app.tab().loc, Loc::Computer) || e.size == 0) {
+                    // Folders: their size from the index once it has reported it.
+                    let s = if e.is_dir && e.size == 0 {
                         "—".to_string()
                     } else {
                         fsys::format_size(e.size)
@@ -1116,7 +1129,10 @@ fn crumb_layout(app: &App) -> Vec<(Rect, Loc, String)> {
         if k < skip {
             continue;
         }
-        let w = w.min(max_x - x).max(24.0);
+        if max_x - x < 24.0 {
+            break; // too narrow: the status text keeps its place
+        }
+        let w = w.min(max_x - x);
         out.push((Rect::new(x, s.y + 4.0, w, s.h - 8.0), loc, name));
         x += w + 14.0;
     }
@@ -1250,7 +1266,8 @@ pub fn status_text(app: &App) -> String {
             .sel
             .indices()
             .iter()
-            .filter(|&&i| !tab.entries[i].is_dir)
+            // Folders count with their indexed size; drives in "Tento počítač" carry capacity.
+            .filter(|&&i| !tab.entries[i].is_dir || !matches!(tab.loc, Loc::Computer))
             .map(|&i| tab.entries[i].size)
             .sum();
         if bytes > 0 {

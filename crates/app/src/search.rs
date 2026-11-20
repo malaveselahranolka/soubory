@@ -30,6 +30,20 @@ struct State {
     scanning: bool,
     progress: usize,
     rerun_armed: bool,
+    /// Folder sizes the index reported, by full path (the list view's Size column).
+    sizes: HashMap<PathBuf, u64>,
+    /// Per window: the running folder-size request's token.
+    size_tokens: HashMap<isize, CancelToken>,
+}
+
+/// Folders sized per request; a folder with more subfolders than this is rare and they are
+/// listed first anyway.
+const MAX_SIZED: usize = 5000;
+
+struct Sizes {
+    loc: Loc,
+    paths: Vec<PathBuf>,
+    sizes: Vec<Option<u64>>,
 }
 
 thread_local! {
@@ -39,6 +53,8 @@ thread_local! {
 struct Reply {
     generation: u64,
     hits: Vec<Hit>,
+    /// Creation times by hit (the index has none), fetched when the tab sorts or groups by them.
+    created: Vec<u64>,
 }
 
 /// Starts the index on a background thread: loading a snapshot of a few million entries takes
@@ -52,7 +68,7 @@ pub fn start() {
         .cloned();
     // Test runs index only what they ask for, never the whole disk.
     let test_run = args.iter().any(|a| a.starts_with("--dev-") || a == "--new-instance");
-    let roots = match dev_root {
+    let roots = match dev_root.clone() {
         Some(r) => vec![r],
         None if test_run => return,
         None => fm_index::win::service::default_roots(),
@@ -60,7 +76,9 @@ pub fn start() {
     if roots.is_empty() {
         return;
     }
-    let data = crate::prefs::data_dir().join("index");
+    // Snapshots are named by volume: a test index of a scratch folder on C: must not replace
+    // the real index of C:.
+    let data = crate::prefs::data_dir().join(if dev_root.is_some() { "index-dev" } else { "index" });
     let _ = std::fs::create_dir_all(&data);
     let hub = crate::win::hub().0 as isize;
     ST.with(|s| s.borrow_mut().scanning = true);
@@ -90,12 +108,114 @@ fn post<T>(hub: isize, kind: usize, v: Box<T>) {
     }
 }
 
-/// At exit: stops the watchers and writes the snapshot.
+/// At exit: stops the watchers and writes the snapshot. A query or size request still running
+/// holds the service; it is cancelled and given up to two seconds to let go.
 pub fn stop() {
-    let svc = ST.with(|s| s.borrow_mut().svc.take());
-    if let Some(svc) = svc.and_then(|a| Arc::try_unwrap(a).ok()) {
-        svc.stop();
+    let (svc, tokens, size_tokens) = ST.with(|s| {
+        let mut s = s.borrow_mut();
+        (s.svc.take(), std::mem::take(&mut s.tokens), std::mem::take(&mut s.size_tokens))
+    });
+    tokens.values().for_each(|(t, _)| t.cancel());
+    size_tokens.values().for_each(CancelToken::cancel);
+    let Some(mut svc) = svc else { return };
+    for _ in 0..100 {
+        match Arc::try_unwrap(svc) {
+            Ok(s) => return s.stop(),
+            Err(again) => svc = again,
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
     }
+    crate::prefs::log("index: a query outlived exit; the snapshot was not written");
+}
+
+/// Folder sizes the index already reported, filled in before sorting so a reload neither
+/// flickers nor sorts twice.
+pub fn known_sizes(entries: &mut [Entry], dir: &Path) {
+    ST.with(|s| {
+        let s = s.borrow();
+        if s.sizes.is_empty() {
+            return;
+        }
+        for e in entries.iter_mut().filter(|e| e.is_dir) {
+            if let Some(&n) = s.sizes.get(&e.path_in(dir)) {
+                e.size = n;
+            }
+        }
+    });
+}
+
+/// Asks the index for the sizes of the current tab's folders; they arrive as WM_APP_SIZES.
+pub fn request_sizes(app: &App) {
+    let Some(svc) = ST.with(|s| s.borrow().svc.clone()) else { return };
+    let t = app.tab();
+    if matches!(t.loc, Loc::Computer | Loc::Shell { .. }) {
+        return;
+    }
+    let dir = t.dir();
+    let paths: Vec<PathBuf> = t.entries.iter().filter(|e| e.is_dir && e.shell.is_none()).take(MAX_SIZED).map(|e| e.path_in(&dir)).collect();
+    if paths.is_empty() {
+        return;
+    }
+    let key = app.hwnd.0 as isize;
+    let token = ST.with(|s| {
+        let mut s = s.borrow_mut();
+        let token = match s.size_tokens.get(&key) {
+            Some(t) => t.next(),
+            None => CancelToken::new(),
+        };
+        s.size_tokens.insert(key, token.clone());
+        token
+    });
+    let loc = t.loc.clone();
+    std::thread::spawn(move || {
+        let strs: Vec<String> = paths.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+        let Some(sizes) = svc.folder_sizes(&strs, &token) else { return };
+        if token.is_cancelled() {
+            return;
+        }
+        let r = Box::into_raw(Box::new(Sizes { loc, paths, sizes }));
+        unsafe {
+            if PostMessageW(Some(HWND(key as *mut std::ffi::c_void)), crate::win::WM_APP_SIZES, WPARAM(0), LPARAM(r as isize)).is_err() {
+                drop(Box::from_raw(r));
+            }
+        }
+    });
+}
+
+/// Folder sizes for a window: every tab still showing that place takes them.
+pub fn sizes_message(app: &mut App, l: LPARAM) {
+    let r = unsafe { Box::from_raw(l.0 as *mut Sizes) };
+    let fresh: HashMap<PathBuf, u64> = r.paths.into_iter().zip(r.sizes).filter_map(|(p, n)| Some((p, n?))).collect();
+    ST.with(|s| {
+        let mut s = s.borrow_mut();
+        // shortcut: the cache is dropped wholesale past 100k folders; an LRU would keep the hot ones.
+        if s.sizes.len() > 100_000 {
+            s.sizes.clear();
+        }
+        s.sizes.extend(fresh.iter().map(|(p, n)| (p.clone(), *n)));
+    });
+    let folders_first = app.prefs.folders_first;
+    let renaming = crate::win::renaming_index(app).is_some();
+    for k in 0..app.tabs.len() {
+        let t = &mut app.tabs[k];
+        if t.loc != r.loc {
+            continue;
+        }
+        let dir = t.dir();
+        let mut changed = false;
+        for e in t.entries.iter_mut().filter(|e| e.is_dir) {
+            if let Some(&n) = fresh.get(&e.path_in(&dir)) {
+                changed |= e.size != n;
+                e.size = n;
+            }
+        }
+        // Sorted by size: the folders move to their places (not under an open rename field).
+        let sorted = t.sort == fsys::SortKey::Size && !matches!(t.loc, Loc::Recents) && !(matches!(t.loc, Loc::Search { .. }) && t.by_rank);
+        if changed && sorted && !(renaming && k == app.cur) {
+            t.resort(folders_first);
+        }
+    }
+    app.invalidate();
 }
 
 pub fn forget(hwnd: HWND) {
@@ -164,6 +284,8 @@ fn rerun_all() {
         if matches!(a.tab().loc, Loc::Search { .. }) {
             run(a);
             a.invalidate();
+        } else {
+            request_sizes(a);
         }
     });
 }
@@ -220,10 +342,18 @@ pub fn run(app: &mut App) {
     });
     let hidden = app.prefs.show_hidden;
     let scope = scope.map(|p| p.to_string_lossy().into_owned());
+    let t = app.tab();
+    let want_created = t.sort == fsys::SortKey::Created || t.group == crate::groups::GroupKey::Created;
     std::thread::spawn(move || {
         if let Some(hits) = svc.search(&text, scope.as_deref(), hidden, LIMIT, &token) {
+            // Attributes only (no file is opened, placeholders stay online), at most LIMIT.
+            let created = if want_created {
+                hits.iter().map(|h| fsys::entry_of(Path::new(&h.path)).map_or(0, |e| e.created)).collect()
+            } else {
+                Vec::new()
+            };
             if !token.is_cancelled() {
-                let r = Box::into_raw(Box::new(Reply { generation, hits }));
+                let r = Box::into_raw(Box::new(Reply { generation, hits, created }));
                 unsafe {
                     if PostMessageW(
                         Some(HWND(key as *mut std::ffi::c_void)),
@@ -248,15 +378,17 @@ pub fn message(app: &mut App, _w: WPARAM, l: LPARAM) {
     if current != Some(reply.generation) || !matches!(app.tab().loc, Loc::Search { .. }) {
         return;
     }
+    let created = reply.created;
     let entries = reply
         .hits
         .into_iter()
-        .map(|h| Entry {
+        .enumerate()
+        .map(|(k, h)| Entry {
             name: h.name,
             is_dir: h.is_dir,
             size: h.size,
             modified: h.mtime.max(0) as u64,
-            created: 0,
+            created: created.get(k).copied().unwrap_or(0),
             attrs: h.attrs,
             full: Some(PathBuf::from(h.path)),
             shell: None,
@@ -269,13 +401,15 @@ pub fn message(app: &mut App, _w: WPARAM, l: LPARAM) {
 
 /// A column header was clicked: sort the results in place.
 pub fn resort(app: &mut App) {
-    let entries = std::mem::take(&mut app.tab_mut().entries);
+    // A copy: set_entries maps the old selection through the old list.
+    let entries = app.tab().entries.clone();
     set_entries(app, entries);
 }
 
 /// Replaces the results, keeping the selection on the same paths (live updates).
 fn set_entries(app: &mut App, mut entries: Vec<Entry>) {
     let folders_first = app.prefs.folders_first;
+    known_sizes(&mut entries, Path::new(""));
     let t = app.tab_mut();
     if !t.by_rank {
         fsys::sort(&mut entries, t.sort, t.asc, folders_first);
@@ -286,6 +420,7 @@ fn set_entries(app: &mut App, mut entries: Vec<Entry>) {
         .into_iter()
         .filter_map(|i| t.entries.get(i).and_then(|e| e.full.clone()))
         .collect();
+    let focus = t.sel.focus.and_then(|i| t.entries.get(i)).and_then(|e| e.full.clone());
     t.entries = entries;
     crate::groups::apply(t, folders_first);
     t.icon_idx = vec![i32::MIN; t.entries.len()];
@@ -300,7 +435,15 @@ fn set_entries(app: &mut App, mut entries: Vec<Entry>) {
     if !again.is_empty() {
         t.sel.set_many(again, &[]);
     }
+    if let Some(i) = focus.and_then(|p| t.entries.iter().position(|e| e.full.as_ref() == Some(&p))) {
+        t.sel.focus = Some(i);
+        t.sel.anchor = Some(i);
+    }
     app.clamp_scroll();
+    if std::mem::take(&mut app.tab_mut().reveal_on_load) {
+        app.reveal_focus();
+    }
+    request_sizes(app);
 }
 
 /// Without the index: the scope folder's own entries whose folded name has every term.

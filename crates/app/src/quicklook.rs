@@ -491,7 +491,7 @@ fn draw(ql: &mut Ql, c: &mut Canvas, t: &Theme, w: f32, h: f32) {
     c.round(open, 6.0, if ql.hover_open { t.press } else { t.field });
     c.round_stroke(open, 6.0, t.edge, 0.0);
     c.text("Otevřít", open, Font::Small, t.ink, Align::Center);
-    let kind = if ql.entry.is_dir { fsys::kind_name(&ql.entry) } else { format!("{} – {}", fsys::kind_name(&ql.entry), fsys::format_size(ql.entry.size)) };
+    let kind = if ql.entry.is_dir && ql.entry.size == 0 { fsys::kind_name(&ql.entry) } else { format!("{} – {}", fsys::kind_name(&ql.entry), fsys::format_size(ql.entry.size)) };
     c.text(&kind, Rect::new(120.0, 0.0, (open.x - 136.0).max(0.0), BAR_H), Font::Small, t.ink3, Align::Center);
 
     let area = Rect::new(0.0, BAR_H, w, h - BAR_H);

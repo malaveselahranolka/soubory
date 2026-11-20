@@ -84,6 +84,8 @@ pub struct Tab {
     /// Group by; `groups` partitions `entries` in the icon and list views (see groups.rs).
     pub group: GroupKey,
     pub groups: Vec<groups::Group>,
+    /// Bring the focus into view when the pending async list arrives (after a regroup).
+    pub reveal_on_load: bool,
 }
 
 impl Tab {
@@ -107,6 +109,7 @@ impl Tab {
             loading: false,
             group: GroupKey::None,
             groups: Vec::new(),
+            reveal_on_load: false,
         }
     }
     pub fn dir(&self) -> PathBuf {
@@ -122,6 +125,28 @@ impl Tab {
             .map(|i| self.path_of(i))
             .collect()
     }
+    /// Sorts and groups the current entries again (folder sizes arrived, an item was renamed in
+    /// place), keeping the selection, focus and anchor on the same items.
+    pub fn resort(&mut self, folders_first: bool) {
+        let dir = self.dir();
+        let at = |t: &Tab, i: Option<usize>| i.and_then(|i| t.entries.get(i)).map(|e| e.path_in(&dir));
+        let selected: Vec<PathBuf> = self.sel.indices().into_iter().map(|i| self.entries[i].path_in(&dir)).collect();
+        let (focus, anchor) = (at(self, self.sel.focus), at(self, self.sel.anchor));
+        // Recents and a relevance-ordered search keep their own order; only the groups move.
+        let ranked = matches!(self.loc, Loc::Recents) || (matches!(self.loc, Loc::Search { .. }) && self.by_rank);
+        if !ranked {
+            fsys::sort(&mut self.entries, self.sort, self.asc, folders_first);
+        }
+        groups::apply(self, folders_first);
+        let pos: std::collections::HashMap<PathBuf, usize> = self.entries.iter().enumerate().map(|(i, e)| (e.path_in(&dir), i)).collect();
+        self.icon_idx = vec![i32::MIN; self.entries.len()];
+        let mut sel = Selection::new(self.entries.len());
+        sel.set_many(selected.iter().filter_map(|p| pos.get(p).copied()), &[]);
+        sel.focus = focus.and_then(|p| pos.get(&p).copied());
+        sel.anchor = anchor.and_then(|p| pos.get(&p).copied());
+        self.sel = sel;
+    }
+
     pub fn focused_name(&self) -> Option<String> {
         self.sel
             .focus
@@ -400,6 +425,7 @@ impl App {
         };
         match res {
             Ok(mut v) => {
+                crate::search::known_sizes(&mut v, &t.dir());
                 if !matches!(t.loc, Loc::Recents) {
                     fsys::sort(&mut v, t.sort, t.asc, folders_first);
                 }
@@ -445,6 +471,7 @@ impl App {
         }
         crate::win::watch_current(self);
         crate::win::set_title(self);
+        crate::search::request_sizes(self);
     }
 
     /// A saved search. The search field shows its text (reload syncs it). A scoped one offers
@@ -595,7 +622,15 @@ impl App {
         }
     }
 
+    /// Grouped by tags in a view that shows the groups (tags may have changed meanwhile).
+    pub fn groups_by_tags(&self) -> bool {
+        self.tab().group == GroupKey::Tags && matches!(self.tab().view, View::Icons | View::List)
+    }
+
     fn after_tab_switch(&mut self) {
+        if self.groups_by_tags() {
+            self.reload(None);
+        }
         crate::win::sync_search_field(self);
         self.relayout();
         crate::win::watch_current(self);
@@ -604,6 +639,7 @@ impl App {
     }
 
     pub fn set_view(&mut self, v: View) {
+        crate::win::end_rename(self);
         let shows_groups = |t: &Tab| t.group != GroupKey::None && matches!(t.view, View::Icons | View::List);
         let before = shows_groups(self.tab());
         self.tab_mut().view = v;
@@ -615,11 +651,12 @@ impl App {
         }
         self.relayout();
         crate::views::sync_columns(self);
-        self.reveal_focus();
+        self.reveal_soon();
         self.invalidate();
     }
 
     pub fn set_sort(&mut self, key: SortKey) {
+        crate::win::end_rename(self);
         let t = self.tab_mut();
         if t.sort == key {
             t.asc = !t.asc;
@@ -633,7 +670,12 @@ impl App {
                 let t = self.tab_mut();
                 t.asc = !matches!(key, SortKey::Modified | SortKey::Created | SortKey::Size);
             }
-            crate::search::resort(self);
+            if key == SortKey::Created {
+                // Creation dates are not in the index; the query fetches them.
+                crate::search::run(self);
+            } else {
+                crate::search::resort(self);
+            }
         } else {
             self.reload(None);
         }
@@ -641,22 +683,34 @@ impl App {
     }
 
     pub fn set_group(&mut self, key: GroupKey) {
+        crate::win::end_rename(self);
         if self.tab().group == key {
             return;
         }
         self.tab_mut().group = key;
-        if !matches!(self.tab().view, View::Icons | View::List) && key != GroupKey::None {
-            self.note("Skupiny se zobrazují v ikonách a v seznamu");
+        if !matches!(self.tab().view, View::Icons | View::List) {
+            // Columns and gallery show no groups; the key applies when the view comes back.
+            if key != GroupKey::None {
+                self.note("Skupiny se zobrazují v ikonách a v seznamu");
+            }
             return;
         }
-        self.tab_mut().scroll = 0.0;
-        if matches!(self.tab().loc, Loc::Search { .. }) {
-            crate::search::resort(self);
-        } else {
-            self.reload(None);
+        // Async places (search, shell folders) show no stale headers until their list lands.
+        let t = self.tab_mut();
+        t.groups.clear();
+        t.scroll = 0.0;
+        // A search re-runs: grouping permuted its relevance order, and dates come with it.
+        self.reload(None);
+        self.reveal_soon();
+        self.invalidate();
+    }
+
+    /// Reveals the focus now, or when an async list (search, shell folder) arrives.
+    fn reveal_soon(&mut self) {
+        if self.tab().loading || matches!(self.tab().loc, Loc::Search { .. }) {
+            self.tab_mut().reveal_on_load = true;
         }
         self.reveal_focus();
-        self.invalidate();
     }
 
     pub fn toggle_hidden(&mut self) {
@@ -822,12 +876,12 @@ impl App {
             let b = self.lay.body;
             // Below the pinned group header; a group's first item brings its header along.
             let top = b.y + if self.shown_groups().is_empty() { 0.0 } else { self.geo().header_h };
-            let t = self.tab_mut();
-            if r.y < top {
-                t.scroll -= top - r.y;
-            } else if r.b() > b.b() {
-                t.scroll += r.b() - b.b();
+            // Bottom first, then the top wins: a tile taller than the room sits at the top.
+            let mut d = (r.b() - b.b()).max(0.0);
+            if r.y - d < top {
+                d = r.y - top;
             }
+            self.tab_mut().scroll += d;
         }
         self.clamp_scroll();
         if self.tab().view == View::Columns {
@@ -1357,13 +1411,28 @@ impl App {
             }
             (VK_HOME, ..) => mv(self, -(n as isize)),
             (VK_END, ..) => mv(self, n as isize),
-            (VK_PRIOR, ..) => {
-                let p = self.page_rows();
-                mv(self, -p)
-            }
-            (VK_NEXT, ..) => {
-                let p = self.page_rows();
-                mv(self, p)
+            (VK_PRIOR, ..) | (VK_NEXT, ..) => {
+                let down = vk == VK_NEXT;
+                let d = match self.tab().sel.focus {
+                    // Grouped: a screenful down the layout, in the same column.
+                    Some(f) if !self.shown_groups().is_empty() => {
+                        let geo = self.geo();
+                        let page = (self.lay.body.h - geo.header_h - geo.item_h).max(geo.item_h);
+                        let y0 = geo.pos(f).0;
+                        let mut j = geo.vertical(f, down);
+                        loop {
+                            let k = geo.vertical(j, down);
+                            if k == j || (geo.pos(k).0 - y0).abs() > page {
+                                break;
+                            }
+                            j = k;
+                        }
+                        j as isize - f as isize
+                    }
+                    _ if down => self.page_rows(),
+                    _ => -self.page_rows(),
+                };
+                mv(self, d)
             }
             (VK_SPACE, true, false, false) => {
                 if let Some(f) = self.tab().sel.focus {

@@ -14,7 +14,8 @@ Nothing here has been tried by hand in daily use yet; see "Not verified" at the 
 | Tabs (Ctrl+T, Ctrl+W, Ctrl+Tab, middle-click) | tab strip | 🔶 |
 | Several windows (Ctrl+N), one process; a second launch opens a window in it | hub window, `WM_COPYDATA` | ✅ |
 | Views: details, icons (S–XL with slider), columns, gallery | Ctrl+1–4 | 🔶 |
-| Tiles view, group by | | ⬜ |
+| Group by: name, kind, date modified/created, size, tags; Finder-style headers that stay on top while scrolling; a header click selects its group | `groups.rs`, View menus, palette | ✅ (geometry round-trip tests, harness hit-test over the real window, captures) |
+| Tiles view | | ⬜ |
 | Sort by any column, folders first | header click, More menu | 🔶 |
 | Full shell context menu (Open with, Send to, Compress to ZIP, Extract all, 7-Zip, Git…) | `IContextMenu` of the folder | 🔶 |
 | New folder / New ▸ any type | shell New menu (same as the dialog helper) | 🔶 |
@@ -50,7 +51,7 @@ Nothing here has been tried by hand in daily use yet; see "Not verified" at the 
 | Duplicate (Ctrl+D), New Folder with Selection | ✅ |
 | Search scope bar: whole computer / this folder | ✅ |
 | Smart folders: saved searches in the sidebar (More → Uložit hledání) | ✅ open (harness), 🔶 save |
-| Calculate folder sizes | ⬜ (from the index) |
+| Calculate folder sizes | ✅ always on, from the index (see Our own) |
 
 ## Our own
 | Feature | Status |
@@ -58,7 +59,7 @@ Nothing here has been tried by hand in daily use yet; see "Not verified" at the 
 | Instant whole-disk search with Czech diacritics folding (`kun` finds `kůň`), live as files change | ✅ (C: 4.2 M entries, 30 s walk, queries 3–8 ms: `docs/search-bench.md`; index reviewed twice, see `26ad376`) |
 | New file/folder from any Open/Save dialog | ✅ |
 | Cold start ≈ 200 ms (D3D device built in parallel, power-saving GPU) | ✅ (`--dev-startup`) |
-| Folder sizes in list view, live from the index | ⬜ |
+| Folder sizes in list view, live from the index; sort by size moves folders too; in the selection total and the inspector | ✅ (scratch-index harness and capture; the whole C: sums in 15 ms) |
 | Filter the current folder as you type | 🔶 (search scoped to the folder) |
 | Command palette (Ctrl+K): every command plus every sidebar place, diacritics-insensitive | 🔶 (filtering tested and captured; running uses the menu handlers) |
 

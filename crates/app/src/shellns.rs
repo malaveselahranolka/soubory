@@ -125,6 +125,7 @@ unsafe fn display(f: &IShellFolder, child: *const ITEMIDLIST, flags: SHGDNF) -> 
 const STORAGE: GUID = GUID::from_u128(0xb725f130_47ef_101a_a5f1_02608c9eebac);
 const PKEY_SIZE: PROPERTYKEY = PROPERTYKEY { fmtid: STORAGE, pid: 12 };
 const PKEY_DATE_MODIFIED: PROPERTYKEY = PROPERTYKEY { fmtid: STORAGE, pid: 14 };
+const PKEY_DATE_CREATED: PROPERTYKEY = PROPERTYKEY { fmtid: STORAGE, pid: 15 };
 /// Bin columns (Explorer's "Original Location" / "Date Deleted").
 const DELETED_FROM: PROPERTYKEY = PROPERTYKEY { fmtid: GUID::from_u128(0x9b174b33_40ff_11d2_a27e_00c04fc30871), pid: 2 };
 const DATE_DELETED: PROPERTYKEY = PROPERTYKEY { fmtid: GUID::from_u128(0x9b174b33_40ff_11d2_a27e_00c04fc30871), pid: 3 };
@@ -199,6 +200,9 @@ pub fn list(owner: HWND, id: &ShellId, hidden: bool) -> std::result::Result<Vec<
                 if let Some(v) = detail(f2, child, &PKEY_SIZE) {
                     e.size = as_u64(&v).unwrap_or(0);
                 }
+                if let Some(v) = detail(f2, child, &PKEY_DATE_CREATED) {
+                    e.created = as_filetime(&v).unwrap_or(0);
+                }
                 let when = if bin { DATE_DELETED } else { PKEY_DATE_MODIFIED };
                 if let Some(v) = detail(f2, child, &when) {
                     e.modified = as_filetime(&v).unwrap_or(0);
@@ -256,6 +260,7 @@ fn finish(app: &mut App, listed: Listed) {
     let t = app.tab_mut();
     t.loading = false;
     let keep: Vec<String> = t.sel.indices().iter().filter_map(|&i| t.entries.get(i).map(|e| e.name.clone())).collect();
+    let focus = t.focused_name();
     match listed.result {
         Ok(mut v) => {
             crate::fsys::sort(&mut v, t.sort, t.asc, folders_first);
@@ -274,7 +279,15 @@ fn finish(app: &mut App, listed: Listed) {
     if !again.is_empty() {
         t.sel.set_many(again, &[]);
     }
+    if let Some(i) = focus.and_then(|n| t.entries.iter().position(|e| e.name == n)) {
+        t.sel.focus = Some(i);
+        t.sel.anchor = Some(i);
+    }
     app.clamp_scroll();
+    // Only after a regroup or view change, not on every watcher refresh.
+    if std::mem::take(&mut app.tab_mut().reveal_on_load) {
+        app.reveal_focus();
+    }
 }
 
 /// Opens an item of a shell location: folders inside the app, anything else with its verb.
