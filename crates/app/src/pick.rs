@@ -1,7 +1,8 @@
 //! Option 2's picker (docs/ARCHITECTURE.md §2): an fm window that picks files for another app's
 //! Open dialog. `fm_dialog_shim.dll` in that app hands the request to the resident fm's door, or
 //! starts `fm --pick <pipe>`; both end in [`start`]. The window is a normal fm window (sidebar,
-//! views, search) plus a bottom bar: the file types, "Zrušit" and the dialog's OK button.
+//! views, search) plus a bottom bar: "Nový" (the background menu's New items), the file types,
+//! "Zrušit" and the dialog's OK button.
 //!
 //! The pipe (protocol in `fm_dialog_shim::proto`): read the request, say Ready once the window is
 //! up, answer exactly once. Every way a shown picker closes answers (Drop); before Ready it only
@@ -30,6 +31,7 @@ use windows::{
 pub const H_TYPES: u8 = 0;
 pub const H_CANCEL: u8 = 1;
 pub const H_OK: u8 = 2;
+pub const H_NEW: u8 = 3;
 const BTN_H: f32 = 28.0;
 
 /// The folder of the last pick: where the next picker opens unless the app names one.
@@ -336,12 +338,13 @@ pub fn tick(app: &mut App) {
 // ---- bottom bar ----------------------------------------------------------------------------------
 
 pub struct Parts {
+    pub new: Rect,
     pub types: Option<Rect>,
     pub cancel: Rect,
     pub ok: Rect,
 }
 
-/// The bar's controls: the file types aligned with the content, the buttons on the right.
+/// The bar's controls: Nový and the file types aligned with the content, the buttons on the right.
 pub fn parts(app: &App) -> Option<Parts> {
     let p = app.pick.as_ref()?;
     let bar = app.lay.pick?;
@@ -351,12 +354,53 @@ pub fn parts(app: &App) -> Option<Parts> {
     let cancel_w = (m("Zrušit", Font::Body) + 32.0).max(88.0);
     let ok = Rect::new(bar.r() - 16.0 - ok_w, y, ok_w, BTN_H);
     let cancel = Rect::new(ok.x - 8.0 - cancel_w, y, cancel_w, BTN_H);
+    let new = Rect::new(app.lay.card.x + 12.0, y, (m("Nový", Font::Body) + 44.0).max(72.0), BTN_H);
     let types = p.req.filters.get(p.filter).map(|(name, spec)| {
-        let x = app.lay.card.x + 12.0;
+        let x = new.r() + 8.0;
         let w = (m(type_label(name, spec), Font::Body) + 44.0).clamp(120.0, 320.0).min(cancel.x - 16.0 - x).max(40.0);
         Rect::new(x, y, w, BTN_H)
     });
-    Some(Parts { types, cancel, ok })
+    Some(Parts { new, types, cancel, ok })
+}
+
+/// New items go into a folder on disk (not search results, Recents or a shell place).
+fn can_create(app: &App) -> bool {
+    app.tab().loc.folder().is_some()
+}
+
+/// The bar's buttons, for UI Automation (in the bar's order).
+pub fn buttons(app: &App) -> Vec<u8> {
+    let Some(p) = parts(app) else { return Vec::new() };
+    [Some(H_NEW), p.types.map(|_| H_TYPES), Some(H_CANCEL), Some(H_OK)].into_iter().flatten().collect()
+}
+
+pub fn button_rect(app: &App, k: u8) -> Option<Rect> {
+    let p = parts(app)?;
+    match k {
+        H_NEW => Some(p.new),
+        H_TYPES => p.types,
+        H_CANCEL => Some(p.cancel),
+        H_OK => Some(p.ok),
+        _ => None,
+    }
+}
+
+pub fn button_name(app: &App, k: u8) -> String {
+    let Some(p) = app.pick.as_ref() else { return String::new() };
+    match k {
+        H_NEW => "Nový".into(),
+        H_TYPES => p.req.filters.get(p.filter).map(|(n, s)| format!("Typ souboru: {}", type_label(n, s))).unwrap_or_default(),
+        H_CANCEL => "Zrušit".into(),
+        _ => p.ok_label().into(),
+    }
+}
+
+pub fn button_enabled(app: &App, k: u8) -> bool {
+    match k {
+        H_NEW => can_create(app),
+        H_OK => app.tab().sel.count() > 0,
+        _ => true,
+    }
 }
 
 fn type_label<'a>(name: &'a str, spec: &'a str) -> &'a str {
@@ -365,7 +409,9 @@ fn type_label<'a>(name: &'a str, spec: &'a str) -> &'a str {
 
 pub fn hit(app: &App, x: f32, y: f32) -> Hit {
     let Some(p) = parts(app) else { return Hit::None };
-    if p.types.is_some_and(|r| r.contains(x, y)) {
+    if p.new.contains(x, y) {
+        Hit::Pick(H_NEW)
+    } else if p.types.is_some_and(|r| r.contains(x, y)) {
         Hit::Pick(H_TYPES)
     } else if p.cancel.contains(x, y) {
         Hit::Pick(H_CANCEL)
@@ -379,6 +425,11 @@ pub fn hit(app: &App, x: f32, y: f32) -> Hit {
 
 pub fn click(app: &mut App, k: u8) {
     match k {
+        H_NEW if can_create(app) => {
+            let Some(r) = parts(app).map(|p| p.new) else { return };
+            let pt = crate::win::to_screen(app, r.x, r.y - 2.0);
+            crate::shell::new_items_menu(app, pt);
+        }
         H_TYPES => types_menu(app),
         H_CANCEL => cancel(app),
         H_OK => accept_selection(app),
@@ -421,6 +472,15 @@ pub fn paint(app: &App, c: &mut Canvas, t: &Theme) {
             c.round(r, 6.0, t.hover);
         }
     };
+    // Nový: a dropdown button, greyed where nothing can be created.
+    let new_on = can_create(app);
+    c.round(parts.new, 6.0, field);
+    if new_on {
+        state(c, parts.new, H_NEW);
+    }
+    c.round_stroke(parts.new, 6.0, t.edge, 0.0);
+    c.text("Nový", parts.new.cut_left(10.0).cut_right(26.0), Font::Body, if new_on { t.ink } else { t.ink4 }, Align::Start);
+    c.icon(crate::paint::g::DOWN, crate::phosphor::Weight::Bold, parts.new.right(26.0), 12.0, if new_on { t.ink2 } else { t.ink4 });
     if let (Some(r), Some((name, spec))) = (parts.types, p.req.filters.get(p.filter)) {
         c.round(r, 6.0, field);
         state(c, r, H_TYPES);
@@ -492,6 +552,27 @@ mod tests {
         r.index = 0;
         let p = Picker::offline(r);
         assert_eq!((p.filter, p.title(), p.ok_label()), (0, "Otevřít", "Otevřít"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bar_offers_new_items_where_they_can_be_made() {
+        let dir = std::env::temp_dir().join(format!("fm-pick-bar-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = App::new(Loc::Folder(dir.clone()));
+        app.offscreen = true;
+        app.pick = Some(Picker::offline(Request { filters: vec![("Vše".into(), "*.*".into())], ..Default::default() }));
+        app.reload(None);
+        let p = parts(&app).expect("a picker has its bar");
+        let types = p.types.unwrap();
+        assert!(p.new.r() < types.x && types.r() < p.cancel.x && p.cancel.r() < p.ok.x, "Nový, types, Zrušit, OK from the left");
+        assert_eq!(hit(&app, p.new.x + 4.0, p.new.y + 4.0), Hit::Pick(H_NEW));
+        assert_eq!(buttons(&app), [H_NEW, H_TYPES, H_CANCEL, H_OK]);
+        assert_eq!((button_name(&app, H_NEW).as_str(), button_enabled(&app, H_NEW)), ("Nový", true));
+        assert_eq!(button_name(&app, H_TYPES), "Typ souboru: Vše");
+        assert!(!button_enabled(&app, H_OK), "nothing selected yet");
+        app.tab_mut().loc = Loc::Computer;
+        assert!(!button_enabled(&app, H_NEW), "nothing is made outside a folder");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

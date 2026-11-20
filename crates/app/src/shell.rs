@@ -212,11 +212,16 @@ fn submenu(m: HMENU, text: &str) -> HMENU {
 }
 
 pub(crate) fn track(app: &App, m: HMENU, pt: POINT) -> u32 {
+    track_aligned(app, m, pt, TPM_TOPALIGN)
+}
+
+/// `track` with the menu's vertical alignment to `pt` (TPM_BOTTOMALIGN: above it).
+fn track_aligned(app: &App, m: HMENU, pt: POINT, align: TRACK_POPUP_MENU_FLAGS) -> u32 {
     unsafe {
         let _ = SetForegroundWindow(app.hwnd);
         let r = TrackPopupMenuEx(
             m,
-            (TPM_RETURNCMD | TPM_RIGHTBUTTON).0,
+            (TPM_RETURNCMD | TPM_RIGHTBUTTON | align).0,
             pt.x,
             pt.y,
             app.hwnd,
@@ -469,22 +474,7 @@ pub fn background_menu(app: &mut App, pt: POINT) {
         append(m, C_REFRESH, "Aktualizovat\tF5", false, true);
         append(m, C_PASTE, "Vložit\tCtrl+V", false, can_paste());
         sep(m);
-        append(m, C_NEW_FOLDER, "Nová složka\tCtrl+Shift+N", false, true);
-        let newcm = new_menu(&dir);
-        if let Some(nc) = &newcm {
-            if nc
-                .QueryContextMenu(
-                    m,
-                    GetMenuItemCount(Some(m)) as u32,
-                    NEW_FIRST,
-                    NEW_LAST,
-                    CMF_NORMAL,
-                )
-                .is_err()
-            {
-                // Leave it out.
-            }
-        }
+        let newcm = add_new_items(m, &dir);
         sep(m);
         append(m, C_TERMINAL, "Otevřít v Terminálu", false, true);
         append(
@@ -521,16 +511,7 @@ pub fn background_menu(app: &mut App, pt: POINT) {
         let _ = DestroyMenu(m);
         match cmd {
             0 => {}
-            c if (NEW_FIRST..=NEW_LAST).contains(&c) => {
-                if let Some(nc) = &newcm {
-                    invoke(nc, app.hwnd, c - NEW_FIRST, Some(&dir), None);
-                    // Select the created item and start renaming it, like Explorer.
-                    if let Some(name) = created_since(&dir, &before) {
-                        app.reload(Some(&name));
-                        crate::win::begin_rename(app);
-                    }
-                }
-            }
+            c if c == C_NEW_FOLDER || (NEW_FIRST..=NEW_LAST).contains(&c) => run_new_item(app, newcm.as_ref(), &dir, &before, c),
             c if (SHELL_FIRST..=SHELL_LAST).contains(&c) => {
                 if let Some(b) = &bg {
                     invoke(b, app.hwnd, c - SHELL_FIRST, Some(&dir), Some(pt));
@@ -538,6 +519,46 @@ pub fn background_menu(app: &mut App, pt: POINT) {
             }
             c => own_command(app, c),
         }
+    }
+}
+
+/// The background menu's New part: "Nová složka", then the shell's New submenu (left out when it
+/// fails). Also the whole menu of a picker's Nový button.
+fn add_new_items(m: HMENU, dir: &Path) -> Option<IContextMenu> {
+    append(m, C_NEW_FOLDER, "Nová složka\tCtrl+Shift+N", false, true);
+    let nc = new_menu(dir)?;
+    let added = unsafe { nc.QueryContextMenu(m, GetMenuItemCount(Some(m)) as u32, NEW_FIRST, NEW_LAST, CMF_NORMAL) }.is_ok();
+    added.then_some(nc)
+}
+
+/// A command from [`add_new_items`]: the created item is selected and renamed, like Explorer.
+fn run_new_item(app: &mut App, nc: Option<&IContextMenu>, dir: &Path, before: &HashSet<String>, cmd: u32) {
+    if cmd == C_NEW_FOLDER {
+        new_folder(app);
+        return;
+    }
+    let Some(nc) = nc.filter(|_| (NEW_FIRST..=NEW_LAST).contains(&cmd)) else { return };
+    invoke(nc, app.hwnd, cmd - NEW_FIRST, Some(dir), None);
+    if let Some(name) = created_since(dir, before) {
+        app.reload(Some(&name));
+        if app.tab().sel.count() == 0 && app.pick.is_some() {
+            app.note(&format!("„{name}“ je vytvořený, ale zvolený typ souboru ho skrývá."));
+        }
+        crate::win::begin_rename(app);
+    }
+}
+
+/// A picker's Nový button: the New items alone, opening upwards from `pt` (the button's top).
+pub fn new_items_menu(app: &mut App, pt: POINT) {
+    let Some(dir) = app.tab().loc.folder().map(Path::to_path_buf) else { return };
+    unsafe {
+        let Ok(m) = CreatePopupMenu() else { return };
+        let newcm = add_new_items(m, &dir);
+        let active: Vec<&IContextMenu> = newcm.iter().collect();
+        let before = names(&dir);
+        let cmd = with_active(&active, || track_aligned(app, m, pt, TPM_BOTTOMALIGN));
+        let _ = DestroyMenu(m);
+        run_new_item(app, newcm.as_ref(), &dir, &before, cmd);
     }
 }
 

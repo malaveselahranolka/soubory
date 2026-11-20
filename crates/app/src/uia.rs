@@ -66,6 +66,8 @@ enum Kind {
     /// An item: index (a hint) and its path (the identity).
     Item(usize, PathBuf),
     Status,
+    /// A picker's bottom bar; its buttons are `Button(Hit::Pick(_))`.
+    PickBar,
 }
 
 // ---- resolving identities against the live window ------------------------------------------------------
@@ -129,7 +131,14 @@ fn top_level(app: &App) -> Vec<Kind> {
     }
     v.push(Kind::Content);
     v.push(Kind::Status);
+    if app.pick.is_some() {
+        v.push(Kind::PickBar);
+    }
     v
+}
+
+fn pick_button(app: &App, k: Option<&u8>) -> Option<Kind> {
+    k.filter(|k| crate::pick::buttons(app).contains(k)).map(|&k| Kind::Button(Hit::Pick(k)))
 }
 
 /// The element still exists; an item or place may have moved (its index is refreshed).
@@ -138,6 +147,8 @@ fn resolve(app: &App, k: &Kind) -> Option<Kind> {
         Kind::Place(hint, key) => place_index(app, *hint, key).map(|i| Kind::Place(i, key.clone())),
         Kind::Item(hint, path) => item_index(app, *hint, path).map(|i| Kind::Item(i, path.clone())),
         Kind::Sidebar if !app.sidebar_on => None,
+        Kind::PickBar if app.pick.is_none() => None,
+        Kind::Button(Hit::Pick(k)) => pick_button(app, Some(k)),
         other => Some(other.clone()),
     }
 }
@@ -154,6 +165,10 @@ fn first_child(app: &App, k: &Kind, last: bool) -> Option<Kind> {
             let n = app.tab().entries.len();
             (n > 0).then(|| item(app, if last { n - 1 } else { 0 }))
         }
+        Kind::PickBar => {
+            let b = crate::pick::buttons(app);
+            pick_button(app, if last { b.last() } else { b.first() })
+        }
         _ => None,
     }
 }
@@ -161,6 +176,11 @@ fn first_child(app: &App, k: &Kind, last: bool) -> Option<Kind> {
 fn sibling(app: &App, k: &Kind, next: bool) -> Option<Kind> {
     let step = |i: usize, n: usize| if next { (i + 1 < n).then(|| i + 1) } else { i.checked_sub(1) };
     match k {
+        Kind::Button(Hit::Pick(p)) => {
+            let b = crate::pick::buttons(app);
+            let i = b.iter().position(|x| x == p)?;
+            pick_button(app, step(i, b.len()).map(|j| &b[j]))
+        }
         Kind::Button(h) => {
             let i = BUTTONS.iter().position(|b| b == h)?;
             step(i, BUTTONS.len()).map(|j| Kind::Button(BUTTONS[j]))
@@ -181,6 +201,7 @@ fn sibling(app: &App, k: &Kind, next: bool) -> Option<Kind> {
 
 fn parent(k: &Kind) -> Option<Kind> {
     match k {
+        Kind::Button(Hit::Pick(_)) => Some(Kind::PickBar),
         Kind::Button(_) => Some(Kind::Toolbar),
         Kind::Place(..) => Some(Kind::Sidebar),
         Kind::Item(..) => Some(Kind::Content),
@@ -206,6 +227,7 @@ fn button_enabled(app: &App, h: Hit) -> bool {
     match h {
         Hit::Back => app.tab().hist.can_back(),
         Hit::Fwd => app.tab().hist.can_forward(),
+        Hit::Pick(k) => crate::pick::button_enabled(app, k),
         _ => true,
     }
 }
@@ -215,6 +237,7 @@ fn rect_of(app: &App, k: &Kind) -> Rect {
     match k {
         Kind::Toolbar => l.toolbar,
         Kind::Button(h) => match h {
+            Hit::Pick(k) => crate::pick::button_rect(app, *k).unwrap_or_default(),
             Hit::SidebarBtn => l.sidebar_btn,
             Hit::Back => l.back,
             Hit::Fwd => l.fwd,
@@ -226,6 +249,7 @@ fn rect_of(app: &App, k: &Kind) -> Rect {
         Kind::Content => l.body,
         Kind::Item(i, _) => app.item_rect(*i),
         Kind::Status => l.status,
+        Kind::PickBar => l.pick.unwrap_or_default(),
     }
 }
 
@@ -284,12 +308,14 @@ fn runtime_id(k: &Kind) -> [i32; 3] {
     };
     let (tag, id) = match k {
         Kind::Toolbar => (1, 0),
+        Kind::Button(Hit::Pick(k)) => (8, *k as i32),
         Kind::Button(h) => (2, BUTTONS.iter().position(|b| b == h).unwrap_or(0) as i32),
         Kind::Sidebar => (3, 0),
         Kind::Place(_, key) => (4, hash(key)),
         Kind::Content => (5, 0),
         Kind::Item(_, p) => (6, hash(&p.to_string_lossy())),
         Kind::Status => (7, 0),
+        Kind::PickBar => (9, 0),
     };
     [UiaAppendRuntimeId as i32, tag, id]
 }
@@ -416,7 +442,8 @@ impl IRawElementProviderFragmentRoot_Impl for Root_Impl {
         let k = match app.hit(cx, cy) {
             Hit::Row(i) => Some(item(app, i)),
             Hit::SideRow(k) => app.side_rows.get(k).and_then(place_key).map(|key| Kind::Place(k, key)),
-            h @ (Hit::SidebarBtn | Hit::Back | Hit::Fwd | Hit::View(_) | Hit::More) => Some(Kind::Button(h)),
+            h @ (Hit::SidebarBtn | Hit::Back | Hit::Fwd | Hit::View(_) | Hit::More | Hit::Pick(_)) => Some(Kind::Button(h)),
+            _ if l.pick.is_some_and(|r| r.contains(cx, cy)) => Some(Kind::PickBar),
             _ if l.body.contains(cx, cy) => Some(Kind::Content),
             _ if app.sidebar_on && l.sidebar.contains(cx, cy) => Some(Kind::Sidebar),
             _ if l.toolbar.contains(cx, cy) => Some(Kind::Toolbar),
@@ -470,7 +497,10 @@ impl IRawElementProviderSimple_Impl for Node_Impl {
             (_, UIA_IsOffscreenPropertyId) => VARIANT::from(offscreen(app, &k)),
             (Kind::Toolbar, UIA_ControlTypePropertyId) => control(UIA_ToolBarControlTypeId),
             (Kind::Toolbar, UIA_NamePropertyId) => VARIANT::from("Panel nástrojů"),
+            (Kind::PickBar, UIA_ControlTypePropertyId) => control(UIA_ToolBarControlTypeId),
+            (Kind::PickBar, UIA_NamePropertyId) => VARIANT::from("Výběr souboru"),
             (Kind::Button(_), UIA_ControlTypePropertyId) => control(UIA_ButtonControlTypeId),
+            (Kind::Button(Hit::Pick(k)), UIA_NamePropertyId) => VARIANT::from(crate::pick::button_name(app, *k).as_str()),
             (Kind::Button(h), UIA_NamePropertyId) => VARIANT::from(button_name(app, *h)),
             (Kind::Button(_), UIA_IsKeyboardFocusablePropertyId) => VARIANT::from(false),
             (Kind::Sidebar, UIA_ControlTypePropertyId) => control(UIA_ListControlTypeId),
