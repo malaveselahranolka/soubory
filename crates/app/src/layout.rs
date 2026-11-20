@@ -213,15 +213,17 @@ mod tests {
             h: 800.0,
             sidebar: Some(208.0),
             tabs: true,
+            scope: true,
             header: true,
             preview: None,
         });
         assert_eq!(l.card.x, 208.0);
+        assert_eq!(l.scope.unwrap().y, l.tabs.unwrap().b());
+        assert_eq!(l.header.unwrap().y, l.scope.unwrap().b());
         assert!(l.search.r() <= l.caption[0].x);
         assert!(l.views[3].r() <= l.more.x && l.more.r() <= l.search.x);
         assert!(l.title.x >= l.fwd.r());
         assert_eq!(l.tabs.unwrap().h, TABS_H);
-        assert_eq!(l.header.unwrap().y, l.tabs.unwrap().b());
         assert!((l.body.b() - l.status.y).abs() < 0.01);
         assert!((l.status.b() - 800.0).abs() < 0.01);
     }
