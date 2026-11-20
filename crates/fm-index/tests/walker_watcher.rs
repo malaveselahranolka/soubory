@@ -16,10 +16,13 @@ use fm_fs::attrs::{
 };
 use fm_index::win::service::{Event, Service, default_roots};
 use fm_index::win::walker::{
-    DirEntryRef, DirSource, MAX_WALK_DEPTH, RootInfo, WalkOptions, merge_index, walk_root,
-    walk_with_source,
+    DirEntryRef, DirSource, MAX_WALK_DEPTH, RootInfo, WalkOptions, Win32DirSource, merge_index,
+    merge_index_with_report, walk_root, walk_with_source, walk_with_source_report,
 };
-use fm_index::win::watcher::{VolumeWatcher, WatcherConfig};
+use fm_index::win::watcher::{
+    NoopWatcherFs, NotifyAction, NotifyRecord, VolumeWatcher, WatcherConfig, WatcherFs,
+    Win32WatcherFs, apply_records,
+};
 use fm_index::{CancelToken, EntryId, Index, SearchOptions, parse_query};
 use windows::Win32::Storage::FileSystem::{FILE_FLAGS_AND_ATTRIBUTES, SetFileAttributesW};
 use windows::core::PCWSTR;
@@ -300,6 +303,11 @@ struct MockEntry {
 
 enum MockNodeKind {
     Dir(Vec<MockEntry>),
+    PartialError {
+        first_batch: Vec<MockEntry>,
+        err: io::ErrorKind,
+    },
+    FirstReadError(io::ErrorKind),
     Error(io::ErrorKind),
     File,
 }
@@ -346,7 +354,11 @@ impl DirSource for MockDirSource {
                 *self.dir_opens.lock().unwrap().entry(norm).or_insert(0) += 1;
                 Err(io::Error::from(*kind))
             }
-            Some(MockNodeKind::Dir(_)) => {
+            Some(
+                MockNodeKind::Dir(_)
+                | MockNodeKind::PartialError { .. }
+                | MockNodeKind::FirstReadError(_),
+            ) => {
                 *self
                     .dir_opens
                     .lock()
@@ -373,13 +385,32 @@ impl DirSource for MockDirSource {
         _scratch: &mut Self::Scratch,
         emit: &mut dyn FnMut(DirEntryRef<'_>),
     ) -> io::Result<bool> {
-        let Some(MockNodeKind::Dir(entries)) = self.nodes.get(&dir.path) else {
-            return Err(io::Error::from(io::ErrorKind::NotFound));
-        };
         let mut cur = dir.cursor.lock().unwrap();
         if restart {
             *cur = 0;
         }
+        let entries: &[MockEntry] = match self.nodes.get(&dir.path) {
+            Some(MockNodeKind::Dir(entries)) => entries,
+            Some(MockNodeKind::FirstReadError(kind)) => return Err(io::Error::from(*kind)),
+            Some(MockNodeKind::PartialError { first_batch, err }) => {
+                if *cur == 0 {
+                    for e in first_batch {
+                        emit(DirEntryRef {
+                            name: &e.name,
+                            attrs: e.attrs,
+                            size: e.size,
+                            mtime: e.mtime,
+                            file_id: e.file_id,
+                            reparse_tag: e.reparse_tag,
+                        });
+                    }
+                    *cur = first_batch.len().max(1);
+                    return Ok(true);
+                }
+                return Err(io::Error::from(*err));
+            }
+            _ => return Err(io::Error::from(io::ErrorKind::NotFound)),
+        };
         if *cur >= entries.len() {
             return Ok(false);
         }
@@ -389,7 +420,6 @@ impl DirSource for MockDirSource {
                 && (e.attrs & REPARSE_POINT) != 0
                 && (e.reparse_tag & 0xFFFF_0FFF) != 0x9000_001A
             {
-                // Verify test mock doesn't accidentally receive opens on junctions either
                 let child_path = format!("{}\\{}", dir.path.trim_end_matches('\\'), e.name);
                 if self.dir_opens.lock().unwrap().contains_key(&child_path) {
                     self.reparse_opens.fetch_add(1, Ordering::Relaxed);
@@ -802,6 +832,7 @@ fn acceptance_4_forced_overflow_triggers_rewalk_and_matches_fresh() {
         buffer_bytes: 128,
         coalesce_min: Duration::from_millis(50),
         coalesce_max: Duration::from_millis(100),
+        overflow_rewalk_cooldown: Duration::from_millis(50),
     };
 
     let watcher = VolumeWatcher::start(
@@ -908,22 +939,26 @@ fn acceptance_4_forced_overflow_triggers_rewalk_and_matches_fresh() {
         .unwrap();
     }
 
-    {
-        let (mu, cv) = &*ready_count;
-        let mut g = mu.lock().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while *g <= before_ready || svc.is_scanning() {
-            let rem = deadline.saturating_duration_since(Instant::now());
-            assert!(!rem.is_zero(), "post-overflow Service Ready timeout");
-            g = cv.wait_timeout(g, rem).unwrap().0;
-        }
-    }
-
     let tok = CancelToken::new();
-    let hits = svc
-        .search("svc_overflow_0799", None, false, 10, &tok)
-        .expect("not cancelled");
-    assert_eq!(hits.len(), 1);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut hits = Vec::new();
+    while Instant::now() < deadline {
+        let ready_now = *ready_count.0.lock().unwrap();
+        if ready_now > before_ready && !svc.is_scanning() {
+            hits = svc
+                .search("svc_overflow_0799", None, false, 10, &tok)
+                .expect("not cancelled");
+            if hits.len() == 1 {
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        hits.len(),
+        1,
+        "post-overflow Service follow-up walk must index svc_overflow_0799"
+    );
     assert_eq!(hits[0].name, "svc_overflow_0799_long_name.txt");
     svc.stop();
 }
@@ -1279,4 +1314,912 @@ fn walker_failed_root_open_keeps_consistent_stats() {
     assert_eq!(idx.len(), 0);
     assert_eq!(stats.dirs + stats.files, idx.len());
     assert_eq!(stats.errors, 1);
+}
+
+#[test]
+fn regression_folder_renamed_during_rewalk_preserves_subtree() {
+    let root_info = RootInfo {
+        volume_serial: 0x1111_2222,
+        file_id: 1,
+        attrs: DIRECTORY,
+        mtime: 10,
+    };
+
+    // 1. Initial walk builds R:\D\P with children c1.txt and c2.txt
+    let mut mock_init = MockDirSource::new(root_info, 16);
+    mock_init.nodes.insert(
+        "R:\\".to_owned(),
+        MockNodeKind::Dir(vec![MockEntry {
+            name: "D".to_owned(),
+            attrs: DIRECTORY,
+            size: 0,
+            mtime: 10,
+            file_id: 2,
+            reparse_tag: 0,
+        }]),
+    );
+    mock_init.nodes.insert(
+        "R:\\D".to_owned(),
+        MockNodeKind::Dir(vec![MockEntry {
+            name: "P".to_owned(),
+            attrs: DIRECTORY,
+            size: 0,
+            mtime: 10,
+            file_id: 10,
+            reparse_tag: 0,
+        }]),
+    );
+    mock_init.nodes.insert(
+        "R:\\D\\P".to_owned(),
+        MockNodeKind::Dir(vec![
+            MockEntry {
+                name: "c1.txt".to_owned(),
+                attrs: ARCHIVE,
+                size: 11,
+                mtime: 20,
+                file_id: 11,
+                reparse_tag: 0,
+            },
+            MockEntry {
+                name: "c2.txt".to_owned(),
+                attrs: ARCHIVE,
+                size: 22,
+                mtime: 21,
+                file_id: 12,
+                reparse_tag: 0,
+            },
+        ]),
+    );
+
+    let cancel = AtomicBool::new(false);
+    let (mut live, _, _) =
+        walk_with_source_report(&mock_init, "R:\\", WalkOptions::default(), &cancel, |_| {})
+            .unwrap();
+    assert!(live.lookup("R:\\D\\P\\c1.txt").is_some());
+    assert!(live.lookup("R:\\D\\P\\c2.txt").is_some());
+
+    // 2. Re-walk: D lists P (fid=10), then P was renamed -> Q so open(R:\D\P) fails NotFound
+    let mut mock_rewalk = MockDirSource::new(root_info, 16);
+    mock_rewalk.nodes.insert(
+        "R:\\".to_owned(),
+        MockNodeKind::Dir(vec![MockEntry {
+            name: "D".to_owned(),
+            attrs: DIRECTORY,
+            size: 0,
+            mtime: 10,
+            file_id: 2,
+            reparse_tag: 0,
+        }]),
+    );
+    mock_rewalk.nodes.insert(
+        "R:\\D".to_owned(),
+        MockNodeKind::Dir(vec![MockEntry {
+            name: "P".to_owned(),
+            attrs: DIRECTORY,
+            size: 0,
+            mtime: 10,
+            file_id: 10,
+            reparse_tag: 0,
+        }]),
+    );
+    mock_rewalk.nodes.insert(
+        "R:\\D\\P".to_owned(),
+        MockNodeKind::Error(io::ErrorKind::NotFound),
+    );
+
+    let (fresh, _, report) = walk_with_source_report(
+        &mock_rewalk,
+        "R:\\",
+        WalkOptions::default(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    assert!(
+        report
+            .failed
+            .iter()
+            .any(|f| f.file_id == 10 && f.rel_path == "D\\P")
+    );
+
+    // 3. Merge preserves P's live subtree rather than deleting it for the empty fresh stub
+    merge_index_with_report(&mut live, fresh, &report, true);
+    assert!(live.lookup("R:\\D\\P\\c1.txt").is_some());
+    assert!(live.lookup("R:\\D\\P\\c2.txt").is_some());
+
+    // 4. Replay captured rename P -> Q ends with Q holding all children
+    let root_id = live.lookup("R:\\").unwrap();
+    let replay = [
+        NotifyRecord {
+            action: NotifyAction::RenamedOldName,
+            rel_path: "D\\P".to_owned(),
+            file_id: 10,
+            parent_file_id: 2,
+            attrs: DIRECTORY,
+            size: 0,
+            mtime: 10,
+            reparse_tag: 0,
+        },
+        NotifyRecord {
+            action: NotifyAction::RenamedNewName,
+            rel_path: "D\\Q".to_owned(),
+            file_id: 10,
+            parent_file_id: 2,
+            attrs: DIRECTORY,
+            size: 0,
+            mtime: 10,
+            reparse_tag: 0,
+        },
+    ];
+    assert!(apply_records(&mut live, root_id, &replay, &NoopWatcherFs));
+    assert_eq!(live.lookup("R:\\D\\P"), None);
+    assert!(live.lookup("R:\\D\\Q\\c1.txt").is_some());
+    assert!(live.lookup("R:\\D\\Q\\c2.txt").is_some());
+}
+
+#[test]
+fn regression_root_failure_and_mid_listing_error_keep_live_subtrees() {
+    let root_info = RootInfo {
+        volume_serial: 0x3333_4444,
+        file_id: 1,
+        attrs: DIRECTORY,
+        mtime: 10,
+    };
+
+    let mut mock_init = MockDirSource::new(root_info, 16);
+    mock_init.nodes.insert(
+        "R:\\".to_owned(),
+        MockNodeKind::Dir(vec![MockEntry {
+            name: "M".to_owned(),
+            attrs: DIRECTORY,
+            size: 0,
+            mtime: 10,
+            file_id: 20,
+            reparse_tag: 0,
+        }]),
+    );
+    mock_init.nodes.insert(
+        "R:\\M".to_owned(),
+        MockNodeKind::Dir(vec![
+            MockEntry {
+                name: "a.txt".to_owned(),
+                attrs: ARCHIVE,
+                size: 10,
+                mtime: 20,
+                file_id: 21,
+                reparse_tag: 0,
+            },
+            MockEntry {
+                name: "b.txt".to_owned(),
+                attrs: ARCHIVE,
+                size: 20,
+                mtime: 20,
+                file_id: 22,
+                reparse_tag: 0,
+            },
+        ]),
+    );
+
+    let cancel = AtomicBool::new(false);
+    let (mut live, _, _) =
+        walk_with_source_report(&mock_init, "R:\\", WalkOptions::default(), &cancel, |_| {})
+            .unwrap();
+    let expected_len = live.len();
+
+    // 1. Root open failure keeps live unchanged
+    let mut mock_root_open_fail = MockDirSource::new(root_info, 16);
+    mock_root_open_fail
+        .nodes
+        .insert("R:\\".to_owned(), MockNodeKind::Error(io::ErrorKind::Other));
+    let (fresh1, _, rep1) = walk_with_source_report(
+        &mock_root_open_fail,
+        "R:\\",
+        WalkOptions::default(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    assert!(rep1.root_failed);
+    assert!(!merge_index_with_report(&mut live, fresh1, &rep1, true));
+    assert_eq!(live.len(), expected_len);
+    assert!(live.lookup("R:\\M\\b.txt").is_some());
+
+    // 2. Root first read failure keeps live unchanged
+    let mut mock_root_read_fail = MockDirSource::new(root_info, 16);
+    mock_root_read_fail.nodes.insert(
+        "R:\\".to_owned(),
+        MockNodeKind::FirstReadError(io::ErrorKind::Other),
+    );
+    let (fresh2, _, rep2) = walk_with_source_report(
+        &mock_root_read_fail,
+        "R:\\",
+        WalkOptions::default(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    assert!(rep2.root_failed);
+    assert!(!merge_index_with_report(&mut live, fresh2, &rep2, true));
+    assert_eq!(live.len(), expected_len);
+    assert!(live.lookup("R:\\M\\b.txt").is_some());
+
+    // 3. Mid-listing error in R:\M preserves M's unseen live children (b.txt)
+    let mut mock_mid_err = MockDirSource::new(root_info, 16);
+    mock_mid_err.nodes.insert(
+        "R:\\".to_owned(),
+        MockNodeKind::Dir(vec![MockEntry {
+            name: "M".to_owned(),
+            attrs: DIRECTORY,
+            size: 0,
+            mtime: 10,
+            file_id: 20,
+            reparse_tag: 0,
+        }]),
+    );
+    mock_mid_err.nodes.insert(
+        "R:\\M".to_owned(),
+        MockNodeKind::PartialError {
+            first_batch: vec![MockEntry {
+                name: "a.txt".to_owned(),
+                attrs: ARCHIVE,
+                size: 15,
+                mtime: 30,
+                file_id: 21,
+                reparse_tag: 0,
+            }],
+            err: io::ErrorKind::Other,
+        },
+    );
+    let (fresh3, _, rep3) = walk_with_source_report(
+        &mock_mid_err,
+        "R:\\",
+        WalkOptions::default(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    assert!(!rep3.root_failed);
+    assert!(
+        rep3.failed
+            .iter()
+            .any(|f| f.file_id == 20 && f.rel_path == "M")
+    );
+    merge_index_with_report(&mut live, fresh3, &rep3, true);
+    assert_eq!(live.meta(live.lookup("R:\\M\\a.txt").unwrap()).size, 15);
+    assert!(
+        live.lookup("R:\\M\\b.txt").is_some(),
+        "b.txt must survive partial listing failure"
+    );
+}
+
+#[test]
+fn win32_dir_source_rejects_files_and_never_follows_junctions() {
+    let mut tree = TempTree::new("win32_dir_only");
+    let real_file = tree.path.join("regular.txt");
+    let target_dir = tree.path.join("Target");
+    fs::write(&real_file, b"payload").unwrap();
+    fs::create_dir_all(&target_dir).unwrap();
+    fs::write(target_dir.join("inside_target.txt"), b"x").unwrap();
+
+    // Opening a regular file as a directory must fail and never read
+    let src = Win32DirSource;
+    assert!(src.open_dir(&real_file.to_string_lossy()).is_err());
+
+    // Create a junction and ensure both Win32DirSource and Win32WatcherFs treat it as non-descended
+    let junction = tree.path.join("Junc");
+    let mklink = Command::new("cmd")
+        .args(["/c", "mklink", "/J"])
+        .arg(&junction)
+        .arg(&target_dir)
+        .output();
+    if let Ok(out) = mklink
+        && out.status.success()
+    {
+        tree.junctions.push(junction.clone());
+        let h = src
+            .open_dir(&junction.to_string_lossy())
+            .expect("reparse skipped handle");
+        let mut scratch = <Win32DirSource as DirSource>::Scratch::default();
+        let mut count = 0usize;
+        let more = src
+            .read_batch(&h, true, &mut scratch, &mut |_| {
+                count += 1;
+            })
+            .unwrap();
+        assert!(!more);
+        assert_eq!(count, 0);
+
+        let children = Win32WatcherFs.list_dir_children(&junction.to_string_lossy());
+        assert!(
+            children.is_empty(),
+            "junction must never be followed by watcher"
+        );
+    }
+}
+
+#[test]
+fn service_ready_always_emits_cooldown_cleans_temps_and_missing_root_errors() {
+    assert_eq!(
+        WatcherConfig::default().overflow_rewalk_cooldown,
+        Duration::from_secs(60)
+    );
+
+    // 1. Stale temp cleanup + Error event on missing root + fast stop
+    let data_dir = TempTree::new("svc_hygiene_data");
+    let stale_tmp = data_dir.path.join("index-12345678.bin.tmp.999.1");
+    let real_bin = data_dir.path.join("index-12345678.bin");
+    fs::write(&stale_tmp, b"leftover").unwrap();
+    fs::write(&real_bin, b"corrupt_or_other").unwrap();
+
+    let missing_root = std::env::temp_dir().join(format!(
+        "fm_missing_svc_root_{}_{}",
+        std::process::id(),
+        TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let events: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
+    let ev_cb = Arc::clone(&events);
+    let svc_missing = Service::start(
+        vec![missing_root.to_string_lossy().into_owned()],
+        data_dir.path.clone(),
+        Box::new(move |ev| {
+            ev_cb.lock().unwrap().push(ev);
+        }),
+    );
+
+    assert!(
+        !stale_tmp.exists(),
+        "stale .bin.tmp.* must be removed at start"
+    );
+    assert!(real_bin.exists(), "non-tmp files must remain");
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut got_error = false;
+    let mut got_ready = false;
+    while Instant::now() < deadline {
+        {
+            let guard = events.lock().unwrap();
+            got_error = guard.iter().any(|e| matches!(e, Event::Error { .. }));
+            got_ready = guard.iter().any(|e| matches!(e, Event::Ready { .. }));
+        }
+        if got_error && got_ready {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(got_error, "expected Event::Error for missing watched root");
+    assert!(got_ready, "expected Event::Ready even on failed walk");
+    let t0 = Instant::now();
+    svc_missing.stop();
+    assert!(
+        t0.elapsed() < Duration::from_secs(2),
+        "stop must wake retrying watcher quickly"
+    );
+
+    // 2. Overflow cooldown keeps is_scanning() == false between walks and manual trigger bypasses it
+    let tree = TempTree::new("svc_cooldown_root");
+    let data2 = TempTree::new("svc_cooldown_data");
+    let ready_cnt = Arc::new((Mutex::new(0usize), Condvar::new()));
+    let rc_cb = Arc::clone(&ready_cnt);
+    let cfg = WatcherConfig {
+        buffer_bytes: 128,
+        coalesce_min: Duration::from_millis(20),
+        coalesce_max: Duration::from_millis(40),
+        overflow_rewalk_cooldown: Duration::from_secs(30),
+    };
+    let svc = Service::start_with_watcher_config(
+        vec![tree.path_str()],
+        data2.path.clone(),
+        cfg,
+        Box::new(move |ev| {
+            if matches!(ev, Event::Ready { .. }) {
+                let (mu, cv) = &*rc_cb;
+                *mu.lock().unwrap() += 1;
+                cv.notify_all();
+            }
+        }),
+    );
+
+    {
+        let (mu, cv) = &*ready_cnt;
+        let mut g = mu.lock().unwrap();
+        let d = Instant::now() + Duration::from_secs(5);
+        while *g < 1 {
+            let rem = d.saturating_duration_since(Instant::now());
+            assert!(!rem.is_zero());
+            g = cv.wait_timeout(g, rem).unwrap().0;
+        }
+    }
+    assert!(!svc.is_scanning());
+
+    // Force an overflow: cooldown is 30 s so no immediate overflow re-walk starts and is_scanning stays false
+    for i in 0..300usize {
+        fs::write(tree.path.join(format!("ov_{i:04}_long_name.txt")), b"x").unwrap();
+    }
+    thread::sleep(Duration::from_millis(250));
+    assert!(
+        !svc.is_scanning(),
+        "is_scanning must be false during overflow cooldown"
+    );
+    assert_eq!(*ready_cnt.0.lock().unwrap(), 1);
+
+    // Manual trigger_rewalk must bypass the 30 s overflow cooldown immediately
+    svc.trigger_rewalk();
+    {
+        let (mu, cv) = &*ready_cnt;
+        let mut g = mu.lock().unwrap();
+        let d = Instant::now() + Duration::from_secs(5);
+        while *g < 2 {
+            let rem = d.saturating_duration_since(Instant::now());
+            assert!(!rem.is_zero(), "manual trigger_rewalk must bypass cooldown");
+            g = cv.wait_timeout(g, rem).unwrap().0;
+        }
+    }
+    svc.stop();
+}
+
+#[test]
+fn service_hidden_scope_finds_visible_child_and_hides_nested_hidden() {
+    let root = TempTree::new("hidden_scope_root");
+    let data = TempTree::new("hidden_scope_data");
+    let hidden_folder = root.path.join("SecretFolder");
+    let sub_hidden = hidden_folder.join("NestedHidden");
+    fs::create_dir_all(&sub_hidden).unwrap();
+    set_hidden(&hidden_folder);
+    set_hidden(&sub_hidden);
+
+    fs::write(hidden_folder.join("visible_in_hidden.txt"), b"ok").unwrap();
+    fs::write(sub_hidden.join("should_stay_hidden.txt"), b"no").unwrap();
+
+    let ready = Arc::new((Mutex::new(false), Condvar::new()));
+    let r_cb = Arc::clone(&ready);
+    let svc = Service::start(
+        vec![root.path_str()],
+        data.path.clone(),
+        Box::new(move |ev| {
+            if matches!(ev, Event::Ready { .. }) {
+                let (mu, cv) = &*r_cb;
+                *mu.lock().unwrap() = true;
+                cv.notify_all();
+            }
+        }),
+    );
+    {
+        let (mu, cv) = &*ready;
+        let mut g = mu.lock().unwrap();
+        let d = Instant::now() + Duration::from_secs(5);
+        while !*g {
+            let rem = d.saturating_duration_since(Instant::now());
+            assert!(!rem.is_zero());
+            g = cv.wait_timeout(g, rem).unwrap().0;
+        }
+    }
+
+    let tok = CancelToken::new();
+    let global = svc
+        .search("visible_in_hidden", None, false, 10, &tok)
+        .unwrap();
+    assert!(global.is_empty());
+
+    let scope_str = hidden_folder.to_string_lossy().into_owned();
+    let scoped = svc
+        .search("txt", Some(&scope_str), false, 10, &tok)
+        .unwrap();
+    let names: Vec<&str> = scoped.iter().map(|h| h.name.as_str()).collect();
+    assert_eq!(names, vec!["visible_in_hidden.txt"]);
+    svc.stop();
+}
+
+#[test]
+fn watcher_panic_cancels_pending_io_and_recovers_poisoned_lock() {
+    let tree = TempTree::new("panic_recover");
+    let root_str = tree.path_str();
+    let cancel = AtomicBool::new(false);
+    let (init_idx, _) = walk_root(&root_str, WalkOptions::default(), &cancel, |_| {}).unwrap();
+    let shared_idx = Arc::new(RwLock::new(init_idx));
+
+    // 1. Trigger a real panic inside VolumeWatcher::on_applied while the second ReadDirectoryChangesExW
+    // buffer IS already armed in the kernel; ArmedWatchState::drop must CancelIoEx + await completion
+    // safely before freeing buffers/OVERLAPPED!
+    let panicked_flag = Arc::new(AtomicBool::new(false));
+    let pf_cb = Arc::clone(&panicked_flag);
+    let panic_watcher = VolumeWatcher::start(
+        root_str.clone(),
+        Arc::clone(&shared_idx),
+        WatcherConfig::default(),
+        Box::new(move |_recs, _ch| {
+            pf_cb.store(true, Ordering::Release);
+            panic!("intentional watcher callback panic during armed I/O");
+        }),
+        Box::new(|| {}),
+    )
+    .expect("start panic watcher");
+    fs::write(tree.path.join("trigger_watcher_panic.txt"), b"p").unwrap();
+    let p_deadline = Instant::now() + Duration::from_secs(3);
+    while !panicked_flag.load(Ordering::Acquire) && Instant::now() < p_deadline {
+        thread::sleep(Duration::from_millis(15));
+    }
+    assert!(panicked_flag.load(Ordering::Acquire));
+    panic_watcher.stop();
+
+    // 2. Intentionally poison the shared RwLock<Index> and verify VolumeWatcher recovers cleanly
+    let idx_poison = Arc::clone(&shared_idx);
+    let _ = thread::spawn(move || {
+        let _g = idx_poison.write().unwrap();
+        panic!("intentional lock poison test");
+    })
+    .join();
+    assert!(shared_idx.read().is_err(), "lock should now be poisoned");
+
+    // Start a watcher whose index RwLock IS poisoned and trigger a real file write; must not panic!
+    let got_applied = Arc::new((Mutex::new(false), Condvar::new()));
+    let ga_cb = Arc::clone(&got_applied);
+    let watcher = VolumeWatcher::start(
+        root_str.clone(),
+        Arc::clone(&shared_idx),
+        WatcherConfig::default(),
+        Box::new(move |_recs, ch| {
+            if ch {
+                let (mu, cv) = &*ga_cb;
+                *mu.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+                cv.notify_all();
+            }
+        }),
+        Box::new(|| {}),
+    )
+    .expect("watcher starts against poisoned lock");
+
+    fs::write(tree.path.join("recovered_after_poison.txt"), b"ok").unwrap();
+    {
+        let (mu, cv) = &*got_applied;
+        let mut g = mu.lock().unwrap();
+        let d = Instant::now() + Duration::from_secs(3);
+        while !*g {
+            let rem = d.saturating_duration_since(Instant::now());
+            assert!(
+                !rem.is_zero(),
+                "watcher did not recover poisoned lock in time"
+            );
+            g = cv.wait_timeout(g, rem).unwrap().0;
+        }
+    }
+    watcher.stop();
+
+    let recovered = shared_idx
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(
+        recovered
+            .lookup(&format!("{root_str}\\recovered_after_poison.txt"))
+            .is_some()
+    );
+}
+#[test]
+fn regression_partial_error_rename_and_reused_old_path() {
+    let root_info = RootInfo {
+        volume_serial: 0x5555_6666,
+        file_id: 1,
+        attrs: DIRECTORY,
+        mtime: 10,
+    };
+    let cancel = AtomicBool::new(false);
+
+    // Case A: P (fid=10) renamed to Q (fid=10) before walk reaches it, and listing Q hits PartialError
+    // yielding only a.txt while b.txt is unseen. Merge keeps one Q with updated a.txt and preserved b.txt.
+    let mut mock_init_a = MockDirSource::new(root_info, 16);
+    mock_init_a.nodes.insert(
+        "R:\\".to_owned(),
+        MockNodeKind::Dir(vec![MockEntry {
+            name: "D".to_owned(),
+            attrs: DIRECTORY,
+            size: 0,
+            mtime: 10,
+            file_id: 2,
+            reparse_tag: 0,
+        }]),
+    );
+    mock_init_a.nodes.insert(
+        "R:\\D".to_owned(),
+        MockNodeKind::Dir(vec![MockEntry {
+            name: "P".to_owned(),
+            attrs: DIRECTORY,
+            size: 0,
+            mtime: 10,
+            file_id: 10,
+            reparse_tag: 0,
+        }]),
+    );
+    mock_init_a.nodes.insert(
+        "R:\\D\\P".to_owned(),
+        MockNodeKind::Dir(vec![
+            MockEntry {
+                name: "a.txt".to_owned(),
+                attrs: ARCHIVE,
+                size: 10,
+                mtime: 20,
+                file_id: 11,
+                reparse_tag: 0,
+            },
+            MockEntry {
+                name: "b.txt".to_owned(),
+                attrs: ARCHIVE,
+                size: 20,
+                mtime: 21,
+                file_id: 12,
+                reparse_tag: 0,
+            },
+        ]),
+    );
+    let (mut live_a, _, _) = walk_with_source_report(
+        &mock_init_a,
+        "R:\\",
+        WalkOptions::default(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    assert_eq!(live_a.len(), 5);
+
+    let mut mock_rewalk_a = MockDirSource::new(root_info, 16);
+    mock_rewalk_a.nodes.insert(
+        "R:\\".to_owned(),
+        MockNodeKind::Dir(vec![MockEntry {
+            name: "D".to_owned(),
+            attrs: DIRECTORY,
+            size: 0,
+            mtime: 10,
+            file_id: 2,
+            reparse_tag: 0,
+        }]),
+    );
+    mock_rewalk_a.nodes.insert(
+        "R:\\D".to_owned(),
+        MockNodeKind::Dir(vec![MockEntry {
+            name: "Q".to_owned(),
+            attrs: DIRECTORY,
+            size: 0,
+            mtime: 11,
+            file_id: 10,
+            reparse_tag: 0,
+        }]),
+    );
+    mock_rewalk_a.nodes.insert(
+        "R:\\D\\Q".to_owned(),
+        MockNodeKind::PartialError {
+            first_batch: vec![MockEntry {
+                name: "a.txt".to_owned(),
+                attrs: ARCHIVE,
+                size: 15,
+                mtime: 30,
+                file_id: 11,
+                reparse_tag: 0,
+            }],
+            err: io::ErrorKind::Other,
+        },
+    );
+    let (fresh_a, _, rep_a) = walk_with_source_report(
+        &mock_rewalk_a,
+        "R:\\",
+        WalkOptions::default(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    assert!(
+        rep_a
+            .failed
+            .iter()
+            .any(|f| f.file_id == 10 && f.rel_path == "D\\Q")
+    );
+    merge_index_with_report(&mut live_a, fresh_a, &rep_a, true);
+    assert_eq!(live_a.lookup("R:\\D\\P"), None);
+    let q_id = live_a.lookup("R:\\D\\Q").expect("Q present");
+    assert_eq!(live_a.by_file_id(10), Some(q_id));
+    assert_eq!(
+        live_a.meta(live_a.lookup("R:\\D\\Q\\a.txt").unwrap()).size,
+        15
+    );
+    assert!(live_a.lookup("R:\\D\\Q\\b.txt").is_some());
+    assert_eq!(live_a.len(), 5, "zero duplicate Q or children");
+
+    // Case B1: A (fid=10) -> B (fid=10, PartialError) while a brand-new dir A (fid=99) occupies "D\A".
+    // Case B2: P (fid=100) was renamed to Q2 (fid=100, open fails NotFound) while a new P (fid=199) occupies "D\P".
+    let mut mock_init_b = MockDirSource::new(root_info, 16);
+    mock_init_b.nodes.insert(
+        "R:\\".to_owned(),
+        MockNodeKind::Dir(vec![MockEntry {
+            name: "D".to_owned(),
+            attrs: DIRECTORY,
+            size: 0,
+            mtime: 10,
+            file_id: 2,
+            reparse_tag: 0,
+        }]),
+    );
+    mock_init_b.nodes.insert(
+        "R:\\D".to_owned(),
+        MockNodeKind::Dir(vec![
+            MockEntry {
+                name: "A".to_owned(),
+                attrs: DIRECTORY,
+                size: 0,
+                mtime: 10,
+                file_id: 10,
+                reparse_tag: 0,
+            },
+            MockEntry {
+                name: "P".to_owned(),
+                attrs: DIRECTORY,
+                size: 0,
+                mtime: 10,
+                file_id: 100,
+                reparse_tag: 0,
+            },
+        ]),
+    );
+    mock_init_b.nodes.insert(
+        "R:\\D\\A".to_owned(),
+        MockNodeKind::Dir(vec![MockEntry {
+            name: "secret_a.txt".to_owned(),
+            attrs: ARCHIVE,
+            size: 77,
+            mtime: 20,
+            file_id: 13,
+            reparse_tag: 0,
+        }]),
+    );
+    mock_init_b.nodes.insert(
+        "R:\\D\\P".to_owned(),
+        MockNodeKind::Dir(vec![MockEntry {
+            name: "secret_p.txt".to_owned(),
+            attrs: ARCHIVE,
+            size: 88,
+            mtime: 20,
+            file_id: 101,
+            reparse_tag: 0,
+        }]),
+    );
+    let (mut live_b, _, _) = walk_with_source_report(
+        &mock_init_b,
+        "R:\\",
+        WalkOptions::default(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+
+    let mut mock_rewalk_b = MockDirSource::new(root_info, 16);
+    mock_rewalk_b.nodes.insert(
+        "R:\\".to_owned(),
+        MockNodeKind::Dir(vec![MockEntry {
+            name: "D".to_owned(),
+            attrs: DIRECTORY,
+            size: 0,
+            mtime: 10,
+            file_id: 2,
+            reparse_tag: 0,
+        }]),
+    );
+    mock_rewalk_b.nodes.insert(
+        "R:\\D".to_owned(),
+        MockNodeKind::Dir(vec![
+            MockEntry {
+                name: "A".to_owned(),
+                attrs: DIRECTORY,
+                size: 0,
+                mtime: 30,
+                file_id: 99,
+                reparse_tag: 0,
+            },
+            MockEntry {
+                name: "B".to_owned(),
+                attrs: DIRECTORY,
+                size: 0,
+                mtime: 30,
+                file_id: 10,
+                reparse_tag: 0,
+            },
+            MockEntry {
+                name: "P".to_owned(),
+                attrs: DIRECTORY,
+                size: 0,
+                mtime: 30,
+                file_id: 199,
+                reparse_tag: 0,
+            },
+            MockEntry {
+                name: "Q2".to_owned(),
+                attrs: DIRECTORY,
+                size: 0,
+                mtime: 30,
+                file_id: 100,
+                reparse_tag: 0,
+            },
+        ]),
+    );
+    mock_rewalk_b.nodes.insert(
+        "R:\\D\\A".to_owned(),
+        MockNodeKind::Dir(vec![MockEntry {
+            name: "new_a.txt".to_owned(),
+            attrs: ARCHIVE,
+            size: 5,
+            mtime: 30,
+            file_id: 98,
+            reparse_tag: 0,
+        }]),
+    );
+    mock_rewalk_b.nodes.insert(
+        "R:\\D\\B".to_owned(),
+        MockNodeKind::PartialError {
+            first_batch: Vec::new(),
+            err: io::ErrorKind::Other,
+        },
+    );
+    mock_rewalk_b.nodes.insert(
+        "R:\\D\\P".to_owned(),
+        MockNodeKind::Dir(vec![MockEntry {
+            name: "new_p.txt".to_owned(),
+            attrs: ARCHIVE,
+            size: 6,
+            mtime: 30,
+            file_id: 198,
+            reparse_tag: 0,
+        }]),
+    );
+    mock_rewalk_b.nodes.insert(
+        "R:\\D\\Q2".to_owned(),
+        MockNodeKind::Error(io::ErrorKind::NotFound),
+    );
+
+    let (fresh_b, _, rep_b) = walk_with_source_report(
+        &mock_rewalk_b,
+        "R:\\",
+        WalkOptions::default(),
+        &cancel,
+        |_| {},
+    )
+    .unwrap();
+    merge_index_with_report(&mut live_b, fresh_b, &rep_b, true);
+
+    assert_eq!(live_b.by_file_id(99), live_b.lookup("R:\\D\\A"));
+    assert!(live_b.lookup("R:\\D\\A\\new_a.txt").is_some());
+    assert_eq!(live_b.lookup("R:\\D\\A\\secret_a.txt"), None);
+    assert_eq!(live_b.by_file_id(10), live_b.lookup("R:\\D\\B"));
+    assert!(live_b.lookup("R:\\D\\B\\secret_a.txt").is_some());
+
+    assert_eq!(live_b.by_file_id(199), live_b.lookup("R:\\D\\P"));
+    assert!(live_b.lookup("R:\\D\\P\\new_p.txt").is_some());
+    assert_eq!(live_b.lookup("R:\\D\\P\\secret_p.txt"), None);
+    assert!(live_b.by_file_id(100).is_some());
+
+    let root_b = live_b.lookup("R:\\").unwrap();
+    let replay_b = [
+        NotifyRecord {
+            action: NotifyAction::RenamedOldName,
+            rel_path: "D\\Q2".to_owned(),
+            file_id: 100,
+            parent_file_id: 2,
+            attrs: DIRECTORY,
+            size: 0,
+            mtime: 30,
+            reparse_tag: 0,
+        },
+        NotifyRecord {
+            action: NotifyAction::RenamedNewName,
+            rel_path: "D\\Q3".to_owned(),
+            file_id: 100,
+            parent_file_id: 2,
+            attrs: DIRECTORY,
+            size: 0,
+            mtime: 30,
+            reparse_tag: 0,
+        },
+    ];
+    assert!(apply_records(
+        &mut live_b,
+        root_b,
+        &replay_b,
+        &NoopWatcherFs
+    ));
+    assert!(live_b.lookup("R:\\D\\Q3\\secret_p.txt").is_some());
+    assert_eq!(live_b.by_file_id(100), live_b.lookup("R:\\D\\Q3"));
 }

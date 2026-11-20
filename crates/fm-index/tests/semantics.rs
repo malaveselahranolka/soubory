@@ -188,7 +188,13 @@ fn semantics_table_48_cases() {
         (
             "folder:",
             false,
-            &["C:\\", "Projekty", "Dokumenty", "Alpha_Client"],
+            &[
+                "C:\\",
+                "Projekty",
+                "Dokumenty",
+                "Alpha_Client",
+                "SystemData",
+            ],
         ),
         ("folder:alpha", false, &["Alpha_Client"]),
         ("file:alpha", false, &["alpha"]),
@@ -205,7 +211,7 @@ fn semantics_table_48_cases() {
         ),
         ("deep_under_hidden", false, &[]),
         ("deep_under_hidden", true, &["deep_under_hidden.pdf"]),
-        ("pagefile", false, &[]),
+        ("pagefile", false, &["pagefile.sys"]),
         ("pagefile", true, &["pagefile.sys"]),
         ("foo:bar", false, &["foo:bar_weird"]),
         ("gitignore", false, &[".gitignore"]),
@@ -762,7 +768,7 @@ fn cross_index_refine_and_root_edge_cases() {
 
 #[test]
 fn file_id_map_property_vs_naive_model() {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     #[derive(Clone)]
     struct NaiveNode {
@@ -863,8 +869,14 @@ fn file_id_map_property_vs_naive_model() {
             } else {
                 format!("{base}_{}", rng.gen_range(60))
             };
+            let live_fids: Vec<u64> = model
+                .values()
+                .filter_map(|n| (n.meta.file_id != 0).then_some(n.meta.file_id))
+                .collect();
             let fid = if rng.gen_range(8) == 0 {
                 0
+            } else if !live_fids.is_empty() && rng.gen_range(3) == 0 {
+                live_fids[rng.gen_range(live_fids.len())]
             } else {
                 let f = next_fid;
                 next_fid += 1;
@@ -902,8 +914,14 @@ fn file_id_map_property_vs_naive_model() {
         } else if op < 50 {
             // Update meta / set_file_id
             let id = all_ids[rng.gen_range(all_ids.len())];
+            let live_fids: Vec<u64> = model
+                .values()
+                .filter_map(|n| (n.meta.file_id != 0).then_some(n.meta.file_id))
+                .collect();
             let new_fid = if rng.gen_range(6) == 0 {
                 0
+            } else if !live_fids.is_empty() && rng.gen_range(3) == 0 {
+                live_fids[rng.gen_range(live_fids.len())]
             } else {
                 let f = next_fid;
                 next_fid += 1;
@@ -993,6 +1011,7 @@ fn file_id_map_property_vs_naive_model() {
         assert_eq!(idx.len(), model.len(), "step {step}: len mismatch");
         assert_eq!(idx.by_file_id(0), None, "step {step}: fid 0 must be None");
         if step % 25 == 0 || step == 2499 {
+            let mut fid_to_ids: HashMap<u64, HashSet<EntryId>> = HashMap::new();
             for (&id, node) in &model {
                 assert!(idx.is_alive(id), "step {step}: {id} not alive");
                 assert_eq!(
@@ -1001,20 +1020,27 @@ fn file_id_map_property_vs_naive_model() {
                     "step {step}: fid mismatch"
                 );
                 if node.meta.file_id != 0 {
-                    assert_eq!(
-                        idx.by_file_id(node.meta.file_id),
-                        Some(id),
-                        "step {step}: by_file_id({}) mismatch",
-                        node.meta.file_id
-                    );
+                    fid_to_ids.entry(node.meta.file_id).or_default().insert(id);
                 }
             }
-            for &rfid in retired_fids.iter().rev().take(50) {
-                assert_eq!(
-                    idx.by_file_id(rfid),
-                    None,
-                    "step {step}: retired fid {rfid} still present"
+            for (&fid, expected_ids) in &fid_to_ids {
+                let got = idx
+                    .by_file_id(fid)
+                    .unwrap_or_else(|| panic!("step {step}: missing fid {fid}"));
+                assert!(idx.is_alive(got), "step {step}: dead fid target {got}");
+                assert!(
+                    expected_ids.contains(&got),
+                    "step {step}: by_file_id({fid})={got} not in live set {expected_ids:?}"
                 );
+            }
+            for &rfid in retired_fids.iter().rev().take(50) {
+                if !fid_to_ids.contains_key(&rfid) {
+                    assert_eq!(
+                        idx.by_file_id(rfid),
+                        None,
+                        "step {step}: retired fid {rfid} still present"
+                    );
+                }
             }
         }
     }

@@ -6,14 +6,58 @@ pub mod watcher;
 
 use std::io;
 use std::path::PathBuf;
+use std::sync::{
+    Condvar, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard,
+    WaitTimeoutResult,
+};
+use std::time::Duration;
 
-use windows::Win32::Foundation::{CloseHandle, FILETIME, HANDLE};
+use fm_fs::attrs::{DIRECTORY, REPARSE_POINT};
+use windows::Win32::Foundation::{
+    CloseHandle, ERROR_DIRECTORY, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED, FILETIME, HANDLE,
+};
 use windows::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED,
-    FILE_FLAGS_AND_ATTRIBUTES, FILE_LIST_DIRECTORY, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, GetFileInformationByHandle, GetFullPathNameW, OPEN_EXISTING,
+    BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_OVERLAPPED, FILE_FLAGS_AND_ATTRIBUTES,
+    FILE_LIST_DIRECTORY, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    FileAttributeTagInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
+    GetFullPathNameW, GetVolumeInformationW, GetVolumePathNameW, OPEN_EXISTING,
 };
 use windows::core::PCWSTR;
+
+/// `FILE_FLAG_OPEN_NO_RECALL` (`0x00100000`) to avoid hydrating cloud placeholder files.
+const FILE_FLAG_OPEN_NO_RECALL_RAW: FILE_FLAGS_AND_ATTRIBUTES =
+    FILE_FLAGS_AND_ATTRIBUTES(0x0010_0000);
+
+#[inline]
+pub(crate) fn lock_or_recover<T>(mu: &Mutex<T>) -> MutexGuard<'_, T> {
+    mu.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+#[inline]
+pub(crate) fn read_or_recover<T>(rw: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    rw.read().unwrap_or_else(PoisonError::into_inner)
+}
+
+#[inline]
+pub(crate) fn write_or_recover<T>(rw: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    rw.write().unwrap_or_else(PoisonError::into_inner)
+}
+
+#[inline]
+pub(crate) fn wait_or_recover<'a, T>(cv: &Condvar, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
+    cv.wait(guard).unwrap_or_else(PoisonError::into_inner)
+}
+
+#[inline]
+pub(crate) fn wait_timeout_or_recover<'a, T>(
+    cv: &Condvar,
+    guard: MutexGuard<'a, T>,
+    dur: Duration,
+) -> (MutexGuard<'a, T>, WaitTimeoutResult) {
+    cv.wait_timeout(guard, dur)
+        .unwrap_or_else(PoisonError::into_inner)
+}
 
 /// Bitmask check for the `IO_REPARSE_TAG_CLOUD*` family (`0x9000_001A` .. `0x9000_F01A`).
 #[inline]
@@ -167,23 +211,41 @@ pub(crate) fn join_child_path(parent: &str, child: &str) -> String {
     out
 }
 
-/// Opens an existing directory handle for listing/watching only (never opens files).
-pub(crate) fn open_dir_handle(
-    path: &str,
-    overlapped: bool,
-    wbuf: &mut Vec<u16>,
-) -> io::Result<WinHandle> {
-    let ext = to_extended_path(path);
-    wide_into(&ext, wbuf);
-    let flags = FILE_FLAG_BACKUP_SEMANTICS
-        | if overlapped {
-            FILE_FLAG_OVERLAPPED
-        } else {
-            FILE_FLAGS_AND_ATTRIBUTES(0)
-        };
+/// Result of opening a directory path while strictly rejecting regular files and non-cloud junctions.
+pub(crate) enum DirOpen {
+    /// Opened directory handle ready for listing/watching.
+    Dir(WinHandle),
+    /// Path is a non-cloud reparse directory (junction/symlink/mount point); handle already closed.
+    ReparseSkipped,
+}
+
+fn query_attr_and_tag(handle: HANDLE) -> io::Result<(u32, u32)> {
+    let mut tag_info = FILE_ATTRIBUTE_TAG_INFO::default();
+    let res = unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileAttributeTagInfo,
+            (&raw mut tag_info).cast(),
+            std::mem::size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+        )
+    };
+    match res {
+        Ok(()) => Ok((tag_info.FileAttributes, tag_info.ReparseTag)),
+        Err(e) => match win32_error_code(&e) {
+            Some(c) if c == ERROR_INVALID_PARAMETER.0 || c == ERROR_NOT_SUPPORTED.0 => {
+                let mut info = BY_HANDLE_FILE_INFORMATION::default();
+                unsafe { GetFileInformationByHandle(handle, &mut info) }.map_err(win32_to_io)?;
+                Ok((info.dwFileAttributes, 0))
+            }
+            _ => Err(win32_to_io(e)),
+        },
+    }
+}
+
+fn create_dir_raw(wptr: PCWSTR, flags: FILE_FLAGS_AND_ATTRIBUTES) -> io::Result<WinHandle> {
     let handle = unsafe {
         CreateFileW(
-            PCWSTR(wbuf.as_ptr()),
+            wptr,
             FILE_LIST_DIRECTORY.0,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             None,
@@ -194,6 +256,109 @@ pub(crate) fn open_dir_handle(
     }
     .map_err(win32_to_io)?;
     Ok(WinHandle(handle))
+}
+
+/// Opens an existing directory handle safely without ever opening or recalling regular files,
+/// rejecting non-directories and skipping non-cloud reparse points (closing their handle).
+pub(crate) fn open_dir_checked(
+    path: &str,
+    overlapped: bool,
+    wbuf: &mut Vec<u16>,
+) -> io::Result<DirOpen> {
+    let ext = to_extended_path(path);
+    wide_into(&ext, wbuf);
+    let ov_flag = if overlapped {
+        FILE_FLAG_OVERLAPPED
+    } else {
+        FILE_FLAGS_AND_ATTRIBUTES(0)
+    };
+    let base_flags = FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_NO_RECALL_RAW | ov_flag;
+
+    let handle = create_dir_raw(
+        PCWSTR(wbuf.as_ptr()),
+        base_flags | FILE_FLAG_OPEN_REPARSE_POINT,
+    )?;
+    let (attrs, reparse_tag) = query_attr_and_tag(handle.0)?;
+
+    if (attrs & DIRECTORY) == 0 {
+        drop(handle);
+        return Err(io::Error::from_raw_os_error(ERROR_DIRECTORY.0 as i32));
+    }
+
+    if (attrs & REPARSE_POINT) != 0 {
+        if !is_cloud_reparse_tag(reparse_tag) {
+            drop(handle);
+            return Ok(DirOpen::ReparseSkipped);
+        }
+        drop(handle);
+        // Reopen cloud placeholder folder without OPEN_REPARSE_POINT (keeping OPEN_NO_RECALL) so
+        // directory enumeration sees the virtual cloud entries without hydrating placeholder files.
+        let cloud_handle = create_dir_raw(PCWSTR(wbuf.as_ptr()), base_flags)?;
+        let (attrs2, _) = query_attr_and_tag(cloud_handle.0)?;
+        if (attrs2 & DIRECTORY) == 0 {
+            drop(cloud_handle);
+            return Err(io::Error::from_raw_os_error(ERROR_DIRECTORY.0 as i32));
+        }
+        return Ok(DirOpen::Dir(cloud_handle));
+    }
+
+    Ok(DirOpen::Dir(handle))
+}
+
+/// Opens an existing directory handle for watching (rejects non-directories and non-cloud junctions).
+pub(crate) fn open_dir_handle(
+    path: &str,
+    overlapped: bool,
+    wbuf: &mut Vec<u16>,
+) -> io::Result<WinHandle> {
+    match open_dir_checked(path, overlapped, wbuf)? {
+        DirOpen::Dir(h) => Ok(h),
+        DirOpen::ReparseSkipped => Err(io::Error::other(
+            "refusing to open non-cloud reparse point as directory",
+        )),
+    }
+}
+
+/// Returns `true` when the volume hosting `path` reports `NTFS` (where FileIds are unique).
+pub(crate) fn is_ntfs_volume(path: &str) -> bool {
+    let display = normalize_display_path(path);
+    let w_path = wide_null(&display);
+    let mut vol_buf = vec![0u16; display.len().max(260) + 16];
+    let has_vol = unsafe { GetVolumePathNameW(PCWSTR(w_path.as_ptr()), &mut vol_buf) }.is_ok();
+
+    let vol_w: Vec<u16> = if has_vol {
+        let len = vol_buf
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(vol_buf.len());
+        let mut v = vol_buf[..len].to_vec();
+        v.push(0);
+        v
+    } else {
+        let bytes = display.as_bytes();
+        if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+            wide_null(&format!("{}:\\", bytes[0] as char))
+        } else {
+            return false;
+        }
+    };
+
+    let mut fs_buf = [0u16; 64];
+    let ok = unsafe {
+        GetVolumeInformationW(
+            PCWSTR(vol_w.as_ptr()),
+            None,
+            None,
+            None,
+            None,
+            Some(&mut fs_buf),
+        )
+    };
+    if ok.is_err() {
+        return false;
+    }
+    let fs_len = fs_buf.iter().position(|&c| c == 0).unwrap_or(fs_buf.len());
+    String::from_utf16_lossy(&fs_buf[..fs_len]).eq_ignore_ascii_case("NTFS")
 }
 
 /// Queries volume serial, 64-bit FileId, attributes, and mtime from an open directory handle.
