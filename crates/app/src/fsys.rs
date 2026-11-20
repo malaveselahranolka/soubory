@@ -270,8 +270,19 @@ pub fn display_name(p: &Path) -> String {
     if let Some(n) = DISPLAY.with(|m| m.borrow().get(p).cloned()) {
         return n;
     }
-    let mut info = SHFILEINFOW::default();
     let w = wide(&p.to_string_lossy());
+    // Only drive roots and customized folders (desktop.ini, which Windows flags with the
+    // read-only or system attribute) show a name other than their own; asking the shell costs
+    // milliseconds per breadcrumb.
+    if let Some(own) = p.file_name() {
+        let a = unsafe { GetFileAttributesW(PCWSTR(w.as_ptr())) };
+        if a != INVALID_FILE_ATTRIBUTES && a & (FILE_ATTRIBUTE_READONLY.0 | FILE_ATTRIBUTE_SYSTEM.0) == 0 {
+            let n = own.to_string_lossy().into_owned();
+            DISPLAY.with(|m| m.borrow_mut().insert(p.to_path_buf(), n.clone()));
+            return n;
+        }
+    }
+    let mut info = SHFILEINFOW::default();
     let ok = unsafe {
         SHGetFileInfoW(
             PCWSTR(w.as_ptr()),

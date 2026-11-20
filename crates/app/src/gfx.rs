@@ -219,34 +219,8 @@ impl Gfx {
     /// Creates the composition swap chain for `hwnd` (created with WS_EX_NOREDIRECTIONBITMAP).
     pub fn attach(&mut self, hwnd: HWND, w: u32, h: u32) -> Result<()> {
         unsafe {
-            let mut d3d = None;
-            let flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
-            if D3D11CreateDevice(
-                None,
-                D3D_DRIVER_TYPE_HARDWARE,
-                HMODULE::default(),
-                flags,
-                None,
-                D3D11_SDK_VERSION,
-                Some(&mut d3d),
-                None,
-                None,
-            )
-            .is_err()
-            {
-                D3D11CreateDevice(
-                    None,
-                    D3D_DRIVER_TYPE_WARP,
-                    HMODULE::default(),
-                    flags,
-                    None,
-                    D3D11_SDK_VERSION,
-                    Some(&mut d3d),
-                    None,
-                    None,
-                )?;
-            }
-            let d3d = d3d.unwrap();
+            let d3d = take_prewarmed().or_else(create_d3d).ok_or(Error::from(E_FAIL))?;
+            crate::win::trace("d3d11_device");
             let dxgi: IDXGIDevice = d3d.cast()?;
             let d2d_dev = self.d2d.CreateDevice(&dxgi)?;
             let dc = d2d_dev.CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE)?;
@@ -267,7 +241,9 @@ impl Gfx {
                 Flags: 0,
                 Stereo: FALSE,
             };
+            crate::win::trace("d2d_dc_factory");
             let swap = factory.CreateSwapChainForComposition(&dxgi, &desc, None)?;
+            crate::win::trace("swapchain");
             let dcomp: IDCompositionDevice = DCompositionCreateDevice(&dxgi)?;
             // Not topmost: child EDITs (search, rename) must stay above the composition visual.
             let target = dcomp.CreateTargetForHwnd(hwnd, false)?;
@@ -275,6 +251,7 @@ impl Gfx {
             visual.SetContent(&swap)?;
             target.SetRoot(&visual)?;
             dcomp.Commit()?;
+            crate::win::trace("dcomp");
             self.dev = Some(Device {
                 dc,
                 swap,
@@ -426,6 +403,45 @@ impl Gfx {
             enc.Commit()?;
             Ok(())
         }
+    }
+}
+
+/// Creating the D3D device is the slowest step of a cold start (driver load); `prewarm` starts
+/// it on another thread while the window and the first listing are built, `attach` collects it.
+struct SendDevice(ID3D11Device);
+// SAFETY: ID3D11Device is free-threaded; only the immediate context is not, and it is not shared.
+unsafe impl Send for SendDevice {}
+static PREWARM: std::sync::Mutex<Option<std::thread::JoinHandle<Option<SendDevice>>>> = std::sync::Mutex::new(None);
+
+pub fn prewarm() {
+    let h = std::thread::spawn(|| create_d3d().map(SendDevice));
+    *PREWARM.lock().unwrap_or_else(|e| e.into_inner()) = Some(h);
+}
+
+fn take_prewarmed() -> Option<ID3D11Device> {
+    let h = PREWARM.lock().unwrap_or_else(|e| e.into_inner()).take()?;
+    h.join().ok().flatten().map(|d| d.0)
+}
+
+/// The power-saving GPU first: DWM composes there anyway, and waking a discrete GPU costs half
+/// a second at start and battery afterwards. Then any hardware adapter, then WARP.
+fn create_d3d() -> Option<ID3D11Device> {
+    unsafe {
+        let flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+        let make = |a: Option<&IDXGIAdapter1>, kind| {
+            let mut d3d = None;
+            let a: Option<IDXGIAdapter> = a.and_then(|a| a.cast().ok());
+            D3D11CreateDevice(a.as_ref(), kind, HMODULE::default(), flags, None, D3D11_SDK_VERSION, Some(&mut d3d), None, None)
+                .ok()
+                .and(d3d)
+        };
+        let low: Option<IDXGIAdapter1> = CreateDXGIFactory2::<IDXGIFactory6>(DXGI_CREATE_FACTORY_FLAGS(0))
+            .and_then(|f| f.EnumAdapterByGpuPreference(0, DXGI_GPU_PREFERENCE_MINIMUM_POWER))
+            .ok();
+        low.as_ref()
+            .and_then(|a| make(Some(a), D3D_DRIVER_TYPE_UNKNOWN))
+            .or_else(|| make(None, D3D_DRIVER_TYPE_HARDWARE))
+            .or_else(|| make(None, D3D_DRIVER_TYPE_WARP))
     }
 }
 

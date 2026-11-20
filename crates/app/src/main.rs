@@ -40,6 +40,7 @@ pub fn start_loc(arg: &str) -> app::Loc {
 }
 
 fn main() {
+    win::trace("main");
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("--render") {
         std::process::exit(render::cli(&args[1..]));

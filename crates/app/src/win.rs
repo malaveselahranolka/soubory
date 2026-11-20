@@ -146,7 +146,9 @@ pub fn hand_over(path: Option<&Path>) -> bool {
 
 pub fn run(start: Loc) -> i32 {
     unsafe {
+        crate::gfx::prewarm();
         let _ = windows::Win32::System::Ole::OleInitialize(None);
+        crate::win::trace("ole");
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         allow_dark_menus();
         let hinst = GetModuleHandleW(None).unwrap_or_default();
@@ -210,10 +212,15 @@ pub fn open_window(loc: Loc, near: Option<HWND>) -> Option<HWND> {
     unsafe {
         let hinst = GetModuleHandleW(None).unwrap_or_default();
         let mut app = Box::new(App::new(loc));
+        crate::win::trace("app_new");
         crate::prefs::load(&mut app);
-        app.side_rows = crate::sidebar::build(&app.prefs.favorites);
+        // App::new built the sidebar without favorites; only they can change it.
+        if !app.prefs.favorites.is_empty() {
+            app.side_rows = crate::sidebar::build(&app.prefs.favorites);
+        }
         app.reload(None);
         let app_raw: *mut App = Box::into_raw(app);
+        crate::win::trace("prefs_sidebar_reload");
 
         // Initial size in DIPs, scaled for the primary monitor.
         let mut pt = POINT::default();
@@ -238,6 +245,7 @@ pub fn open_window(loc: Loc, near: Option<HWND>) -> Option<HWND> {
         );
         // shortcut: if creation fails before WM_NCCREATE the App leaks; it never does in practice.
         let Ok(hwnd) = hwnd else { return None };
+        crate::win::trace("create_window");
         let app = &mut *app_raw;
         setup_dwm(app);
         let _ = SetWindowPos(
@@ -251,6 +259,7 @@ pub fn open_window(loc: Loc, near: Option<HWND>) -> Option<HWND> {
         );
         set_title(app);
         watch_current(app);
+        crate::win::trace("dwm_title_watch");
         crate::droptarget::register(hwnd);
         let mut near_rect = RECT::default();
         if near.is_some_and(|n| GetWindowRect(n, &mut near_rect).is_ok() && !IsIconic(n).as_bool()) {
@@ -271,6 +280,7 @@ pub fn open_window(loc: Loc, near: Option<HWND>) -> Option<HWND> {
             let maximized = restored && app.prefs.window.is_some_and(|w| w.1);
             let _ = ShowWindow(hwnd, if maximized { SW_SHOWMAXIMIZED } else if restored { SW_SHOWNORMAL } else { SW_SHOWDEFAULT });
         }
+        crate::win::trace("shown");
         Some(hwnd)
     }
 }
@@ -457,6 +467,56 @@ fn dev_keys(app: &mut App, script: &str, out: Option<String>) {
     }
 }
 
+/// `--dev-startup FILE`: phase timings (ms since process creation) go to FILE.trace.
+pub fn trace(label: &str) {
+    static OUT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let out = OUT.get_or_init(|| {
+        let args: Vec<String> = std::env::args().collect();
+        args.iter().position(|a| a == "--dev-startup").and_then(|i| args.get(i + 1)).cloned()
+    });
+    let Some(out) = out else { return };
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(format!("{out}.trace")) {
+        let _ = writeln!(f, "{label}: {}", since_start_ms());
+    }
+}
+
+fn since_start_ms() -> u64 {
+    unsafe {
+        let (mut c, mut e, mut k, mut u) = Default::default();
+        if GetProcessTimes(GetCurrentProcess(), &mut c, &mut e, &mut k, &mut u).is_err() {
+            return 0;
+        }
+        let unix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+        let now = (unix.as_nanos() / 100) as u64 + 116_444_736_000_000_000;
+        let created: FILETIME = c;
+        let t = ((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64;
+        now.saturating_sub(t) / 10_000
+    }
+}
+
+/// `--dev-startup FILE`: after the first presented frame, writes the ms since the process was
+/// created (the cold-start budget is 300 ms).
+fn startup_probe() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let args: Vec<String> = std::env::args().collect();
+    let Some(out) = args.iter().position(|a| a == "--dev-startup").and_then(|i| args.get(i + 1)) else { return };
+    unsafe {
+        let (mut c, mut e, mut k, mut u) = Default::default();
+        if GetProcessTimes(GetCurrentProcess(), &mut c, &mut e, &mut k, &mut u).is_ok() {
+            let unix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+            let now = (unix.as_nanos() / 100) as u64 + 116_444_736_000_000_000; // FILETIME ticks
+            let created: FILETIME = c;
+            let t = ((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64;
+            let _ = std::fs::write(out, format!("{}", now.saturating_sub(t) / 10_000));
+        }
+    }
+}
+
 /// Dev/test runs (`--dev-*`) must not overwrite the user's saved window and view.
 fn dev_run() -> bool {
     std::env::args().any(|a| a.starts_with("--dev-"))
@@ -613,7 +673,10 @@ fn paint_now(app: &mut App) {
             (app.w * app.scale).round() as u32,
             (app.h * app.scale).round() as u32,
         );
-        if g.attach(app.hwnd, w, h).is_err() {
+        crate::win::trace("paint_begin");
+        let attached = g.attach(app.hwnd, w, h);
+        crate::win::trace("gfx_attach");
+        if attached.is_err() {
             app.gfx = Some(g);
             return;
         }
@@ -621,6 +684,7 @@ fn paint_now(app: &mut App) {
     let g = Rc::new(g);
     app.gfx_ref = Some(g.clone());
     let ok = g.frame(app.scale, |c| paint::paint(app, c));
+    crate::win::trace("frame");
     app.gfx_ref = None;
     let mut g = Rc::try_unwrap(g)
         .ok()
@@ -636,6 +700,9 @@ fn paint_now(app: &mut App) {
         }
     }
     app.gfx = Some(g);
+    if ok {
+        startup_probe();
+    }
     position_edits(app);
     crate::quicklook::follow(app);
 }
