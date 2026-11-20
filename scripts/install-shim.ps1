@@ -1,14 +1,18 @@
 ﻿<#
 .SYNOPSIS
-  Option 2 gate: puts fm_dialog_shim.dll in front of the system Open dialog, for the current user.
+  Option 2: puts fm_dialog_shim.dll in front of the system Open dialog, for the current user.
 .DESCRIPTION
-  The shim hands every Open dialog straight to Windows (comdlg32) and only writes one line per
-  dialog to %LOCALAPPDATA%\fm\shim.log: which app, its integrity level, and whether it would get
-  fm's own picker later. Nothing about files or folders is logged.
+  Claude.exe (and the apps listed in %LOCALAPPDATA%\fm\shim-allow.txt, one per line) get fm's own
+  picker for their Open dialog: from the running fm, or from an installed fm.exe new enough for
+  --pick. Whatever the picker cannot do, and every other app, goes straight to Windows (comdlg32).
+  One line per dialog goes to %LOCALAPPDATA%\fm\shim.log (inside a Store/MSIX app such as Claude:
+  %LOCALAPPDATA%\Packages\<app>\LocalCache\Local\fm\shim.log). Nothing about files or folders is
+  logged.
 
   Registers HKCU\Software\Classes\CLSID\{DC1C5A9C-…} (64-bit apps only), copies the DLL to its
-  own directory first and writes the key last. The file %LOCALAPPDATA%\fm\disable-shim stops only
-  its log; the shim stays in place. Remove: scripts\uninstall-shim.ps1. Emergency recovery:
+  own directory first and writes the key last. The file %LOCALAPPDATA%\fm\disable-shim turns the
+  picker and the log off (every dialog is Windows' again); the shim stays in place. Remove:
+  scripts\uninstall-shim.ps1. An app keeps the DLL it loaded until it is restarted. Emergency recovery:
     reg delete "HKCU\Software\Classes\CLSID\{DC1C5A9C-E88A-4dde-A5A1-60F82A20AEF7}" /f
   Run from your own 64-bit PowerShell (not from inside another app's sandbox). Tests pass
   -ClassesRoot, -RegRoot and -InstallDir.
@@ -57,10 +61,11 @@ if ($locked -or $stale.Count) { Register-DelCleanup $RegRoot $InstallDir } else 
 
 # The key last: it only ever points at a DLL that is already in place.
 New-KeyIfMissing "$key\InprocServer32"
-Set-ItemProperty $key -Name '(default)' -Value 'fm Option 2 gate (FileOpenDialog)'
+Set-ItemProperty $key -Name '(default)' -Value 'fm Option 2 (FileOpenDialog)'
 Set-ItemProperty "$key\InprocServer32" -Name '(default)' -Value $dll
 Set-ItemProperty "$key\InprocServer32" -Name 'ThreadingModel' -Value $threading
 if ((Get-Item "$key\InprocServer32").GetValue('') -ne $dll -or -not (Test-Path $dll)) { throw 'Registrace se nepovedla.' }
 
 Write-Host "Nainstalováno: $dll"
-Write-Host "Log: $env:LOCALAPPDATA\fm\shim.log  ·  vypnout log: soubor $env:LOCALAPPDATA\fm\disable-shim  ·  odinstalovat: scripts\uninstall-shim.ps1"
+Write-Host "Výběr souborů z fm dostane Claude.exe (další aplikace: $env:LOCALAPPDATA\fm\shim-allow.txt). Aplikace, která už dialog otevřela, potřebuje restart."
+Write-Host "Log: $env:LOCALAPPDATA\fm\shim.log (u Clauda v ...\Packages\Claude_…\LocalCache\Local\fm\)  ·  vypnout: soubor $env:LOCALAPPDATA\fm\disable-shim  ·  odinstalovat: scripts\uninstall-shim.ps1"

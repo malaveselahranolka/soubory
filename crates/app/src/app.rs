@@ -218,6 +218,8 @@ pub enum Hit {
     /// A group header (Group by): a click selects the group, as in Explorer.
     Group(usize),
     PaletteCard,
+    /// The picker's bottom bar (pick.rs codes).
+    Pick(u8),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -310,6 +312,8 @@ pub struct App {
     pub last_click: Option<(Instant, usize)>,
     /// Set by `--render`: paint without a window.
     pub offscreen: bool,
+    /// This window picks files for another app's Open dialog (pick.rs).
+    pub pick: Option<crate::pick::Picker>,
 }
 
 pub const DEFAULT_SIDEBAR: f32 = 208.0;
@@ -365,6 +369,7 @@ impl App {
             status_note: None,
             last_click: None,
             offscreen: false,
+            pick: None,
         };
         app.reload(None);
         app.relayout();
@@ -391,6 +396,7 @@ impl App {
             header: matches!(t.view, View::List)
                 || matches!(t.loc, Loc::Search { .. } | Loc::Recents),
             preview: (self.preview_on && self.w > 900.0).then_some(280.0),
+            pick: self.pick.is_some(),
         });
         self.clamp_scroll();
         // A taller window may fit the whole sidebar again; Koš then goes back to the bottom.
@@ -429,6 +435,7 @@ impl App {
         }
         let show_hidden = self.prefs.show_hidden;
         let folders_first = self.prefs.folders_first;
+        let file_types = crate::pick::filter_of(self);
         // By path: names repeat in tag places and Recents (two README.md from two folders).
         let (keep, focus_path): (Vec<PathBuf>, Option<PathBuf>) = {
             let t = self.tab();
@@ -465,6 +472,9 @@ impl App {
         };
         match res {
             Ok(mut v) => {
+                if let Some(f) = &file_types {
+                    v.retain(|e| crate::pick::shows(f, e));
+                }
                 // Drives carry their capacity, not an indexed size.
                 if !matches!(t.loc, Loc::Computer) {
                     crate::search::known_sizes(&mut v, &t.dir());
@@ -595,8 +605,11 @@ impl App {
         }
     }
 
-    /// Opens entry `i`: folders navigate, files open with their default app.
+    /// Opens entry `i`: folders navigate, files open with their default app (a picker picks them).
     pub fn open(&mut self, i: usize, new_tab: bool) {
+        if self.pick.is_some() && crate::pick::open(self, i).is_some() {
+            return;
+        }
         if matches!(self.tab().loc, Loc::Shell { .. }) {
             crate::shellns::open(self, i, new_tab);
             return;
@@ -613,6 +626,10 @@ impl App {
     }
 
     pub fn open_selection(&mut self) {
+        if self.pick.is_some() {
+            crate::pick::accept_selection(self);
+            return;
+        }
         let idx = self.tab().sel.indices();
         if idx.len() == 1 {
             self.open(idx[0], false);
@@ -1023,6 +1040,9 @@ impl App {
             }
             return if l.toolbar.contains(x, y) { Hit::Drag } else { Hit::None };
         }
+        if l.pick.is_some_and(|b| b.contains(x, y)) {
+            return crate::pick::hit(self, x, y);
+        }
         if l.toolbar.contains(x, y) {
             if l.sidebar_btn.contains(x, y) {
                 return Hit::SidebarBtn;
@@ -1141,6 +1161,7 @@ impl App {
             let keep = keep.clone();
             let items = self.items_in(&band);
             self.tab_mut().sel.set_many(items, &keep);
+            crate::pick::clamp(self);
         }
     }
 
@@ -1245,6 +1266,7 @@ impl App {
             Hit::Search => crate::win::focus_search(self),
             _ => {}
         }
+        crate::pick::clamp(self);
         crate::views::sync_columns(self);
         self.invalidate();
     }
@@ -1352,6 +1374,7 @@ impl App {
                 }
             }
             Hit::CrumbMenu(k) => crate::shell::crumb_menu(self, k),
+            Hit::Pick(k) => crate::pick::click(self, k),
             _ => {}
         }
         self.invalidate();
@@ -1602,6 +1625,8 @@ impl App {
             (VK_ESCAPE, ..) => {
                 if matches!(self.tab().loc, Loc::Search { .. }) {
                     crate::win::clear_search(self);
+                } else if self.pick.is_some() {
+                    crate::pick::cancel(self);
                 } else {
                     self.tab_mut().sel.clear();
                     self.invalidate();
@@ -1617,6 +1642,7 @@ impl App {
             }
             _ => return false,
         }
+        crate::pick::clamp(self);
         crate::views::sync_columns(self);
         true
     }

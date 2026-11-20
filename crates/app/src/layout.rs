@@ -12,6 +12,8 @@ pub const HEADER_H: f32 = 28.0;
 pub const STATUS_H: f32 = 28.0;
 pub const TABS_H: f32 = 32.0;
 pub const SCOPE_H: f32 = 36.0;
+/// The picker's bottom bar (file types, Zrušit, the OK button): the toolbar's height.
+pub const PICK_H: f32 = 52.0;
 pub const CARD_RADIUS: f32 = 8.0;
 pub const BTN_W: f32 = 32.0;
 pub const BTN_H: f32 = 28.0;
@@ -44,6 +46,8 @@ pub struct Layout {
     pub body: Rect,
     pub status: Rect,
     pub preview: Option<Rect>,
+    /// The picker's bottom bar, under the sidebar and the card.
+    pub pick: Option<Rect>,
 }
 
 pub struct LayoutIn {
@@ -58,6 +62,7 @@ pub struct LayoutIn {
     pub scope: bool,
     pub header: bool,
     pub preview: Option<f32>,
+    pub pick: bool,
 }
 
 pub fn compute(i: &LayoutIn) -> Layout {
@@ -95,7 +100,12 @@ pub fn compute(i: &LayoutIn) -> Layout {
         BTN_H,
     );
 
-    let below = full.cut_top(i.top + TOOLBAR_H);
+    let mut below = full.cut_top(i.top + TOOLBAR_H);
+    let pick = i.pick.then(|| {
+        let b = below.bottom(PICK_H);
+        below = below.cut_bottom(PICK_H);
+        b
+    });
     let sidebar = below.left(sw);
     let side_resize = Rect::new(sw - 3.0, below.y, 6.0, below.h);
     let card = below.cut_left(sw);
@@ -148,6 +158,7 @@ pub fn compute(i: &LayoutIn) -> Layout {
         body: inner,
         status,
         preview,
+        pick,
     }
 }
 
@@ -232,6 +243,7 @@ mod tests {
             scope: true,
             header: true,
             preview: None,
+            pick: false,
         });
         assert_eq!(l.card.x, 208.0);
         assert_eq!(l.scope.unwrap().y, l.tabs.unwrap().b());
@@ -256,11 +268,32 @@ mod tests {
             scope: false,
             header: false,
             preview: None,
+            pick: false,
         });
         assert_eq!(l.toolbar.y, 6.0);
         assert_eq!(l.back.y, 6.0 + (TOOLBAR_H - BTN_H) / 2.0);
         assert_eq!(l.card.y, 6.0 + TOOLBAR_H);
         assert!((l.status.b() - 800.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn picker_bar_spans_the_bottom() {
+        let l = compute(&LayoutIn {
+            w: 1000.0,
+            h: 700.0,
+            sidebar: Some(208.0),
+            caption_w: 3.0 * CAPTION_W,
+            top: 0.0,
+            tabs: false,
+            scope: false,
+            header: true,
+            preview: None,
+            pick: true,
+        });
+        let bar = l.pick.unwrap();
+        assert_eq!((bar.x, bar.w, bar.h), (0.0, 1000.0, PICK_H));
+        assert!((bar.b() - 700.0).abs() < 0.01);
+        assert!((l.status.b() - bar.y).abs() < 0.01 && (l.sidebar.b() - bar.y).abs() < 0.01);
     }
 
     #[test]

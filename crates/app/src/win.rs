@@ -38,6 +38,8 @@ const WM_APP_OPS_IDLE: u32 = WM_APP + 17;
 const WM_APP_OPEN: u32 = WM_APP + 20;
 /// `fm --quit` from another process (hub).
 const WM_APP_QUIT: u32 = WM_APP + 22;
+/// Open the pickers other apps' Open dialogs asked for (PICKS).
+const WM_APP_PICK: u32 = WM_APP + 23;
 
 /// Work still running off the windows: fm's own copy/move/delete threads ([`OpGuard`]) and the
 /// shell's (a drop from Explorer, Properties, Extract All) through the process reference below.
@@ -138,6 +140,8 @@ const TIMER_FS: usize = 1;
 const TIMER_NOTE: usize = 2;
 /// A close that came during a menu, drag or shell dialog, tried again (nested()).
 const TIMER_CLOSE: usize = 3;
+/// A picker checks that its host still waits (pick::tick).
+const TIMER_PICK: usize = 0xE3;
 const EDIT_SEARCH: usize = 100;
 const EDIT_RENAME: usize = 101;
 const EDIT_PATH: usize = 102;
@@ -407,6 +411,22 @@ unsafe extern "system" fn door_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
                 let _ = PostMessageW(hub, WM_APP_OPEN, WPARAM(0), LPARAM(0));
                 LRESULT(1)
             }
+            // Another app's Open dialog (fm_dialog_shim): the explicit ACK tells it a picker comes.
+            fm_dialog_shim::proto::COPY_PICK => {
+                let words = if cds.cbData < 2 || cds.lpData.is_null() {
+                    &[][..]
+                } else {
+                    std::slice::from_raw_parts(cds.lpData as *const u16, cds.cbData as usize / 2)
+                };
+                let Some(req) = fm_dialog_shim::proto::Request::decode(words) else { return LRESULT(0) };
+                let Ok(mut p) = PICKS.lock() else { return LRESULT(0) };
+                if QUITTING.load(std::sync::atomic::Ordering::SeqCst) {
+                    return LRESULT(0);
+                }
+                p.push(req.pipe);
+                let _ = PostMessageW(hub, WM_APP_PICK, WPARAM(0), LPARAM(0));
+                LRESULT(fm_dialog_shim::proto::ACK)
+            }
             _ => LRESULT(0),
         }
     }
@@ -414,7 +434,7 @@ unsafe extern "system" fn door_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
 
 /// The message loop of the process. `resident`: it stays when the last window closes, as Explorer
 /// does (folder opens are instant and the index stays warm); "Ukončit Soubory" ends it.
-pub fn run(raw: &str, cwd: &Path, background: bool, resident: bool) -> i32 {
+pub fn run(raw: &str, cwd: &Path, background: bool, resident: bool, pick: Option<&str>) -> i32 {
     RESIDENT.store(resident, std::sync::atomic::Ordering::SeqCst);
     unsafe {
         crate::gfx::prewarm();
@@ -483,14 +503,21 @@ pub fn run(raw: &str, cwd: &Path, background: bool, resident: bool) -> i32 {
         }
 
         // After OleInitialize: shell places (`::{…}`, `shell:`) parse through COM.
-        let first = if background { None } else { open_target(crate::target::parse(raw, cwd), None) };
+        let first = match pick {
+            Some(pipe) => crate::pick::start(pipe),
+            None if background => None,
+            None => open_target(crate::target::parse(raw, cwd), None),
+        };
         if first.is_none() && !resident {
             return 1;
         }
-        crate::search::start();
+        // A started picker has no index: searches filter the folder's listing (search.rs).
+        if pick.is_none() {
+            crate::search::start();
+        }
         // Recents reads every shortcut in Windows' Recent folder the first time; do that while
         // nobody waits for it.
-        if !dev_run() {
+        if !dev_run() && pick.is_none() {
             SetTimer(Some(hub()), TIMER_RECENTS, 3000, None);
         }
         if let Some(app) = first.and_then(|h| app_of(h).as_mut()) {
@@ -555,6 +582,9 @@ static RESIDENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::
 /// thread: (sender's folder, line).
 static PENDING: std::sync::Mutex<Vec<(PathBuf, String)>> = std::sync::Mutex::new(Vec::new());
 
+/// Pipes of pick requests the door took (fm_dialog_shim), opened by WM_APP_PICK on the UI thread.
+static PICKS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
 /// The process ends once no window is left, unless resident; a copy or move still running keeps
 /// it (windowless) until it ends.
 fn quit_if_done() {
@@ -601,7 +631,7 @@ pub fn open_target(t: crate::target::Target, near: Option<HWND>) -> Option<HWND>
     use crate::target::Target;
     match t {
         Target::Open { loc, select } => {
-            let h = open_window(loc, near)?;
+            let h = open_window(loc, near, None)?;
             if let Some(app) = unsafe { app_of(h).as_mut() } {
                 if select.is_some() {
                     app.reload(select.as_deref());
@@ -664,13 +694,20 @@ pub fn open_in_explorer(app: &mut App) {
 }
 
 /// Opens a main window on `loc`. `near`: cascade from that window (Ctrl+N, a second launch);
-/// otherwise it goes where the last window was closed.
-pub fn open_window(loc: Loc, near: Option<HWND>) -> Option<HWND> {
+/// otherwise it goes where the last window was closed. `pick`: a picker, centred over its host's
+/// window and foreground.
+pub fn open_window(loc: Loc, near: Option<HWND>, pick: Option<crate::pick::Picker>) -> Option<HWND> {
     unsafe {
         let hinst = GetModuleHandleW(None).unwrap_or_default();
         let mut app = Box::new(App::new(loc));
         crate::win::trace("app_new");
         crate::prefs::load(&mut app);
+        // Its listing (file types, hidden files) and layout (bottom bar) follow from the request.
+        let select = pick.as_ref().map(|p| p.req.name.clone()).filter(|n| !n.is_empty());
+        if let Some(p) = pick {
+            app.prefs.show_hidden |= p.req.hidden;
+            app.pick = Some(p);
+        }
         // App::new built the sidebar from default prefs; only favorites and saved searches differ.
         if !app.prefs.favorites.is_empty() || !app.prefs.saved.is_empty() {
             app.side_rows = crate::sidebar::build(&app.prefs);
@@ -725,7 +762,19 @@ pub fn open_window(loc: Loc, near: Option<HWND>) -> Option<HWND> {
         crate::win::trace("dwm_title_watch");
         crate::droptarget::register(hwnd);
         let mut near_rect = RECT::default();
-        if near.is_some_and(|n| GetWindowRect(n, &mut near_rect).is_ok() && !IsIconic(n).as_bool()) {
+        if app.pick.is_some() {
+            if select.is_some() {
+                app.reload(select.as_deref());
+            }
+            place_picker(app);
+            let _ = ShowWindow(hwnd, SW_SHOWNORMAL);
+            let _ = SetForegroundWindow(hwnd);
+            SetTimer(Some(hwnd), TIMER_PICK, 1000, None);
+            // The host stopped waiting meanwhile: nobody to pick for.
+            if app.pick.as_mut().is_some_and(|p| !p.ready()) {
+                close(app);
+            }
+        } else if near.is_some_and(|n| GetWindowRect(n, &mut near_rect).is_ok() && !IsIconic(n).as_bool()) {
             // Explorer and Finder offset a new window down and right of the current one.
             let off = (26.0 * app.scale) as i32;
             let _ = SetWindowPos(
@@ -745,6 +794,32 @@ pub fn open_window(loc: Loc, near: Option<HWND>) -> Option<HWND> {
         }
         crate::win::trace("shown");
         Some(hwnd)
+    }
+}
+
+/// A picker is dialog-sized and centred over its host's window, inside that monitor's work area.
+fn place_picker(app: &App) {
+    unsafe {
+        let owner = HWND(app.pick.as_ref().map_or(0, |p| p.req.owner) as *mut c_void);
+        let mut r = RECT::default();
+        let over_owner = !owner.is_invalid() && IsWindow(Some(owner)).as_bool() && !IsIconic(owner).as_bool() && GetWindowRect(owner, &mut r).is_ok();
+        let mon = MonitorFromWindow(if over_owner { owner } else { app.hwnd }, MONITOR_DEFAULTTONEAREST);
+        let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        if !GetMonitorInfoW(mon, &mut mi).as_bool() {
+            return;
+        }
+        let work = mi.rcWork;
+        if !over_owner {
+            r = work;
+        }
+        let (mut dx, mut dy) = (96u32, 96u32);
+        let _ = GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &mut dx, &mut dy);
+        let s = dx as f32 / 96.0;
+        let w = ((940.0 * s) as i32).min(work.right - work.left);
+        let h = ((620.0 * s) as i32).min(work.bottom - work.top);
+        let x = ((r.left + r.right) / 2 - w / 2).clamp(work.left, work.right - w);
+        let y = ((r.top + r.bottom) / 2 - h / 2).clamp(work.top, work.bottom - h);
+        let _ = SetWindowPos(app.hwnd, None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
     }
 }
 
@@ -842,6 +917,13 @@ unsafe extern "system" fn hub_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
                 quit_everything();
                 Some(LRESULT(0))
             }
+            WM_APP_PICK => {
+                let picks = PICKS.lock().map(|mut p| std::mem::take(&mut *p)).unwrap_or_default();
+                for pipe in picks {
+                    crate::pick::start(&pipe);
+                }
+                Some(LRESULT(0))
+            }
             // Restart Manager (an installer) asks to close the app: not while a copy runs.
             // Environment variables changed (System settings, an installer): only the session
             // window gets this broadcast, so it runs once.
@@ -857,7 +939,7 @@ unsafe extern "system" fn hub_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
                 // (a logoff ends the process anyway; Restart Manager may not).
                 if w.0 != 0 {
                     for_each_app(|a| {
-                        if !dev_run() {
+                        if !dev_run() && a.pick.is_none() {
                             crate::prefs::save(a);
                         }
                     });
@@ -987,27 +1069,41 @@ fn dev_flags(app: &mut App) {
         }
     }
     if let Some(script) = val("--dev-keys") {
-        dev_keys(app, &script, val("--dev-out"));
+        if !dev_keys(app, &script, val("--dev-out")) {
+            return;
+        }
     }
     app.invalidate();
 }
 
 /// `--dev-keys "sel:0,ctrl+d,wait:1500,dump,ctrl+z,…"`: feeds keys to the app's own key handler
 /// (never synthesized input), pumping messages between steps; `dump` appends the folder listing
-/// and the status note to `--dev-out`.
-fn dev_keys(app: &mut App, script: &str, out: Option<String>) {
+/// and the status note to `--dev-out`. False once a step closed the window (a picker's Enter or
+/// Esc): its App is gone, and the script stops there.
+fn dev_keys(app: &mut App, script: &str, out: Option<String>) -> bool {
     let mut log = String::new();
+    let hwnd = app.hwnd;
+    // False when the window went away; the process's WM_QUIT is posted again for the main loop.
     let pump = |ms: u64| unsafe {
         let start = std::time::Instant::now();
         while start.elapsed() < std::time::Duration::from_millis(ms) {
             let mut msg = MSG::default();
             while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                if msg.message == WM_QUIT {
+                    PostQuitMessage(msg.wParam.0 as i32);
+                    return false;
+                }
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
+            if !IsWindow(Some(hwnd)).as_bool() {
+                return false;
+            }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
+        true
     };
+    let mut alive = true;
     for step in script.split(',').map(str::trim) {
         let (mods, key) = match step.rsplit_once('+') {
             Some((m, k)) => (m, k),
@@ -1019,7 +1115,10 @@ fn dev_keys(app: &mut App, script: &str, out: Option<String>) {
                 app.tab_mut().sel.select_only(n);
             }
         } else if let Some(ms) = step.strip_prefix("wait:").and_then(|n| n.parse::<u64>().ok()) {
-            pump(ms);
+            if !pump(ms) {
+                alive = false;
+                break;
+            }
         } else if step == "go:bin" || step == "go:net" {
             let loc = if step == "go:bin" { crate::shellns::recycle_bin() } else { crate::shellns::network() };
             if let Some(l) = loc {
@@ -1119,16 +1218,21 @@ fn dev_keys(app: &mut App, script: &str, out: Option<String>) {
             let vk = match key {
                 "del" => VK_DELETE,
                 "enter" => VK_RETURN,
+                "esc" => VK_ESCAPE,
                 k if k.len() == 1 => VIRTUAL_KEY(k.to_ascii_uppercase().as_bytes()[0] as u16),
                 _ => continue,
             };
             app.key(vk, ctrl, shift, false);
-            pump(50);
+            if !pump(50) {
+                alive = false;
+                break;
+            }
         }
     }
     if let Some(o) = out {
         let _ = std::fs::write(o, log);
     }
+    alive
 }
 
 /// `--dev-startup FILE`: phase timings (ms since process creation) go to FILE.trace.
@@ -1274,6 +1378,15 @@ pub fn set_title(app: &App) {
     if app.offscreen || app.hwnd.is_invalid() {
         return;
     }
+    // A picker carries its dialog's title and stays out of the shell's window list ("Show in
+    // folder" must not navigate it).
+    if let Some(p) = &app.pick {
+        let t = wide(p.title());
+        unsafe {
+            let _ = SetWindowTextW(app.hwnd, PCWSTR(t.as_ptr()));
+        }
+        return;
+    }
     // Every navigation and tab switch passes here.
     crate::shellwin::sync(app);
     let t = wide(&app.tab().loc.title());
@@ -1339,7 +1452,7 @@ pub fn new_window(app: &App) {
         Loc::Search { .. } => crate::fsys::known_folder(&FOLDERID_Profile).map_or(Loc::Computer, Loc::Folder),
         other => other.clone(),
     };
-    if let Some(h) = open_window(loc, Some(app.hwnd)) {
+    if let Some(h) = open_window(loc, Some(app.hwnd), None) {
         unsafe {
             let _ = SetForegroundWindow(h);
         }
@@ -2669,6 +2782,7 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                         let _ = KillTimer(Some(hwnd), TIMER_CLOSE);
                         let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
                     }
+                    TIMER_PICK => crate::pick::tick(app),
                     crate::droptarget::TIMER => crate::droptarget::tick(app),
                     _ => crate::shell::timer(app, wparam.0),
                 }
@@ -2715,7 +2829,8 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                     return LRESULT(0);
                 }
                 crate::quicklook::close();
-                if !dev_run() {
+                // A picker's size, place and forced hidden files are not the user's defaults.
+                if !dev_run() && app.pick.is_none() {
                     crate::prefs::save(app);
                 }
                 let _ = DestroyWindow(hwnd);

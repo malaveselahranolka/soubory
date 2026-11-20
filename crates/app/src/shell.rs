@@ -182,7 +182,7 @@ fn new_menu(dir: &Path) -> Option<IContextMenu> {
     }
 }
 
-fn append(m: HMENU, id: u32, text: &str, checked: bool, enabled: bool) {
+pub(crate) fn append(m: HMENU, id: u32, text: &str, checked: bool, enabled: bool) {
     let w = wide(text);
     let mut flags = MF_STRING;
     if checked {

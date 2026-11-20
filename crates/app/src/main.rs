@@ -4,6 +4,7 @@
 //! `fm [place]` opens a window on a folder, file or shell place in Explorer's syntax (`target.rs`). `fm --render <out.png> [options]` paints one frame offscreen
 //! (visual tests; see `render.rs`). `fm --set-default` / `fm --restore-explorer` make fm the
 //! default for folders for the current user and undo it (`defaultfm.rs`; the installer runs them).
+//! `fm --pick <pipe>` is another app's Open dialog (`pick.rs`, started by fm_dialog_shim.dll).
 
 mod app;
 mod batch;
@@ -19,6 +20,7 @@ mod icons;
 mod layout;
 mod paint;
 mod phosphor;
+mod pick;
 mod palette;
 mod prefs;
 mod quicklook;
@@ -55,9 +57,13 @@ fn main() {
         win::ask_quit();
         return;
     }
+    // `fm --pick <pipe>`: fm_dialog_shim started this picker because no resident fm took the
+    // request. It runs inside the dialog host's app package view (an MSIX app's AppData), so it
+    // never joins or becomes the resident fm, keeps no index and saves nothing (pick.rs).
+    let pick = (args.first().map(String::as_str) == Some("--pick")).then(|| args.get(1).cloned().unwrap_or_default());
     // Test runs (`--dev-*`, `--new-instance`) never join a running instance and end with their
     // last window; any other fm stays resident like Explorer (`--background`: no window, at logon).
-    let solo = args.iter().any(|a| a.starts_with("--dev-") || a == "--new-instance");
+    let solo = pick.is_some() || args.iter().any(|a| a.starts_with("--dev-") || a == "--new-instance");
     let background = args.iter().any(|a| a == "--background");
     let raw = target::raw_tail();
     let cwd = std::env::current_dir().unwrap_or_default();
@@ -77,7 +83,7 @@ fn main() {
         // Nor its environment (a terminal's, an installer's).
         win::refresh_env();
     }
-    let code = win::run(&raw, &cwd, background, resident);
+    let code = win::run(&raw, &cwd, background, resident, pick.as_deref());
     // Everything is saved by now (prefs on close, the index in search::stop, the clipboard
     // flushed). Leave without running any DLL's exit code: the Intel D3D11 driver
     // (igd10um64xe.dll) can spin forever in its process-detach after ExitProcess has killed the

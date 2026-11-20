@@ -20,6 +20,9 @@ pub struct Pane {
 impl Pane {
     pub fn load(app: &App, dir: &Path) -> Pane {
         let mut entries = fsys::list_dir(dir, app.prefs.show_hidden).unwrap_or_default();
+        if let Some(f) = crate::pick::filter_of(app) {
+            entries.retain(|e| crate::pick::shows(&f, e));
+        }
         crate::search::known_sizes(&mut entries, dir);
         let t = app.tab();
         fsys::sort(&mut entries, t.sort, t.asc, app.prefs.folders_first);

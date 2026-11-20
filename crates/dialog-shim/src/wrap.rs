@@ -411,7 +411,7 @@ unsafe extern "system" fn show(this: *mut c_void, owner: HWND) -> HRESULT {
         let d = me(this);
         let real_show = || (d.vt().base__.base__.Show)(d.raw(), owner);
         // The real dialog took every setter, so it knows the options best (defaults included).
-        let opts = d.real.GetOptions().unwrap_or_default().0 as u32;
+        let opts = d.real.GetOptions().unwrap_or_default().0;
         let line = |decision: &str, outcome: &str| log_line(&format!("Show\topts={opts:#010x}\t{decision}\t{outcome}"));
         let (why, mut req) = {
             let mut st = d.st();
@@ -420,9 +420,9 @@ unsafe extern "system" fn show(this: *mut c_void, owner: HWND) -> HRESULT {
                 Some("kill switch".to_string())
             } else if let Some(w) = &st.delegate {
                 Some(w.clone())
-            } else if opts & FOS_PICKFOLDERS.0 as u32 != 0 {
+            } else if opts & FOS_PICKFOLDERS.0 != 0 {
                 Some("pick folders".into())
-            } else if opts & FOS_ALLNONSTORAGEITEMS.0 as u32 != 0 {
+            } else if opts & FOS_ALLNONSTORAGEITEMS.0 != 0 {
                 Some("non-storage items".into())
             } else {
                 None
@@ -435,8 +435,8 @@ unsafe extern "system" fn show(this: *mut c_void, owner: HWND) -> HRESULT {
             return hr;
         }
         req.owner = owner.0 as isize;
-        req.multi = opts & FOS_ALLOWMULTISELECT.0 as u32 != 0;
-        req.hidden = opts & FOS_FORCESHOWHIDDEN.0 as u32 != 0;
+        req.multi = opts & FOS_ALLOWMULTISELECT.0 != 0;
+        req.hidden = opts & FOS_FORCESHOWHIDDEN.0 != 0;
         let hosts = crate::pick::Hosts::from_env();
         let r = std::panic::catch_unwind(AssertUnwindSafe(|| crate::pick::run(&mut req, owner, &hosts))).unwrap_or_else(|_| Err("panic".into()));
         let why = match r {

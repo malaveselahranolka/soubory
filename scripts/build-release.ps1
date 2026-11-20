@@ -5,7 +5,7 @@
   dist\dialogkit\            fm-dialogkit.exe, fm_dialog_hook.dll
   dist\dialogkit\x86\        32-bit helper and hook (reaches 32-bit Open/Save dialogs)
   dist\app\                  fm.exe and THIRD-PARTY-NOTICES.txt (when the app crate exists)
-  dist\shim\                 fm_dialog_shim.dll (Option 2 gate, 64-bit only)
+  dist\shim\                 fm_dialog_shim.dll (Option 2, 64-bit only)
 #>
 param([switch]$SkipX86)
 $ErrorActionPreference = 'Stop'

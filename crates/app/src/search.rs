@@ -530,6 +530,9 @@ pub fn resort(app: &mut App) {
 /// Replaces the results, keeping the selection on the same paths (live updates).
 fn set_entries(app: &mut App, mut entries: Vec<Entry>) {
     let folders_first = app.prefs.folders_first;
+    if let Some(f) = crate::pick::filter_of(app) {
+        entries.retain(|e| crate::pick::shows(&f, e));
+    }
     known_sizes(&mut entries, Path::new(""));
     let t = app.tab_mut();
     if !t.by_rank {

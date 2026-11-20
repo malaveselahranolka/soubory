@@ -163,7 +163,7 @@ pub fn to_bytes(w: &[u16]) -> Vec<u8> {
 }
 
 pub fn from_bytes(b: &[u8]) -> Option<Vec<u16>> {
-    (b.len() % 2 == 0).then(|| b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect())
+    b.len().is_multiple_of(2).then(|| b.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect())
 }
 
 #[cfg(test)]

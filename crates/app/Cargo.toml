@@ -16,3 +16,4 @@ windows-core = { workspace = true }
 windows-numerics = "0.3"
 fm-fs = { workspace = true }
 fm-index = { workspace = true }
+fm-dialog-shim = { path = "../dialog-shim" }

@@ -117,6 +117,7 @@ pub fn paint(app: &mut App, c: &mut Canvas) {
     }
     drop_highlight(app, c, &t);
     status(app, c, &t);
+    crate::pick::paint(app, c, &t);
     crate::batch::paint(app, c, &t);
     crate::palette::paint(app, c, &t);
 }

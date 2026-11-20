@@ -1,6 +1,7 @@
 //! Offscreen rendering for visual checks: the real paint code into a PNG, no window and no screen
 //! capture. `fm --render out.png --path C:\x [--w 1100 --h 700 --scale 1.5 --theme dark
-//! --view icons --select 0,2 --hover 3 --tabs 2 --kb --inactive --nosidebar --preview]`
+//! --view icons --select 0,2 --hover 3 --tabs 2 --kb --inactive --nosidebar --preview
+//! --pick [--ok Nahrát]]`
 //! `fm --render out.png --glyphs E700-E7FF` draws a labelled glyph sheet.
 //! `fm --render out.png --icons [--scale 1.25]` draws fm's own icons on light, dark and high contrast.
 //! `fm --render <dir> --brand` writes the app icon frames and the setup wizard's images (`brand.rs`).
@@ -88,6 +89,17 @@ pub fn cli(args: &[String]) -> i32 {
             scope,
         };
         crate::search::run(&mut app);
+    }
+    if args.iter().any(|a| a == "--pick") {
+        // A picker's bottom bar, with the file types an app might give (`--ok` its button).
+        app.pick = Some(crate::pick::Picker::offline(fm_dialog_shim::proto::Request {
+            ok: arg(args, "--ok").unwrap_or("").into(),
+            filters: vec![("Obrázky".into(), "*.png;*.jpg;*.jpeg".into()), ("Všechny soubory".into(), "*.*".into())],
+            index: 1,
+            multi: true,
+            ..Default::default()
+        }));
+        app.reload(None);
     }
     app.relayout();
     if let Some(sel) = arg(args, "--select") {

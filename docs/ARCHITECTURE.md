@@ -98,15 +98,20 @@ Coverage of "every dialog" in v1:
   - Ctrl+N opens the menu, registered only while a dialog is in the foreground. Never a Ctrl+Alt chord: Ctrl+Alt+N is AltGr+N, which types `}` on the Czech layout. The dialog's native Ctrl+Shift+N still creates folders.
 - **Higher-integrity targets:** skipped, logged once.
 
-**Option 2: HKCU COM override plus a forwarding shim.**
+**Option 2: HKCU COM override plus a forwarding shim** (built in M10, 2026-11-20; `crates/dialog-shim`, `crates/app/src/pick.rs`).
 - **Registration.** `fm_dialog_shim.dll` under `HKCU\Software\Classes\CLSID\{DC1C5A9C-E88A-4dde-A5A1-60F82A20AEF7}`, 64-bit view only, by script. This is [Files'](https://github.com/files-community/Files/tree/main/src/Files.App.OpenDialog) technique; see their failures in [#15275](https://github.com/files-community/Files/issues/15275) and [#6314](https://github.com/files-community/Files/issues/6314).
-- **Default path.** `DllGetClassObject` returns **comdlg32's own factory** (path taken from HKLM `InprocServer32`) outside the allowlist, and also for elevated processes, `explorer.exe`, or when the kill switch is set.
-- **Allowlisted processes** get a forwarding wrapper. Only `Show()` decides:
-  - Use our picker only for Open, when the options include none of `FOS_PICKFOLDERS`, `FOS_ALLOWMULTISELECT` or `FOS_ALLNONSTORAGEITEMS`, `Advise` was never called and `IFileDialogCustomize` was never requested. Everything else goes to the original `Show()`.
-  - The picker honors `SetFolder`, `SetDefaultFolder`, `SetFileName` and `SetFileTypes`/`SetFileTypeIndex`. After `Show()`, `GetResult`, `GetResults` (a one-item array) and `GetFolder` answer from our result.
-  - Run `fm.exe --pick … --result-file <random temp>` and wait on the process handle while pumping messages.
-  - Re-enable the owner on every path.
-  - If the launch fails or the picker crashes, fall back to the original `Show()`. Every export is wrapped in `catch_unwind`.
+- **Default path.** `DllGetClassObject` returns **comdlg32's own factory** (path taken from HKLM `InprocServer32`) outside the allowlist, and also for elevated processes, AppContainer processes, `explorer.exe`, or when the kill switch is set. The allowlist is `Claude.exe` (the M9 gate saw its dialog come through the override) plus `shim-allow.txt`.
+- **Allowlisted processes** get our class factory. Its dialog is a hand-written COM object (`wrap.rs`, not `#[implement]`: an unknown `QueryInterface` must hand back the real dialog's interface) that forwards every call to comdlg32's real dialog and records what the picker needs: title, OK label, `SetFolder`, `SetDefaultFolder`, `SetFileName`, `SetFileTypes`/`SetFileTypeIndex`. Every method is inside `catch_unwind`.
+- **Delegate** (the real `Show()`, logged with the reason) when the host called `Advise` or `SetFilter`, successfully asked for any other interface (`IFileDialogCustomize`, `IFileDialog2`, `IObjectWithSite`, …; COM's own marshaling and agility probes are answered "no" and change nothing), or the options (read from the real dialog) include `FOS_PICKFOLDERS` or `FOS_ALLNONSTORAGEITEMS`. Multiselect is supported.
+- **Transport: a named pipe**, `\\.\pipe\fm-pick-<pid>-<random>`, created by the shim (message mode, one instance, local clients only, the client's process id checked). Not a file: an MSIX host such as Claude has its `%LOCALAPPDATA%` writes redirected into its package, and a process it starts inherits that view.
+  1. **The resident fm** (preferred: it runs outside the package with the real prefs, tags and index). The shim sends its door window a `WM_COPYDATA` (`COPY_PICK`, a versioned request: pipe, owner, title, OK label, folders, file name, file types and index, multiselect, hidden files). Only the return value `ACK` counts; an older fm answers 0.
+  2. Otherwise **`fm.exe --pick <pipe>`**: the exe from the Run value "Soubory" or App Paths, started only if it carries the `fm-pick=1` RCDATA marker (an older fm would read `--pick` as a folder to open). It never joins or becomes the resident fm, keeps no index (search filters the folder's listing) and saves nothing.
+  3. Otherwise, or on any failure before the picker answers, the real `Show()`.
+- **Protocol** (`proto.rs`, shared by both sides): fm connects and reads the request from the pipe (both ways in), sends `Ready` once its window is up, which ends the shim's 10 s connect clock, then exactly one `Picked(paths)` or `Cancelled`. A pipe that breaks without an answer means the picker is gone (killed, crashed): the real `Show()`. Cancel returns `HRESULT_FROM_WIN32(ERROR_CANCELLED)`.
+- **Waiting** on the dialog's thread: `MsgWaitForMultipleObjectsEx` on the pipe and the started process, pumping messages (a `WM_QUIT` is posted again and counts as cancel). The owner is disabled meanwhile if it was enabled, enabled again on every path, and given the foreground back (fm allows that before it closes).
+- **After `Show()`**, `GetResult`, `GetResults` (every picked item, `SHCreateShellItemArrayFromIDLists`) and `GetFolder` answer from our result; the shim checks first that each path is an existing file. `GetFileName` still answers what `SetFileName` set (Electron never asks).
+- **The picker** is a normal top-level fm window (no cross-process owner, see dialog helper), centred over the owner and in the foreground, with the same sidebar, views and search, starting in `SetFolder`, else the last picker's folder, else `SetDefaultFolder`, else Documents. A bottom bar holds the file type (a native menu; non-matching files are hidden, folders always shown), "Zrušit" and the dialog's OK label ("Otevřít" by default). Double-click and Enter pick files and open folders; a single-select dialog keeps one item selected; Esc and closing the window cancel. It saves no prefs, stays out of the shell's window list and closes by itself once a second check finds the host gone.
+- **Log:** one `shim.log` line per `Show()`: options, decision with its reason (`picker (resident|child)`, `delegate: …`, `fallback: …`) and outcome (`picked N`, `cancelled`, the system dialog's result). Never a path or a title.
 
 **Explorer replacement (2026-11-20, the user's answers):** folder windows only; the desktop, taskbar and Start stay Windows'. Control Panel and other places fm does not show stay Explorer's.
 - Per-user verbs (`fm --set-default` / `fm --restore-explorer` in `defaultfm.rs`, the installer's way; `scripts/set-default-fm.ps1` / `restore-explorer.ps1` write the same keys and backup, so either undoes the other; HKCU only, per-entry backup): Directory and Drive `open`, Folder `explore`, Win+E (`{52205fd8…}`), This PC, Recycle Bin and Network. Every command key carries an empty `DelegateExecute`, or HKLM's leaks through the merged view.
@@ -120,12 +125,12 @@ Coverage of "every dialog" in v1:
 
 | Process | Runs as | Lifetime | IPC |
 |---|---|---|---|
-| `fm.exe` | user | Single instance (`Local\fm.main`); a second launch hands over its command line and folder via `WM_COPYDATA`. Owns the index. Resident: `--background` at sign-in (HKCU Run), stays when the last window closes | none |
-| `fm.exe --pick` | user | One per dialog call, no index | result file |
+| `fm.exe` | user | Single instance (`Local\fm.main`); a second launch hands over its command line and folder via `WM_COPYDATA`. Owns the index. Resident: `--background` at sign-in (HKCU Run), stays when the last window closes. Opens pickers for the shim | door window: `WM_COPYDATA` (handover, `--quit`, pick requests); named pipe per picker |
+| `fm.exe --pick <pipe>` | user, inside the host's package view | One per dialog call when no resident fm takes it; never resident, no index, saves nothing | named pipe |
 | `fm-dialogkit.exe` | user | HKCU `Run`, set by the install script | none |
 | `x86\fm-dialogkit.exe --inject` | user | One per request to a 32-bit dialog | stdout |
 | `fm_dialog_hook.dll` (x64, x86) | dialog host's UI thread | Loaded per request, pinned until the host exits | registered message → `WM_COPYDATA` |
-| `fm_dialog_shim.dll` | allowlisted host | Experiment | starts the picker |
+| `fm_dialog_shim.dll` | every 64-bit host's Open dialog; the picker only for allowlisted ones (Claude.exe) | One dialog object per dialog | `WM_COPYDATA` to fm's door, or starts `fm.exe --pick`; named pipe |
 | `fm-indexd` (v2) | service | Elevated script | named pipe |
 
 ## 3. Cargo workspace
@@ -349,17 +354,23 @@ Preconditions:
 - Status (gate build, 2026-11-20): `crates/dialog-shim`, `scripts/install-shim.ps1`, `scripts/uninstall-shim.ps1`.
   - The shim always returns comdlg32's own factory (from the HKLM `InprocServer32`, never through COM). It logs one line per `DllGetClassObject` to `%LOCALAPPDATA%\fm\shim.log`: process, interface, integrity level, AppContainer, the routing decision for `shim-allow.txt` (empty by default), and the modules on the call stack, which shows whether `comdlg32` (legacy `GetOpenFileName`) or the app itself created the dialog. No paths are logged.
   - The per-method wrapper is deliberately not built: it is the risky part and only makes sense if the gate passes.
+  - Gate result (user's machine, 2026-11-20): `Claude.exe FileOpenDialog IClassFactory medium appcontainer=0 pass (not allowlisted) hr=0 combase.dll<Claude.exe`: Claude's dialog comes through the override, so M10 was built for it. Nothing is known yet about Notepad, Chrome, Paint or Office.
   - [A] passed: routing unit test; `tests/harness.rs` loads a temp copy of the DLL with no registry and creates a real `IFileOpenDialog` through it, with the kill switch off (one log line) and on (none); `scripts/dev/test-shim.ps1` (21 checks: key written last and removed first, ThreadingModel copied from HKLM, a locked DLL set aside with its own RunOnce cleanup, another app's override neither replaced nor removed, dialogkit uninstall leaves the shim, real-keys guard).
   - Gate run (user, own 64-bit PowerShell): `scripts\build-release.ps1 -SkipX86`, `scripts\install-shim.ps1`, open File → Open in Notepad, Chrome, Paint and Office, then read `%LOCALAPPDATA%\fm\shim.log` and `scripts\uninstall-shim.ps1`. Recovery: `reg delete "HKCU\Software\Classes\CLSID\{DC1C5A9C-E88A-4dde-A5A1-60F82A20AEF7}" /f`.
 
 **M10: Option 2 picker**
-- Scope: `fm.exe --pick`, built on the M6 and M7 views including the New menu, plus the `Show()` integration (§2).
+- Scope: the forwarding wrapper and pipe transport in the shim, the picker in fm (the resident's door and `fm.exe --pick`), built on the M6 and M7 views; the `Show()` integration (§2). First host: Claude.exe (Electron's `file_dialog_win.cc`: raw `IFileOpenDialog`, `SetOptions` once, `SetFileName` always, `SetFolder` only for an absolute default path, no `Advise`, no `IFileDialogCustomize`, `GetResults` even for one item; `Show()` may run on a dialog thread).
 - Acceptance:
-  - [A] Delegation tests for customize, Save, multiselect, `FOS_PICKFOLDERS`, `FOS_ALLNONSTORAGEITEMS` and `Advise`.
-  - [A] A filter round-trip: `SetFileTypes` reaches the picker, and `GetResult` and `GetResults` return the picked item.
-  - [M] Notepad Open returns the file picked in our picker, and cancel works.
+  - [A] Delegation tests for customize, `FOS_PICKFOLDERS` and `Advise` (`FOS_ALLNONSTORAGEITEMS` and `SetFilter` take the same path). Save never reaches the shim (only CLSID_FileOpenDialog is registered).
+  - [A] A filter round-trip: the setters reach the picker, and `GetResult`, `GetResults` (one and several items) and `GetFolder` return the pick; cancel returns `ERROR_CANCELLED`; a picker that never connects, an fm that refuses and no fm.exe all end in the system dialog; the owner is disabled while the picker is up and enabled after.
+  - [A] A real `fm --pick` through the shim's transport: file types filter the folder, a single pick, a multiselect pick, Ctrl+A in a single-select dialog, Esc.
+  - [M] Claude's "attach file" returns the file(s) picked in our picker, and cancel works.
   - [M] Killing the picker brings up the system dialog with no hang.
   - [M] Uninstall leaves no registry keys at once and no files after the next sign-in.
+- Status (2026-11-20, branch of `window-fixes`):
+  - [A] passed: `cargo test -p fm-dialog-shim` (protocol round trips and refusals, routing, `tests/harness.rs` with a stand-in door: every case above), `cargo test -p fm-app` (file-type matching, start folder, the filtered listing and single-select clamp), `cargo test -p fm-app --test pick -- --ignored` (the real `fm --pick`), `scripts/dev/test-shim.ps1`.
+  - Not covered automatically: the resident fm's door taking a request (needs a second resident beside the user's), anything inside the real Claude (does its packaged process see fm's door and `shim-allow.txt`, does the foreground come back, which thread and interface Electron really uses). The `shim.log` lines of the next real run answer these.
+  - Try it (user, own 64-bit PowerShell): `scripts\build-release.ps1 -SkipX86`, `scripts\install-fm.ps1` (the resident fm must be this build to take requests; an older one makes the shim show the system dialog), `scripts\install-shim.ps1`, quit and restart Claude, attach a file. Off again: the file `%LOCALAPPDATA%\fm\disable-shim`, or `scripts\uninstall-shim.ps1`.
 
 **Later:** column view, Quick Look, Recents, view memory, tabs, the USN service (and a probe of the undocumented `FSCTL_READ_UNPRIVILEGED_USN_JOURNAL` for an exact catch-up after restart), an elevated dialogkit, the redesign.
 
@@ -386,7 +397,7 @@ Preconditions:
 - **Ctrl+Z:** the Recycle Bin covers deletes.
 - **Dark mode, Mica, thumbnails, tags, icon/gallery views:** these come with the redesign.
 - **Network drives:** RDCW is unreliable over SMB.
-- **Option 2 Save, multiselect, folder pickers, 32-bit and ARM64:** outside the experiment.
+- **Option 2 Save, folder pickers, 32-bit and ARM64:** outside the experiment (multiselect is in since M10).
 - **`IExplorerBrowser`:** it brings Explorer's slowness and can't be reskinned.
 
 ## 9. Open questions for the user
