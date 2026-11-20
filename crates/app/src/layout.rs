@@ -50,6 +50,8 @@ pub struct LayoutIn {
     pub w: f32,
     pub h: f32,
     pub sidebar: Option<f32>,
+    /// Width of the caption buttons at the top right.
+    pub caption_w: f32,
     pub tabs: bool,
     pub scope: bool,
     pub header: bool,
@@ -60,8 +62,9 @@ pub fn compute(i: &LayoutIn) -> Layout {
     let full = Rect::new(0.0, 0.0, i.w, i.h);
     let toolbar = full.top(TOOLBAR_H);
     let mut caption = [Rect::default(); 3];
+    let cw = i.caption_w / 3.0;
     for (k, c) in caption.iter_mut().enumerate() {
-        *c = Rect::new(i.w - CAPTION_W * (3 - k) as f32, 0.0, CAPTION_W, CAPTION_H);
+        *c = Rect::new(i.w - cw * (3 - k) as f32, 0.0, cw, CAPTION_H);
     }
     let cy = (TOOLBAR_H - BTN_H) / 2.0;
     let sidebar_btn = Rect::new(12.0, cy, BTN_W, BTN_H);
@@ -74,7 +77,7 @@ pub fn compute(i: &LayoutIn) -> Layout {
     let back = Rect::new(nav_x, cy, BTN_W, BTN_H);
     let fwd = back.offset(BTN_W, 0.0);
     // Right group, from the caption buttons leftwards.
-    let right_end = i.w - CAPTION_W * 3.0 - 12.0;
+    let right_end = i.w - i.caption_w - 12.0;
     let search_w = if i.w < 760.0 { 150.0 } else { SEARCH_W };
     let search = Rect::new(right_end - search_w, cy, search_w, BTN_H);
     let more = Rect::new(search.x - 8.0 - BTN_W, cy, BTN_W, BTN_H);
@@ -221,6 +224,7 @@ mod tests {
             w: 1200.0,
             h: 800.0,
             sidebar: Some(208.0),
+            caption_w: 3.0 * CAPTION_W,
             tabs: true,
             scope: true,
             header: true,

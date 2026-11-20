@@ -132,6 +132,8 @@ fn register_proc_ref() {
 const TIMER_DRIVES: usize = 0xD1;
 /// Ends the window in which fm's own Explorer launch is let through (hub).
 const TIMER_EXPLORER: usize = 0xE1;
+/// Hub timer: reads the Recent folder's shortcuts ahead of the first visit.
+const TIMER_RECENTS: usize = 0xE2;
 const TIMER_FS: usize = 1;
 const TIMER_NOTE: usize = 2;
 /// A close that came during a menu, drag or shell dialog, tried again (nested()).
@@ -486,6 +488,11 @@ pub fn run(raw: &str, cwd: &Path, background: bool, resident: bool) -> i32 {
             return 1;
         }
         crate::search::start();
+        // Recents reads every shortcut in Windows' Recent folder the first time; do that while
+        // nobody waits for it.
+        if !dev_run() {
+            SetTimer(Some(hub()), TIMER_RECENTS, 3000, None);
+        }
         if let Some(app) = first.and_then(|h| app_of(h).as_mut()) {
             dev_flags(app);
         }
@@ -867,6 +874,11 @@ unsafe extern "system" fn hub_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
             WM_TIMER if w.0 == TIMER_DRIVES => {
                 let _ = KillTimer(Some(hwnd), TIMER_DRIVES);
                 drives_changed();
+                Some(LRESULT(0))
+            }
+            WM_TIMER if w.0 == TIMER_RECENTS => {
+                let _ = KillTimer(Some(hwnd), TIMER_RECENTS);
+                crate::shell::recent_items(200);
                 Some(LRESULT(0))
             }
             WM_TIMER => {
@@ -2294,6 +2306,12 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
             return DefWindowProcW(hwnd, msg, wparam, lparam);
         }
         let app = &mut *ptr;
+        // The frame covers the whole window (Mica), so Windows draws the minimize, maximize and
+        // close buttons over the toolbar; DWM hit-tests, highlights and clicks them (Snap Layouts too).
+        let mut dwm = LRESULT(0);
+        if DwmDefWindowProc(hwnd, msg, wparam, lparam, &mut dwm).as_bool() {
+            return dwm;
+        }
         if let Some(r) = crate::shell::menu_message(hwnd, msg, wparam, lparam) {
             return r;
         }
@@ -2340,47 +2358,22 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                 }
                 let (x, y) = (p.x as f32 / app.scale, p.y as f32 / app.scale);
                 match app.hit(x, y) {
-                    Hit::Caption(Cap::Max) => LRESULT(HTMAXBUTTON as isize),
                     Hit::Drag if !path_editing(app) => LRESULT(HTCAPTION as isize),
                     _ => LRESULT(HTCLIENT as isize),
                 }
             }
             WM_NCMOUSEMOVE => {
-                if wparam.0 == HTMAXBUTTON as usize {
-                    if app.hover != Hit::Caption(Cap::Max) {
-                        app.hover = Hit::Caption(Cap::Max);
-                        track_leave(hwnd, true);
-                        app.invalidate();
-                    }
-                    return LRESULT(0);
-                }
                 if app.hover != Hit::None {
                     app.hover = Hit::None;
                     app.invalidate();
                 }
                 DefWindowProcW(hwnd, msg, wparam, lparam)
             }
-            WM_NCLBUTTONDOWN if wparam.0 == HTMAXBUTTON as usize => {
-                app.pressed = Hit::Caption(Cap::Max);
-                app.invalidate();
-                LRESULT(0)
-            }
-            WM_NCLBUTTONUP if wparam.0 == HTMAXBUTTON as usize => {
-                if app.pressed == Hit::Caption(Cap::Max) {
-                    caption(app, Cap::Max);
-                }
-                app.pressed = Hit::None;
-                app.invalidate();
-                LRESULT(0)
-            }
             WM_NCMOUSELEAVE | WM_MOUSELEAVE => {
                 if !matches!(app.drag, Drag::None) {
                     return LRESULT(0);
                 }
                 app.hover = Hit::None;
-                if msg == WM_NCMOUSELEAVE && app.pressed == Hit::Caption(Cap::Max) {
-                    app.pressed = Hit::None;
-                }
                 app.invalidate();
                 LRESULT(0)
             }
@@ -2402,6 +2395,13 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                     app.maximized = wparam.0 == SIZE_MAXIMIZED as usize;
                     app.w = w as f32 / app.scale;
                     app.h = h as f32 / app.scale;
+                    // Room for Windows' caption buttons, whose size depends on DPI and state.
+                    let mut b = RECT::default();
+                    if DwmGetWindowAttribute(hwnd, DWMWA_CAPTION_BUTTON_BOUNDS, (&mut b as *mut RECT).cast(), std::mem::size_of::<RECT>() as u32).is_ok()
+                        && b.right > b.left
+                    {
+                        app.caption_w = (b.right - b.left) as f32 / app.scale;
+                    }
                     if let Some(g) = app.gfx.as_mut() {
                         g.resize(w, h);
                     }

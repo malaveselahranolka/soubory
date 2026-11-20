@@ -235,8 +235,9 @@ fn toolbar(app: &App, c: &mut Canvas, t: &Theme) {
         );
     }
 
-    // Caption buttons (Windows).
-    for (k, r) in l.caption.iter().enumerate() {
+    // Caption buttons: in a window Windows draws its own (DwmDefWindowProc); offscreen renders
+    // draw lookalikes so screenshots stay whole.
+    for (k, r) in l.caption.iter().enumerate().filter(|_| app.offscreen) {
         let cap = [Cap::Min, Cap::Max, Cap::Close][k];
         let hit = Hit::Caption(cap);
         let hot = app.hover == hit;

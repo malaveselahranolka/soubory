@@ -276,6 +276,8 @@ pub struct App {
     pub side_rows: Vec<Row>,
     pub side_scroll: f32,
     pub sidebar_w: f32,
+    /// Width of Windows' caption buttons at the top right (DIPs), kept free of toolbar items.
+    pub caption_w: f32,
     pub sidebar_on: bool,
     pub preview_on: bool,
     pub hover: Hit,
@@ -336,6 +338,7 @@ impl App {
             side_rows: sidebar::build(&prefs),
             side_scroll: 0.0,
             sidebar_w: DEFAULT_SIDEBAR,
+            caption_w: 3.0 * layout::CAPTION_W,
             sidebar_on: true,
             preview_on: false,
             hover: Hit::None,
@@ -378,6 +381,7 @@ impl App {
             w: self.w,
             h: self.h,
             sidebar: self.sidebar_on.then_some(self.sidebar_w),
+            caption_w: self.caption_w,
             tabs: self.tabs.len() > 1,
             scope: matches!(t.loc, Loc::Search { .. }),
             header: matches!(t.view, View::List)
@@ -1004,11 +1008,6 @@ impl App {
 
     pub fn hit(&self, x: f32, y: f32) -> Hit {
         let l = &self.lay;
-        for (k, c) in l.caption.iter().enumerate() {
-            if c.contains(x, y) {
-                return Hit::Caption([Cap::Min, Cap::Max, Cap::Close][k]);
-            }
-        }
         if self.palette.is_some() {
             return crate::palette::hit(self, x, y);
         }
@@ -1173,10 +1172,6 @@ impl App {
             match h {
                 Hit::Palette(_) => self.pressed = h,
                 Hit::PaletteCard => crate::win::palette_field(self, true),
-                Hit::Caption(_) => {
-                    crate::palette::close(self);
-                    self.pressed = h;
-                }
                 _ => crate::palette::close(self),
             }
             return;
@@ -1299,7 +1294,6 @@ impl App {
     /// What a click on `h` does (also UI Automation's Invoke).
     pub fn activate(&mut self, h: Hit) {
         match h {
-            Hit::Caption(c) => crate::win::caption(self, c),
             Hit::SidebarBtn => {
                 self.sidebar_on = !self.sidebar_on;
                 self.relayout();

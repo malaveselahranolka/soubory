@@ -72,6 +72,9 @@ pub(crate) const C_GROUP0: u32 = OWN + 61; // +0..6, groups::KEYS order
 thread_local! {
     /// Context menus that are being tracked; their owner-draw/init messages are forwarded.
     static ACTIVE: RefCell<Vec<IContextMenu>> = const { RefCell::new(Vec::new()) };
+    /// Recent-folder shortcuts read before: path -> (the .lnk's write time, its target). Reading
+    /// hundreds of .lnk files is what made Recents slow; Windows rewrites one when it changes.
+    static LINKS: RefCell<std::collections::HashMap<PathBuf, (u64, Option<PathBuf>)>> = RefCell::default();
 }
 
 /// Forwards menu messages (icons, lazy "Send to"/"New" submenus) to the shell while a menu is open.
@@ -1502,34 +1505,40 @@ pub fn recent_items(limit: usize) -> Vec<Entry> {
     links.sort_by(|a, b| b.0.cmp(&a.0));
     let mut out = Vec::new();
     let mut seen = HashSet::new();
+    let mut reader: Option<(IShellLinkW, IPersistFile)> = None;
     unsafe {
-        let Ok(sl) = CoCreateInstance::<_, IShellLinkW>(&ShellLink, None, CLSCTX_INPROC_SERVER)
-        else {
-            return out;
-        };
-        let Ok(pf) = sl.cast::<IPersistFile>() else {
-            return out;
-        };
         for (opened, lnk) in links {
             if out.len() >= limit {
                 break;
             }
-            let w = wide(&lnk.to_string_lossy());
-            if pf.Load(PCWSTR(w.as_ptr()), STGM_READ).is_err() {
+            let cached = LINKS.with(|c| c.borrow().get(&lnk).filter(|(m, _)| *m == opened).map(|(_, t)| t.clone()));
+            let target = match cached {
+                Some(t) => t,
+                None => {
+                    if reader.is_none() {
+                        let Ok(sl) = CoCreateInstance::<_, IShellLinkW>(&ShellLink, None, CLSCTX_INPROC_SERVER) else {
+                            return out;
+                        };
+                        let Ok(pf) = sl.cast::<IPersistFile>() else {
+                            return out;
+                        };
+                        reader = Some((sl, pf));
+                    }
+                    let (sl, pf) = reader.as_ref().unwrap();
+                    let w = wide(&lnk.to_string_lossy());
+                    let mut buf = [0u16; 1024];
+                    let t = (pf.Load(PCWSTR(w.as_ptr()), STGM_READ).is_ok()
+                        && sl.GetPath(&mut buf, std::ptr::null_mut(), SLGP_RAWPATH.0 as u32).is_ok())
+                    .then(|| buf.iter().position(|&c| c == 0).unwrap_or(0))
+                    .filter(|&n| n > 0)
+                    .map(|n| PathBuf::from(String::from_utf16_lossy(&buf[..n])));
+                    LINKS.with(|c| c.borrow_mut().insert(lnk.clone(), (opened, t.clone())));
+                    t
+                }
+            };
+            let Some(target) = target else {
                 continue;
-            }
-            let mut buf = [0u16; 1024];
-            if sl
-                .GetPath(&mut buf, std::ptr::null_mut(), SLGP_RAWPATH.0 as u32)
-                .is_err()
-            {
-                continue;
-            }
-            let n = buf.iter().position(|&c| c == 0).unwrap_or(0);
-            if n == 0 {
-                continue;
-            }
-            let target = PathBuf::from(String::from_utf16_lossy(&buf[..n]));
+            };
             if !seen.insert(target.to_string_lossy().to_lowercase()) {
                 continue;
             }
