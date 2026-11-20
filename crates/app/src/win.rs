@@ -324,7 +324,7 @@ fn drives_changed() {
         a.side_rows = crate::sidebar::build(&a.prefs);
         // Tabs on a drive that went away go to "Tento počítač", like Explorer; a rename there is
         // cancelled first so its edit does not outlive the item.
-        let cur = a.cur;
+        let (cur, focus) = (a.cur, a.focus);
         for i in 0..a.tabs.len() {
             let on_gone = gone(&a.tabs[i].loc);
             if !on_gone && !(i == cur && matches!(a.tabs[i].loc, Loc::Computer)) {
@@ -340,7 +340,11 @@ fn drives_changed() {
                 a.reload(None);
             }
         }
+        // Layout, search field, focus, watch and title are per window: back to the visible tab.
         a.cur = cur;
+        a.focus = focus;
+        sync_search_field(a);
+        a.relayout();
         watch_current(a);
         set_title(a);
         a.invalidate();
@@ -1085,6 +1089,27 @@ fn position_edits(app: &App) {
 }
 
 /// (Re)creates the batch rename sheet's fields for its current mode, or removes them.
+/// After a DPI or theme change: the fields are recreated on demand with the new font and
+/// colours; the palette's comes back at once with its query.
+fn rebuild_edits(app: &mut App) {
+    let query = edit_of(app.hwnd, EditKind::Palette).map(|(h, _)| edit_text(h));
+    for k in [EditKind::Search, EditKind::Rename, EditKind::Path, EditKind::Palette] {
+        destroy_edit(app.hwnd, k);
+    }
+    if app.palette.is_some() {
+        palette_field(app, true);
+        if let (Some(q), Some((h, _))) = (query, edit_of(app.hwnd, EditKind::Palette)) {
+            let w = wide(&q);
+            let n = q.encode_utf16().count();
+            unsafe {
+                // EN_CHANGE filters the list again.
+                let _ = SetWindowTextW(h, PCWSTR(w.as_ptr()));
+                SendMessageW(h, EM_SETSEL, Some(WPARAM(n)), Some(LPARAM(n as isize)));
+            }
+        }
+    }
+}
+
 /// Shows (and focuses) or removes the palette's text field.
 pub fn palette_field(app: &mut App, on: bool) {
     if !on {
@@ -1718,13 +1743,7 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                     r.bottom - r.top,
                     SWP_NOZORDER | SWP_NOACTIVATE,
                 );
-                for k in [EditKind::Search, EditKind::Rename, EditKind::Path, EditKind::Palette] {
-                    destroy_edit(app.hwnd, k);
-                }
-                // The palette keeps going: its field comes back in the new size and colours.
-                if app.palette.is_some() {
-                    palette_field(app, true);
-                }
+                rebuild_edits(app);
                 LRESULT(0)
             }
             WM_GETMINMAXINFO => {
@@ -1941,13 +1960,7 @@ unsafe fn wndproc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
             | WM_DWMCOLORIZATIONCOLORCHANGED => {
                 app.theme = crate::theme::Theme::detect();
                 setup_dwm(app);
-                for k in [EditKind::Search, EditKind::Rename, EditKind::Path, EditKind::Palette] {
-                    destroy_edit(app.hwnd, k);
-                }
-                // The palette keeps going: its field comes back in the new size and colours.
-                if app.palette.is_some() {
-                    palette_field(app, true);
-                }
+                rebuild_edits(app);
                 app.invalidate();
                 DefWindowProcW(hwnd, msg, wparam, lparam)
             }

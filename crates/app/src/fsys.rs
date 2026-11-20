@@ -438,6 +438,34 @@ pub struct Volume {
     pub free: u64,
 }
 
+/// Explorer's "share (\\server) (Z:)" from the local connection table; the server is not asked.
+fn network_label(root: &str) -> String {
+    use windows::Win32::NetworkManagement::WNet::WNetGetConnectionW;
+    let local = wide(&root[..2]);
+    let mut buf = [0u16; 520];
+    let mut n = buf.len() as u32;
+    let ok = unsafe { WNetGetConnectionW(PCWSTR(local.as_ptr()), Some(windows::core::PWSTR(buf.as_mut_ptr())), &mut n) } == windows::Win32::Foundation::NO_ERROR;
+    net_label(if ok { from_wide(&buf) } else { String::new() }.as_str(), &root[..2])
+}
+
+fn net_label(remote: &str, drive: &str) -> String {
+    match remote.trim_start_matches('\\').split_once('\\') {
+        Some((server, share)) if !share.is_empty() => format!("{share} (\\\\{server}) ({drive})"),
+        _ => format!("Síťová jednotka ({drive})"),
+    }
+}
+
+/// True for network drives and UNC paths (decided locally, no I/O).
+pub fn is_remote(p: &Path) -> bool {
+    let s = p.to_string_lossy();
+    if s.starts_with("\\\\") {
+        return true;
+    }
+    let Some(root) = s.get(..3) else { return false };
+    let w = wide(root);
+    unsafe { GetDriveTypeW(PCWSTR(w.as_ptr())) == 4 }
+}
+
 /// Mounted drives with Explorer's names ("Místní disk (C:)").
 pub fn volumes() -> Vec<Volume> {
     let mask = unsafe { GetLogicalDrives() };
@@ -460,7 +488,7 @@ pub fn volumes() -> Vec<Volume> {
             continue;
         }
         out.push(Volume {
-            label: display_name(Path::new(&root)),
+            label: if kind == 4 { network_label(&root) } else { display_name(Path::new(&root)) },
             removable: kind == 2 || kind == 5,
             network: kind == 4,
             root: PathBuf::from(root),
@@ -536,6 +564,15 @@ mod tests {
             shell: None,
             origin: None,
         }
+    }
+
+    #[test]
+    fn network_drive_labels() {
+        assert_eq!(super::net_label(r"\\nas\fotky", "Z:"), r"fotky (\\nas) (Z:)");
+        assert_eq!(super::net_label(r"\\nas\fotky\2024", "Y:"), r"fotky\2024 (\\nas) (Y:)");
+        assert_eq!(super::net_label("", "X:"), "Síťová jednotka (X:)");
+        assert!(super::is_remote(std::path::Path::new(r"\\server\share\a")));
+        assert!(!super::is_remote(std::path::Path::new("relative")));
     }
 
     #[test]

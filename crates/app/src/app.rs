@@ -554,6 +554,11 @@ impl App {
     }
 
     pub fn new_tab(&mut self, loc: Loc) {
+        if let Loc::Search { scope, .. } = &loc {
+            if scope.is_some() || !matches!(self.tab().loc, Loc::Search { .. }) {
+                self.search_prev = Some(scope.clone().map_or_else(|| self.tab().loc.clone(), Loc::Folder));
+            }
+        }
         let view = self.tab().view;
         self.tabs.insert(self.cur + 1, Tab::new(loc, view));
         self.cur += 1;

@@ -775,7 +775,7 @@ fn list_view(app: &mut App, c: &mut Canvas, t: &Theme) {
                     Align::Start,
                 ),
                 Col::Size => {
-                    let s = if e.is_dir && !matches!(app.tab().loc, Loc::Computer) {
+                    let s = if e.is_dir && (!matches!(app.tab().loc, Loc::Computer) || e.size == 0) {
                         "—".to_string()
                     } else {
                         fsys::format_size(e.size)
@@ -1201,7 +1201,8 @@ pub fn status_text(app: &App) -> String {
     } else {
         items(n)
     };
-    match tab.loc.folder().and_then(fsys::disk_space) {
+    // Free space is read on every paint: never for network paths, whose server may not answer.
+    match tab.loc.folder().filter(|p| !fsys::is_remote(p)).and_then(fsys::disk_space) {
         Some((_, free)) if sel == 0 => format!("{base}, {} volných", fsys::format_size(free)),
         _ => base,
     }
